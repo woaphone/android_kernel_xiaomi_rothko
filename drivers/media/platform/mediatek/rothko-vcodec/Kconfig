@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_ROTHKO_VENC
+	bool "MT6989 VCP video encoder"
+	depends on ARCH_MEDIATEK && VIDEO_DEV
+	depends on DRM_MEDIATEK_MT6989 && DEVICE_MODULES_ARM_SMMU_V3
+	depends on MTK_TINYSYS_VCP_SUPPORT && DEVICE_MODULES_MTK_SMI
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_MEM2MEM_DEV
+	help
+	  Build the MT6989 vendor V4L2 encoder and its VCP firmware interface.
+	  The Codec2 private controls and DMA buffer ABI are kept local to
+	  this driver. This does not enable the upstream SCP/VPU codec.

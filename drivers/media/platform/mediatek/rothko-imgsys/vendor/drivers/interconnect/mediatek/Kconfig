@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config INTERCONNECT_MTK_MMQOS_COMMON
+	tristate "MediaTek multimedia QoS core"
+	depends on INTERCONNECT && ARCH_MEDIATEK
+	depends on DEVICE_MODULES_MTK_SMI && MTK_MMDVFS && MTK_DRAMC
+	select INTERCONNECT_MTK_EXTENSION
+
+config MTK_MMQOS_VCP
+	bool "MediaTek multimedia QoS VCP protocol"
+	depends on INTERCONNECT_MTK_MMQOS_COMMON && MTK_TINYSYS_VCP_SUPPORT
+
+config INTERCONNECT_MTK_MMQOS_MT6989
+	tristate "MediaTek MT6989 multimedia QoS provider"
+	depends on INTERCONNECT_MTK && DEVICE_MODULES_MTK_SMI
+	select INTERCONNECT_MTK_MMQOS_COMMON
+
+config INTERCONNECT_MTK_EMI
+	tristate "MediaTek DVFSRC EMI bandwidth provider"
+	depends on INTERCONNECT_MTK && MTK_DVFSRC && OF

@@ -253,6 +253,10 @@ struct mtk_pin_soc {
 	const struct mtk_pin_rsel	*pin_rsel;
 	unsigned int			npin_rsel;
 
+	/* Configure pinmux-dependent drive circuitry after setting the mode. */
+	int (*set_pinmux)(struct mtk_pinctrl *hw,
+			  const struct mtk_pin_desc *desc, u16 mode);
+
 	/* Specific pinconfig operations */
 	int (*bias_disable_set)(struct mtk_pinctrl *hw,
 				const struct mtk_pin_desc *desc);

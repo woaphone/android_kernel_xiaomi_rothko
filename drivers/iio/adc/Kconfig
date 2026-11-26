@@ -9,6 +9,12 @@ menu "Analog to digital converters"
 config IIO_ADC_HELPER
 	tristate
 
+config MEDIATEK_MT6681_AUXADC
+	tristate "MediaTek MT6681 PMIC AUXADC"
+	depends on MFD_MT6681
+	help
+	  Read the MT6681 PMIC ADC channels used by the audio codec.
+
 config 88PM886_GPADC
 	tristate "Marvell 88PM886 GPADC driver"
 	depends on MFD_88PM886_PMIC
@@ -1874,5 +1880,26 @@ config XILINX_AMS
 
 	  The driver can also be built as a module. If so, the module will be called
 	  xilinx-ams.
+
+config MEDIATEK_MT6375_ADC
+	tristate "MT6375 ADC driver"
+	depends on MFD_MT6375
+	select IIO_BUFFER
+	select IIO_TRIGGERED_BUFFER
+	help
+	  ADC support for MT6375 voltage and current channels.
+
+config MEDIATEK_MT6375_AUXADC
+	tristate "MT6375 AUXADC driver"
+	depends on MFD_MT6375
+	help
+	  AUXADC support for MT6375 battery voltage and temperature channels.
+
+config MEDIATEK_SPMI_PMIC_ADC
+	tristate "MediaTek SPMI PMIC ADC Support"
+	depends on MFD_MTK_SPMI_PMIC && REGULATOR && POWER_SUPPLY
+	help
+	  Support the MediaTek SPMI PMIC voltage and temperature channels,
+	  including the MT6363 external thermistor inputs used by rothko.
 
 endmenu

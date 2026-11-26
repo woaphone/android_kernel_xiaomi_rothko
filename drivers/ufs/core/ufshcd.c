@@ -11457,7 +11457,16 @@ static void __exit ufshcd_core_exit(void)
 	scsi_unregister_driver(&ufs_dev_wlun_template.gendrv);
 }
 
+#if IS_ENABLED(CONFIG_SCSI_UFS_ROTHKO)
+/* Stock LK blacklists the old GKI core initcall by its symbol name. */
+static int __init ufshcd_rothko_init(void)
+{
+	return ufshcd_core_init();
+}
+module_init(ufshcd_rothko_init);
+#else
 module_init(ufshcd_core_init);
+#endif
 module_exit(ufshcd_core_exit);
 
 MODULE_AUTHOR("Santosh Yaragnavi <santosh.sy@samsung.com>");

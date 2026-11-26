@@ -81,6 +81,30 @@ config PSTORE_RAM
 
 	  For more information, see Documentation/admin-guide/ramoops.rst.
 
+config ROTHKO_PSTORE_HIGHMEM
+	bool "Rothko 200 MiB early high-memory console"
+	depends on ARM64 && PSTORE_RAM=y && PSTORE_CONSOLE && PRINTK
+	default n
+	help
+	  Reserve 200 MiB at physical address 0x400000000 for the Rothko
+	  early console. The ramoops backend reuses this console zone.
+	  Recovery must use a kernel reserving and reading the same region;
+	  an unmodified stock kernel reads a different ramoops address.
+
+config ROTHKO_PM_PSTORE_DIAGNOSTIC
+	bool "Rothko persistent sleep and CPU idle diagnostics"
+	depends on ARCH_MEDIATEK && ROTHKO_PSTORE_HIGHMEM && SUSPEND
+	help
+	  Record sleep phase boundaries and Common SODI5 diagnostics directly
+	  in the high-memory ramoops console, even while consoles are suspended.
+
+config ROTHKO_BOOT_REBOOT_DIAGNOSTIC
+	bool "Rothko 50-second boot reboot probe"
+	depends on ARCH_MEDIATEK && ROTHKO_PSTORE_HIGHMEM
+	help
+	  Request a reboot at about 50 seconds of kernel uptime for diagnostics.
+	  This option is intended only for a dedicated diagnostic image.
+
 config PSTORE_ZONE
 	tristate
 	depends on PSTORE

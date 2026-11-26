@@ -5,16 +5,27 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/clk.h>
 #include <linux/module.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/slab.h>
 
 #include "phy-mtk-io.h"
 
+#define PEXTP_DIG_GLB_00		0x00
+#define PEXTP_DIG_GLB_04		0x04
+#define PEXTP_DIG_GLB_10		0x10
+#define PEXTP_DIG_GLB_20		0x20
+#define RG_XTP_BYPASS_PIPE_RST		BIT(4)
+#define PEXTP_DIG_PROBE_OUT		0xd0
+
 #define PEXTP_ANA_GLB_00_REG		0x9000
+#define PEXTP_ANA_GLB_6			0x9018
+#define PEXTP_ANA_GLB_9			0x9024
 /* Internal Resistor Selection of TX Bias Current */
 #define EFUSE_GLB_INTR_SEL		GENMASK(28, 24)
 
@@ -50,10 +61,12 @@ struct mtk_pcie_lane_efuse {
  * struct mtk_pcie_phy_data - phy data for each SoC
  * @num_lanes: supported lane numbers
  * @sw_efuse_supported: support software to load eFuse data
+ * @has_clocks: PHY manages DT clocks and runtime PM during init and exit
  */
 struct mtk_pcie_phy_data {
 	int num_lanes;
 	bool sw_efuse_supported;
+	bool has_clocks;
 };
 
 /**
@@ -61,6 +74,8 @@ struct mtk_pcie_phy_data {
  * @dev: pointer to device
  * @phy: pointer to generic phy
  * @sif_base: IO mapped register base address of system interface
+ * @clks: PHY clocks
+ * @num_clks: number of PHY clocks
  * @data: pointer to SoC dependent data
  * @sw_efuse_en: software eFuse enable status
  * @efuse_glb_intr: internal resistor selection of TX bias current data
@@ -70,6 +85,8 @@ struct mtk_pcie_phy {
 	struct device *dev;
 	struct phy *phy;
 	void __iomem *sif_base;
+	struct clk_bulk_data *clks;
+	int num_clks;
 	const struct mtk_pcie_phy_data *data;
 
 	bool sw_efuse_en;
@@ -128,6 +145,90 @@ static int mtk_pcie_phy_init(struct phy *phy)
 static const struct phy_ops mtk_pcie_phy_ops = {
 	.init	= mtk_pcie_phy_init,
 	.owner	= THIS_MODULE,
+};
+
+static int mt6989_pcie_phy_init(struct phy *phy)
+{
+	struct mtk_pcie_phy *pcie_phy = phy_get_drvdata(phy);
+	int ret;
+
+	/* Hold the SIF power domain until the consumer exits the PHY. */
+	ret = pm_runtime_resume_and_get(&phy->dev);
+	if (ret)
+		return ret;
+
+	ret = clk_bulk_prepare_enable(pcie_phy->num_clks, pcie_phy->clks);
+	if (ret) {
+		pm_runtime_put_sync(&phy->dev);
+		return ret;
+	}
+
+	/* Let the MAC control PIPE reset, as in the MT6989 stock PHY. */
+	mtk_phy_clear_bits(pcie_phy->sif_base + PEXTP_DIG_GLB_20,
+			   RG_XTP_BYPASS_PIPE_RST);
+
+	return 0;
+}
+
+static int mt6989_pcie_phy_exit(struct phy *phy)
+{
+	struct mtk_pcie_phy *pcie_phy = phy_get_drvdata(phy);
+
+	clk_bulk_disable_unprepare(pcie_phy->num_clks, pcie_phy->clks);
+	pm_runtime_put_sync(&phy->dev);
+
+	return 0;
+}
+
+static u32 mt6989_pcie_phy_read_probe(void __iomem *base, u32 sel, u32 bus)
+{
+	writel_relaxed(bus, base + sel);
+	return readl_relaxed(base + PEXTP_DIG_PROBE_OUT);
+}
+
+/* Stock .calibrate is an on-demand PHY debug probe. */
+static int mt6989_pcie_phy_monitor(struct phy *phy)
+{
+	static const u32 lane_buses[] = {
+		0x910090, 0x1180092, 0x11a011b, 0x11c011d, 0x11e011f,
+	};
+	struct mtk_pcie_phy *pcie_phy = phy_get_drvdata(phy);
+	void __iomem *base = pcie_phy->sif_base;
+	unsigned int i;
+	u32 misc0, misc1, val;
+
+	if (!phy->init_count)
+		return -EINVAL;
+
+	writel_relaxed(0x404, base + PEXTP_DIG_GLB_00);
+	for (i = 0; i < ARRAY_SIZE(lane_buses); i++) {
+		val = mt6989_pcie_phy_read_probe(base, PEXTP_DIG_GLB_10,
+						lane_buses[i]);
+		dev_dbg(pcie_phy->dev, "PHY lane 0 probe %#x: %#x\n",
+			lane_buses[i], val);
+	}
+
+	writel_relaxed(0, base + PEXTP_DIG_GLB_00);
+	writel_relaxed(0x5600038e, base + PEXTP_ANA_GLB_6);
+	misc0 = mt6989_pcie_phy_read_probe(base, PEXTP_DIG_GLB_04, 0x1a);
+
+	writel_relaxed(0x70002, base + PEXTP_DIG_GLB_00);
+	writel_relaxed(0x98045600, base + PEXTP_ANA_GLB_9);
+	misc1 = mt6989_pcie_phy_read_probe(base, PEXTP_DIG_GLB_04, 0x1b1a);
+	dev_dbg(pcie_phy->dev, "PHY misc probes: %#x, %#x\n", misc0, misc1);
+
+	writel_relaxed(0x4, base + PEXTP_DIG_GLB_00);
+	misc0 = mt6989_pcie_phy_read_probe(base, PEXTP_DIG_GLB_10, 0xe2);
+	dev_dbg(pcie_phy->dev, "PHY lane 0 probe 0xe2: %#x\n", misc0);
+
+	return 0;
+}
+
+static const struct phy_ops mt6989_pcie_phy_ops = {
+	.init		= mt6989_pcie_phy_init,
+	.exit		= mt6989_pcie_phy_exit,
+	.calibrate	= mt6989_pcie_phy_monitor,
+	.owner		= THIS_MODULE,
 };
 
 static int mtk_pcie_efuse_read_for_lane(struct mtk_pcie_phy *pcie_phy,
@@ -198,6 +299,7 @@ static int mtk_pcie_read_efuse(struct mtk_pcie_phy *pcie_phy)
 static int mtk_pcie_phy_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct phy_ops *ops = &mtk_pcie_phy_ops;
 	struct phy_provider *provider;
 	struct mtk_pcie_phy *pcie_phy;
 	int ret;
@@ -211,15 +313,31 @@ static int mtk_pcie_phy_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(pcie_phy->sif_base),
 				     "Failed to map phy-sif base\n");
 
-	pcie_phy->phy = devm_phy_create(dev, dev->of_node, &mtk_pcie_phy_ops);
-	if (IS_ERR(pcie_phy->phy))
-		return dev_err_probe(dev, PTR_ERR(pcie_phy->phy),
-				     "Failed to create PCIe phy\n");
-
 	pcie_phy->dev = dev;
 	pcie_phy->data = of_device_get_match_data(dev);
 	if (!pcie_phy->data)
 		return dev_err_probe(dev, -EINVAL, "Failed to get phy data\n");
+
+	if (pcie_phy->data->has_clocks) {
+		ret = devm_clk_bulk_get_all(dev, &pcie_phy->clks);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "Failed to get PHY clocks\n");
+		if (!ret)
+			return dev_err_probe(dev, -EINVAL, "No PHY clocks specified\n");
+		pcie_phy->num_clks = ret;
+
+		/* PHY core enables runtime PM for the child at creation time. */
+		ret = devm_pm_runtime_enable(dev);
+		if (ret)
+			return ret;
+
+		ops = &mt6989_pcie_phy_ops;
+	}
+
+	pcie_phy->phy = devm_phy_create(dev, dev->of_node, ops);
+	if (IS_ERR(pcie_phy->phy))
+		return dev_err_probe(dev, PTR_ERR(pcie_phy->phy),
+				     "Failed to create PCIe phy\n");
 
 	if (pcie_phy->data->sw_efuse_supported) {
 		/*
@@ -246,7 +364,14 @@ static const struct mtk_pcie_phy_data mt8195_data = {
 	.sw_efuse_supported = true,
 };
 
+static const struct mtk_pcie_phy_data mt6989_data = {
+	.num_lanes = 1,
+	.sw_efuse_supported = false,
+	.has_clocks = true,
+};
+
 static const struct of_device_id mtk_pcie_phy_of_match[] = {
+	{ .compatible = "mediatek,mt6989-pcie-phy", .data = &mt6989_data },
 	{ .compatible = "mediatek,mt8195-pcie-phy", .data = &mt8195_data },
 	{ },
 };

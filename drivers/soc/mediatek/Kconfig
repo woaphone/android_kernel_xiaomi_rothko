@@ -37,6 +37,13 @@ config MTK_DVFSRC
 	  software, and performing bandwidth scaling to provide the
 	  best achievable performance-per-watt.
 
+config MTK_ROTHKO_DDR_DEVFREQ
+	bool "MT6989 DDR devfreq support for Rothko"
+	depends on MTK_DVFSRC=y && MTK_DRAMC=y && PM_OPP && DEVFREQ_GOV_USERSPACE=y
+	help
+	  Expose firmware-provided DDR gears and allow devfreq to request a
+	  minimum DDR gear through the MT6989 DVFSRC.
+
 config MTK_INFRACFG
 	tristate "MediaTek INFRACFG Support"
 	select REGMAP
@@ -88,5 +95,13 @@ config MTK_SOCINFO
 	  The MediaTek SoC Information (mtk-socinfo) driver provides
 	  information about the SoC to the userspace including the
 	  manufacturer name, marketing name and soc name.
+
+config MTK_ROTHKO_SOCINFO
+	bool "MT6989 SoC information for rothko"
+	depends on ARCH_MEDIATEK && OF
+	select SOC_BUS
+	help
+	  Expose the MT6989 SoC family and ID for the stock rothko chipinfo
+	  service before Android early-init.
 
 endmenu

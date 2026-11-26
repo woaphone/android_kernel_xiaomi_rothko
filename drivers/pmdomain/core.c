@@ -1459,28 +1459,49 @@ static void genpd_sync_power_off(struct generic_pm_domain *genpd, bool use_lock,
  * transitions. The "noirq" callbacks may be executed asynchronously, thus in
  * these cases the lock must be held.
  */
-static void genpd_sync_power_on(struct generic_pm_domain *genpd, bool use_lock,
-				unsigned int depth)
+static int genpd_sync_power_on(struct generic_pm_domain *genpd, bool use_lock,
+			       unsigned int depth)
 {
 	struct gpd_link *link;
+	int ret;
 
 	if (genpd_status_on(genpd))
-		return;
+		return 0;
 
 	list_for_each_entry(link, &genpd->child_links, child_node) {
-		genpd_sd_counter_inc(link->parent);
+		struct generic_pm_domain *parent = link->parent;
 
+		genpd_sd_counter_inc(parent);
 		if (use_lock)
-			genpd_lock_nested(link->parent, depth + 1);
-
-		genpd_sync_power_on(link->parent, use_lock, depth + 1);
-
+			genpd_lock_nested(parent, depth + 1);
+		ret = genpd_sync_power_on(parent, use_lock, depth + 1);
 		if (use_lock)
-			genpd_unlock(link->parent);
+			genpd_unlock(parent);
+		if (ret) {
+			genpd_sd_counter_dec(parent);
+			goto rollback;
+		}
 	}
 
-	_genpd_power_on(genpd, false);
+	ret = _genpd_power_on(genpd, false);
+	if (ret)
+		goto rollback;
+
 	genpd->status = GENPD_STATE_ON;
+	return 0;
+
+rollback:
+	list_for_each_entry_continue_reverse(link, &genpd->child_links, child_node) {
+		struct generic_pm_domain *parent = link->parent;
+
+		genpd_sd_counter_dec(parent);
+		if (use_lock)
+			genpd_lock_nested(parent, depth + 1);
+		genpd_sync_power_off(parent, use_lock, depth + 1);
+		if (use_lock)
+			genpd_unlock(parent);
+	}
+	return ret;
 }
 
 /**
@@ -1606,9 +1627,11 @@ static int genpd_finish_resume(struct device *dev,
 		return resume_noirq(dev);
 
 	genpd_lock(genpd);
-	genpd_sync_power_on(genpd, true, 0);
+	ret = genpd_sync_power_on(genpd, true, 0);
 	genpd->suspended_count--;
 	genpd_unlock(genpd);
+	if (ret)
+		return ret;
 
 	if (genpd->dev_ops.stop && genpd->dev_ops.start &&
 	    !pm_runtime_status_suspended(dev)) {
@@ -1617,7 +1640,7 @@ static int genpd_finish_resume(struct device *dev,
 			return ret;
 	}
 
-	return pm_generic_resume_noirq(dev);
+	return resume_noirq(dev);
 }
 
 /**
@@ -1730,6 +1753,7 @@ static void genpd_switch_state(struct device *dev, bool suspend)
 {
 	struct generic_pm_domain *genpd;
 	bool use_lock;
+	int ret = 0;
 
 	genpd = dev_to_genpd_safe(dev);
 	if (!genpd)
@@ -1744,12 +1768,14 @@ static void genpd_switch_state(struct device *dev, bool suspend)
 		genpd->suspended_count++;
 		genpd_sync_power_off(genpd, use_lock, 0);
 	} else {
-		genpd_sync_power_on(genpd, use_lock, 0);
+		ret = genpd_sync_power_on(genpd, use_lock, 0);
 		genpd->suspended_count--;
 	}
 
 	if (use_lock)
 		genpd_unlock(genpd);
+	if (ret)
+		dev_err(dev, "power domain %s failed to resume: %d\n", genpd->name, ret);
 }
 
 /**

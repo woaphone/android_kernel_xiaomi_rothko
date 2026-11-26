@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config MTK_SENSOR_SUPPORT
+	bool "MT6989 high frequency sensor manager"
+	depends on ARM64 && OF
+	help
+	  Build the MediaTek high frequency sensor manager and its existing
+	  hf_manager userspace ABI for the MT6989 sensor HAL.
+
+config MTK_SENSORHUB
+	bool "MT6989 SCP sensorhub"
+	depends on MTK_SENSOR_SUPPORT && MTK_TINYSYS_SCP_SUPPORT
+	help
+	  Use the SCP sensor control and notification IPI channels, shared
+	  memory rings and firmware-provided sensor list on MT6989.
+
+config MTK_CONN_SCP
+	bool "MT6989 connectivity SCP bridge"
+	depends on MTK_SENSOR_SUPPORT && MTK_TINYSYS_SCP_SUPPORT && NET
+	help
+	  Build the conap SCP transport and the existing FLP, geofence and
+	  aolextra interfaces using the MT6989 connection mailbox channels.

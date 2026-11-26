@@ -245,4 +245,11 @@ config STM32_OMM
 source "drivers/memory/samsung/Kconfig"
 source "drivers/memory/tegra/Kconfig"
 
+config MTK_DRAMC
+	tristate "MediaTek MT6989 DRAM controller"
+	depends on ARCH_MEDIATEK && OF
+	help
+	  Read DRAM type, mode registers and frequency from the board DT
+	  and the actual DRAMC/DDRPHY register banks.
+
 endif

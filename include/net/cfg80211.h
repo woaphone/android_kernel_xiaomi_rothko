@@ -6652,7 +6652,12 @@ struct wiphy {
 
 	int n_radio;
 	const struct wiphy_radio *radio;
+#if IS_ENABLED(CONFIG_MTK_ROTHKO_WLAN)
+	/* Transport of a persistent wiphy linked to a replaceable bus device. */
+	ANDROID_KABI_USE(1, struct device *transport_dev);
+#else
 	ANDROID_KABI_RESERVE(1);
+#endif
 
 	char priv[] __aligned(NETDEV_ALIGN);
 };
@@ -6710,6 +6715,12 @@ static inline void set_wiphy_dev(struct wiphy *wiphy, struct device *dev)
  */
 static inline struct device *wiphy_dev(struct wiphy *wiphy)
 {
+#if IS_ENABLED(CONFIG_MTK_ROTHKO_WLAN)
+	struct device *transport = READ_ONCE(wiphy->transport_dev);
+
+	if (transport)
+		return transport;
+#endif
 	return wiphy->dev.parent;
 }
 

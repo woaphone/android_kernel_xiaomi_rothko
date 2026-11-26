@@ -5,6 +5,7 @@
  * Author: Chen Zhong <chen.zhong@mediatek.com>
  */
 
+#include <linux/bitfield.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
@@ -13,12 +14,14 @@
 #include <linux/mfd/mt6357/registers.h>
 #include <linux/mfd/mt6358/registers.h>
 #include <linux/mfd/mt6359/registers.h>
+#include <linux/mfd/mt6363/registers.h>
 #include <linux/mfd/mt6397/core.h>
 #include <linux/mfd/mt6397/registers.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/regmap.h>
 
 #define MTK_PMIC_RST_DU_MASK	GENMASK(9, 8)
@@ -28,6 +31,10 @@
 #define MTK_PMIC_MT6331_RST_DU_MASK	GENMASK(13, 12)
 #define MTK_PMIC_MT6331_PWRKEY_RST	BIT(9)
 #define MTK_PMIC_MT6331_HOMEKEY_RST	BIT(8)
+
+#define MT6363_PWRKEY_RST_EN		BIT(2)
+#define MT6363_RST_KEY_MODE		GENMASK(5, 4)
+#define MT6363_RST_DU			GENMASK(7, 6)
 
 #define MTK_PMIC_PWRKEY_INDEX	0
 #define MTK_PMIC_HOMEKEY_INDEX	1
@@ -134,6 +141,16 @@ static const struct mtk_pmic_regs mt6359_regs = {
 	.key_release_irq = true,
 };
 
+static const struct mtk_pmic_regs mt6363_regs = {
+	.keys_regs[MTK_PMIC_PWRKEY_INDEX] =
+		MTK_PMIC_KEYS_REGS(MT6363_TOPSTATUS, 0x1,
+				   MT6363_PSC_TOP_INT_CON0, 0x0, 0),
+	.keys_regs[MTK_PMIC_HOMEKEY_INDEX] =
+		MTK_PMIC_KEYS_REGS(MT6363_TOPSTATUS, 0x3,
+				   MT6363_PSC_TOP_INT_CON0, 0x1, 0),
+	.key_release_irq = true,
+};
+
 struct mtk_pmic_keys_info {
 	struct mtk_pmic_keys *keys;
 	const struct mtk_pmic_keys_regs *regs;
@@ -147,6 +164,7 @@ struct mtk_pmic_keys {
 	struct input_dev *input_dev;
 	struct device *dev;
 	struct regmap *regmap;
+	const struct mtk_pmic_regs *regs;
 	struct mtk_pmic_keys_info keys[MTK_PMIC_MAX_KEY_COUNT];
 };
 
@@ -155,6 +173,21 @@ enum mtk_pmic_keys_lp_mode {
 	LP_ONEKEY,
 	LP_TWOKEY,
 };
+
+static void mt6363_pmic_keys_lp_reset_setup(struct regmap *regmap,
+					  u32 mode, u32 debounce)
+{
+	regmap_update_bits(regmap, MT6363_STRUP_CON12, MT6363_RST_DU,
+			   FIELD_PREP(MT6363_RST_DU, debounce));
+	if (mode > LP_TWOKEY)
+		return;
+
+	regmap_update_bits(regmap, MT6363_STRUP_CON11, MT6363_PWRKEY_RST_EN,
+			   mode == LP_DISABLE ? 0 : MT6363_PWRKEY_RST_EN);
+	regmap_update_bits(regmap, MT6363_STRUP_CON12, MT6363_RST_KEY_MODE,
+			   FIELD_PREP(MT6363_RST_KEY_MODE,
+				      mode == LP_DISABLE ? 3 : mode - LP_ONEKEY));
+}
 
 static void mtk_pmic_keys_lp_reset_setup(struct mtk_pmic_keys *keys,
 					 const struct mtk_pmic_regs *regs)
@@ -172,14 +205,20 @@ static void mtk_pmic_keys_lp_reset_setup(struct mtk_pmic_keys *keys,
 	if (error)
 		long_press_debounce = 0;
 
-	mask = regs->rst_lprst_mask;
-	value = long_press_debounce << (ffs(regs->rst_lprst_mask) - 1);
-
 	error  = of_property_read_u32(keys->dev->of_node,
 				      "mediatek,long-press-mode",
 				      &long_press_mode);
 	if (error)
 		long_press_mode = LP_DISABLE;
+
+	if (regs == &mt6363_regs) {
+		mt6363_pmic_keys_lp_reset_setup(keys->regmap, long_press_mode,
+					      long_press_debounce);
+		return;
+	}
+
+	mask = regs->rst_lprst_mask;
+	value = long_press_debounce << (ffs(regs->rst_lprst_mask) - 1);
 
 	switch (long_press_mode) {
 	case LP_TWOKEY:
@@ -205,18 +244,27 @@ static void mtk_pmic_keys_lp_reset_setup(struct mtk_pmic_keys *keys,
 static irqreturn_t mtk_pmic_keys_irq_handler_thread(int irq, void *data)
 {
 	struct mtk_pmic_keys_info *info = data;
+	struct mtk_pmic_keys *keys = info->keys;
 	u32 key_deb, pressed;
 
-	regmap_read(info->keys->regmap, info->regs->deb_reg, &key_deb);
+	if (keys->regs == &mt6363_regs) {
+		pressed = irq == info->irq;
+	} else {
+		regmap_read(keys->regmap, info->regs->deb_reg, &key_deb);
+		pressed = !(key_deb & info->regs->deb_mask);
+	}
 
-	key_deb &= info->regs->deb_mask;
+	input_report_key(keys->input_dev, info->keycode, pressed);
+	input_sync(keys->input_dev);
 
-	pressed = !key_deb;
+	if (keys->regs == &mt6363_regs && info->wakeup) {
+		if (pressed)
+			pm_stay_awake(keys->dev);
+		else
+			pm_relax(keys->dev);
+	}
 
-	input_report_key(info->keys->input_dev, info->keycode, pressed);
-	input_sync(info->keys->input_dev);
-
-	dev_dbg(info->keys->dev, "(%s) key =%d using PMIC\n",
+	dev_dbg(keys->dev, "(%s) key =%d using PMIC\n",
 		 pressed ? "pressed" : "released", info->keycode);
 
 	return IRQ_HANDLED;
@@ -317,6 +365,9 @@ static const struct of_device_id of_mtk_pmic_keys_match_tbl[] = {
 		.compatible = "mediatek,mt6359-keys",
 		.data = &mt6359_regs,
 	}, {
+		.compatible = "mediatek,mt6363-keys",
+		.data = &mt6363_regs,
+	}, {
 		/* sentinel */
 	}
 };
@@ -326,7 +377,6 @@ static int mtk_pmic_keys_probe(struct platform_device *pdev)
 {
 	int error, index = 0;
 	unsigned int keycount;
-	struct mt6397_chip *pmic_chip = dev_get_drvdata(pdev->dev.parent);
 	struct device_node *node = pdev->dev.of_node;
 	static const char *const irqnames[] = { "powerkey", "homekey" };
 	static const char *const irqnames_r[] = { "powerkey_r", "homekey_r" };
@@ -336,13 +386,24 @@ static int mtk_pmic_keys_probe(struct platform_device *pdev)
 	const struct of_device_id *of_id =
 		of_match_device(of_mtk_pmic_keys_match_tbl, &pdev->dev);
 
+	if (!of_id)
+		return -ENODEV;
+
 	keys = devm_kzalloc(&pdev->dev, sizeof(*keys), GFP_KERNEL);
 	if (!keys)
 		return -ENOMEM;
 
 	keys->dev = &pdev->dev;
-	keys->regmap = pmic_chip->regmap;
-	mtk_pmic_regs = of_id->data;
+	keys->regs = mtk_pmic_regs = of_id->data;
+	if (mtk_pmic_regs == &mt6363_regs) {
+		keys->regmap = dev_get_regmap(pdev->dev.parent, NULL);
+		if (!keys->regmap)
+			return -ENODEV;
+	} else {
+		struct mt6397_chip *pmic_chip = dev_get_drvdata(pdev->dev.parent);
+
+		keys->regmap = pmic_chip->regmap;
+	}
 
 	keys->input_dev = input_dev = devm_input_allocate_device(keys->dev);
 	if (!input_dev) {
@@ -366,14 +427,21 @@ static int mtk_pmic_keys_probe(struct platform_device *pdev)
 	for_each_child_of_node_scoped(node, child) {
 		keys->keys[index].regs = &mtk_pmic_regs->keys_regs[index];
 
-		keys->keys[index].irq =
-			platform_get_irq_byname(pdev, irqnames[index]);
+		if (mtk_pmic_regs == &mt6363_regs)
+			keys->keys[index].irq = platform_get_irq(pdev, index);
+		else
+			keys->keys[index].irq =
+				platform_get_irq_byname(pdev, irqnames[index]);
 		if (keys->keys[index].irq < 0)
 			return keys->keys[index].irq;
 
 		if (mtk_pmic_regs->key_release_irq) {
-			keys->keys[index].irq_r = platform_get_irq_byname(pdev,
-									  irqnames_r[index]);
+			if (mtk_pmic_regs == &mt6363_regs)
+				keys->keys[index].irq_r = platform_get_irq(pdev,
+							 index + MTK_PMIC_MAX_KEY_COUNT);
+			else
+				keys->keys[index].irq_r = platform_get_irq_byname(pdev,
+									 irqnames_r[index]);
 
 			if (keys->keys[index].irq_r < 0)
 				return keys->keys[index].irq_r;
@@ -388,8 +456,14 @@ static int mtk_pmic_keys_probe(struct platform_device *pdev)
 			return error;
 		}
 
-		if (of_property_read_bool(child, "wakeup-source"))
+		if (of_property_read_bool(child, "wakeup-source")) {
+			if (mtk_pmic_regs == &mt6363_regs && !device_can_wakeup(keys->dev)) {
+				error = devm_device_init_wakeup(keys->dev);
+				if (error)
+					return error;
+			}
 			keys->keys[index].wakeup = true;
+		}
 
 		error = mtk_pmic_key_setup(keys, &keys->keys[index]);
 		if (error)

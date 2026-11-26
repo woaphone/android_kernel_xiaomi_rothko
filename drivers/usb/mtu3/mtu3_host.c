@@ -26,6 +26,9 @@
 
 /* mt8183 */
 #define PERI_WK_CTRL0	0x0
+#define PERI_WK_CTRL2	0x8
+#define UWK_MT6989_CTRL0_MASK	0x3
+#define UWK_MT6989_CTRL2_MASK	0x699
 #define WC0_IS_C(x)	((u32)(((x) & 0xf) << 28))  /* cycle debounce */
 #define WC0_IS_P	BIT(12)	/* polarity */
 #define WC0_IS_EN	BIT(6)
@@ -86,6 +89,16 @@ static void ssusb_wakeup_ip_sleep_set(struct ssusb_mtk *ssusb, bool enable)
 		val = enable ? msk : 0;
 		break;
 	case SSUSB_UWK_V1_3:
+		if (ssusb->mt6989) {
+			reg = ssusb->uwk_reg_base + PERI_WK_CTRL0;
+			msk = UWK_MT6989_CTRL0_MASK;
+			val = enable ? msk : 0;
+			regmap_update_bits(ssusb->uwk, reg, msk, val);
+			reg = ssusb->uwk_reg_base + PERI_WK_CTRL2;
+			msk = UWK_MT6989_CTRL2_MASK;
+			val = enable ? msk : 0;
+			break;
+		}
 		reg = ssusb->uwk_reg_base + PERI_WK_CTRL1_8195;
 		msk = WC1_IS_EN_P0_95 | WC1_IS_C_95(0xf) | WC1_IS_P_95;
 		val = enable ? (WC1_IS_EN_P0_95 | WC1_IS_C_95(0x1)) : 0;

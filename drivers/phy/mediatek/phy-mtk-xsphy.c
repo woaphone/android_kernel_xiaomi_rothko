@@ -13,6 +13,7 @@
 #include <linux/iopoll.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
+#include <linux/nvmem-consumer.h>
 #include <linux/of_address.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -107,6 +108,16 @@ struct xsphy_instance {
 	int eye_src;
 	int eye_vrt;
 	int eye_term;
+	int efuse_term_cal;
+	int intr_ofs, host_intr_ofs;
+	int term_ofs, host_term_ofs;
+	int discth, rx_sqth, host_rx_sqth, rev6;
+	int eye_src_host, eye_vrt_host, eye_term_host, rev6_host;
+	int pll_fbksel, pll_posdiv;
+	int tx_lctxcm1, tx_lctxc0, tx_lctxcp1;
+	bool u3_rx_fix, u3_gen2_hqa;
+	bool lpm_quirk;
+	u32 lpm_para[3];
 };
 
 struct mtk_xsphy {
@@ -116,7 +127,12 @@ struct mtk_xsphy {
 	int nphys;
 	int src_ref_clk; /* MHZ, reference clock for slew rate calibrate */
 	int src_coef;    /* coefficient for slew rate calibrate */
+	bool mt6989;
+	bool tx_chirpK_disable;
+	bool bc11_switch_disable;
 };
+
+#include "phy-mtk-xsphy-mt6989.h"
 
 static void u2_phy_slew_rate_calibrate(struct mtk_xsphy *xsphy,
 					struct xsphy_instance *inst)
@@ -127,7 +143,7 @@ static void u2_phy_slew_rate_calibrate(struct mtk_xsphy *xsphy,
 	u32 tmp;
 
 	/* use force value */
-	if (inst->eye_src)
+	if (xsphy->mt6989 ? inst->eye_src >= 0 : inst->eye_src)
 		return;
 
 	/* enable USB ring oscillator */
@@ -239,6 +255,104 @@ static void u2_phy_instance_set_mode(struct mtk_xsphy *xsphy,
 		return;
 	}
 	writel(tmp, inst->port_base + XSP_U2PHYDTM1);
+}
+
+static void mt6989_phy_parse_property(struct xsphy_instance *inst)
+{
+	struct device *dev = &inst->phy->dev;
+	const char *offset;
+
+#define READ_PARAM(property, member) \
+	do { \
+		if (device_property_read_u32(dev, "mediatek," property, \
+					    &inst->member)) \
+			inst->member = -EINVAL; \
+	} while (0)
+	READ_PARAM("efuse-intr", efuse_intr);
+	if (inst->type == PHY_TYPE_USB2) {
+		READ_PARAM("efuse-term", efuse_term_cal);
+		READ_PARAM("eye-src", eye_src);
+		READ_PARAM("eye-vrt", eye_vrt);
+		READ_PARAM("eye-term", eye_term);
+		READ_PARAM("discth", discth);
+		READ_PARAM("rx-sqth", rx_sqth);
+		READ_PARAM("host-rx-sqth", host_rx_sqth);
+		READ_PARAM("rev6", rev6);
+		READ_PARAM("eye-src-host", eye_src_host);
+		READ_PARAM("eye-vrt-host", eye_vrt_host);
+		READ_PARAM("eye-term-host", eye_term_host);
+		READ_PARAM("rev6-host", rev6_host);
+		READ_PARAM("pll-fbksel", pll_fbksel);
+		READ_PARAM("pll-posdiv", pll_posdiv);
+		if (!device_property_read_u32_array(dev, "mediatek,lpm-parameter",
+						inst->lpm_para, PHY_PLL_PARA_CNT))
+			inst->lpm_quirk = true;
+#define READ_OFFSET(property, member, mask) \
+		do { \
+			if (device_property_read_string(dev, "mediatek," property, &offset) || \
+			    kstrtoint(offset, 10, &inst->member) < 0) \
+				inst->member = -(mask + 1); \
+		} while (0)
+		READ_OFFSET("intr-ofs", intr_ofs, P2AR_RG_INTR_CAL_MASK);
+		READ_OFFSET("host-intr-ofs", host_intr_ofs, P2AR_RG_INTR_CAL_MASK);
+		READ_OFFSET("term-ofs", term_ofs, P2ARA_RG_TERM_CAL_MASK);
+		READ_OFFSET("host-term-ofs", host_term_ofs, P2ARA_RG_TERM_CAL_MASK);
+#undef READ_OFFSET
+	} else if (inst->type == PHY_TYPE_USB3) {
+		READ_PARAM("efuse-tx-imp", efuse_tx_imp);
+		READ_PARAM("efuse-rx-imp", efuse_rx_imp);
+		READ_PARAM("tx-lctxcm1", tx_lctxcm1);
+		READ_PARAM("tx-lctxc0", tx_lctxc0);
+		READ_PARAM("tx-lctxcp1", tx_lctxcp1);
+		inst->u3_rx_fix = device_property_read_bool(dev, "mediatek,u3-rx-fix");
+		inst->u3_gen2_hqa = device_property_read_bool(dev, "mediatek,u3-gen2-hqa");
+	}
+#undef READ_PARAM
+}
+
+static int mt6989_phy_read_efuse(struct xsphy_instance *inst,
+			       const char *name, int *parameter)
+{
+	struct device *dev = &inst->phy->dev;
+	u32 mask, value;
+	int index, ret;
+
+	index = of_property_match_string(dev->of_node, "nvmem-cell-names", name);
+	if (index < 0)
+		return 0;
+	ret = of_property_read_u32_index(dev->of_node, "nvmem-cell-masks", index, &mask);
+	if (ret || !mask)
+		return ret ? ret : -EINVAL;
+	ret = nvmem_cell_read_u32(dev, name, &value);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to read %s calibration\n", name);
+	value = (value & mask) >> (ffs(mask) - 1);
+	/* A zero efuse field retains the DT or hardware default, as in the donor. */
+	if (value)
+		*parameter = value;
+	return 0;
+}
+
+static int mt6989_phy_parse_efuse(struct xsphy_instance *inst)
+{
+	int ret;
+
+	if (inst->type == PHY_TYPE_USB2) {
+		ret = mt6989_phy_read_efuse(inst, "intr_cal", &inst->efuse_intr);
+		if (ret)
+			return ret;
+		return mt6989_phy_read_efuse(inst, "term_cal", &inst->efuse_term_cal);
+	}
+	if (inst->type == PHY_TYPE_USB3) {
+		ret = mt6989_phy_read_efuse(inst, "iext_intr_ctrl", &inst->efuse_intr);
+		if (ret)
+			return ret;
+		ret = mt6989_phy_read_efuse(inst, "rx_impsel", &inst->efuse_rx_imp);
+		if (ret)
+			return ret;
+		return mt6989_phy_read_efuse(inst, "tx_impsel", &inst->efuse_tx_imp);
+	}
+	return 0;
 }
 
 static void phy_parse_property(struct mtk_xsphy *xsphy,
@@ -391,11 +505,19 @@ static int mtk_phy_init(struct phy *phy)
 
 	switch (inst->type) {
 	case PHY_TYPE_USB2:
-		u2_phy_instance_init(xsphy, inst);
-		u2_phy_props_set(xsphy, inst);
+		if (xsphy->mt6989) {
+			mt6989_u2_phy_instance_init(xsphy, inst);
+			mt6989_u2_phy_props_set(xsphy, inst);
+		} else {
+			u2_phy_instance_init(xsphy, inst);
+			u2_phy_props_set(xsphy, inst);
+		}
 		break;
 	case PHY_TYPE_USB3:
-		u3_phy_props_set(xsphy, inst);
+		if (xsphy->mt6989)
+			mt6989_u3_phy_props_set(xsphy, inst);
+		else
+			u3_phy_props_set(xsphy, inst);
 		break;
 	case PHY_TYPE_PCIE:
 	case PHY_TYPE_SGMII:
@@ -416,9 +538,24 @@ static int mtk_phy_power_on(struct phy *phy)
 	struct mtk_xsphy *xsphy = dev_get_drvdata(phy->dev.parent);
 
 	if (inst->type == PHY_TYPE_USB2) {
-		u2_phy_instance_power_on(xsphy, inst);
+		if (xsphy->mt6989)
+			mt6989_u2_phy_instance_power_on(xsphy, inst);
+		else
+			u2_phy_instance_power_on(xsphy, inst);
 		u2_phy_slew_rate_calibrate(xsphy, inst);
+		if (xsphy->mt6989) {
+			if (phy->attrs.mode == PHY_MODE_USB_HOST)
+				mt6989_u2_phy_host_props_set(xsphy, inst);
+			else
+				mt6989_u2_phy_props_set(xsphy, inst);
+		}
+	} else if (xsphy->mt6989 && inst->type == PHY_TYPE_USB3) {
+		mt6989_u3_phy_instance_power_on(xsphy, inst);
+		mt6989_u3_phy_props_set(xsphy, inst);
 	}
+	if (xsphy->mt6989 && xsphy->tx_chirpK_disable && inst->type == PHY_TYPE_USB2)
+		mtk_phy_set_bits(inst->port_base + XSP_USBPHYA_RESERVEA1,
+				 P2ARA_RG_TX_CHIRPK);
 
 	return 0;
 }
@@ -428,8 +565,17 @@ static int mtk_phy_power_off(struct phy *phy)
 	struct xsphy_instance *inst = phy_get_drvdata(phy);
 	struct mtk_xsphy *xsphy = dev_get_drvdata(phy->dev.parent);
 
-	if (inst->type == PHY_TYPE_USB2)
-		u2_phy_instance_power_off(xsphy, inst);
+	if (xsphy->mt6989 && xsphy->tx_chirpK_disable && inst->type == PHY_TYPE_USB2)
+		mtk_phy_clear_bits(inst->port_base + XSP_USBPHYA_RESERVEA1,
+				   P2ARA_RG_TX_CHIRPK);
+	if (inst->type == PHY_TYPE_USB2) {
+		if (xsphy->mt6989)
+			mt6989_u2_phy_instance_power_off(xsphy, inst);
+		else
+			u2_phy_instance_power_off(xsphy, inst);
+	} else if (xsphy->mt6989 && inst->type == PHY_TYPE_USB3) {
+		mt6989_u3_phy_instance_power_off(xsphy, inst);
+	}
 
 	return 0;
 }
@@ -447,8 +593,12 @@ static int mtk_phy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 	struct xsphy_instance *inst = phy_get_drvdata(phy);
 	struct mtk_xsphy *xsphy = dev_get_drvdata(phy->dev.parent);
 
-	if (inst->type == PHY_TYPE_USB2)
-		u2_phy_instance_set_mode(xsphy, inst, mode);
+	if (inst->type == PHY_TYPE_USB2) {
+		if (xsphy->mt6989)
+			mt6989_u2_phy_instance_set_mode(xsphy, inst, mode, submode);
+		else
+			u2_phy_instance_set_mode(xsphy, inst, mode);
+	}
 
 	return 0;
 }
@@ -486,7 +636,16 @@ static struct phy *mtk_phy_xlate(struct device *dev,
 		return ERR_PTR(-EINVAL);
 	}
 
-	phy_parse_property(xsphy, inst);
+	if (xsphy->mt6989) {
+		int ret;
+
+		mt6989_phy_parse_property(inst);
+		ret = mt6989_phy_parse_efuse(inst);
+		if (ret)
+			return ERR_PTR(ret);
+	} else {
+		phy_parse_property(xsphy, inst);
+	}
 	phy_type_set(inst);
 
 	return inst->phy;
@@ -528,6 +687,9 @@ static int mtk_xsphy_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	xsphy->dev = dev;
+	xsphy->mt6989 = of_machine_is_compatible("mediatek,MT6989");
+	xsphy->tx_chirpK_disable = device_property_read_bool(dev, "tx-chirpk-capable");
+	xsphy->bc11_switch_disable = device_property_read_bool(dev, "bc11-switch-disable");
 	platform_set_drvdata(pdev, xsphy);
 
 	glb_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);

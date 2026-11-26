@@ -28,10 +28,53 @@ config MTK_LVTS_THERMAL
           thermal controllers to collect temperatures via ASIF
           (Analog Serial Interface).
 
+config MTK_LVTS_MT6989
+	tristate "MediaTek MT6989 LVTS thermal sensors"
+	depends on HAS_IOMEM && NVMEM
+	help
+	  Read the firmware-initialized LVTS controllers on MT6989. The
+	  driver uses the per-sensor eFuse calibration and exposes the SoC
+	  maximum and individual sensors through the thermal subsystem.
+
 config MTK_LVTS_THERMAL_DEBUGFS
        bool "LVTS thermal debugfs"
        depends on MTK_LVTS_THERMAL && DEBUG_FS
        help
          Enable this option to debug the internals of the device driver.
+
+config MTK_BOARD_THERMAL
+	tristate "MediaTek MT6685 TIA board thermistors"
+	depends on HAS_IOMEM && THERMAL_OF
+	help
+	  Read board thermistors through the MT6685 TIA converter and
+	  expose the device-tree thermal zones.
+
+config MTK_PMIC_TEMP
+	tristate "MediaTek MT6363/MT6373 PMIC temperature sensors"
+	depends on IIO && NVMEM_MT635X_EFUSE && MEDIATEK_SPMI_PMIC_ADC
+	help
+	  Register the four calibrated AUXADC temperature sensors on each
+	  MT6363 and MT6373 PMIC. The module is named pmic_temp.
+
+config MTK_CHARGER_COOLING
+	tristate "MediaTek MT6375 charger cooling"
+	depends on MTK_CHARGER && CHARGER_MT6375
+	help
+	  Apply thermal cooling states as charging current limits through the
+	  MediaTek charger manager. The module is named charger_cooling.
+
+config MTK_BACKLIGHT_COOLING
+	tristate "MediaTek display backlight cooling"
+	depends on LEDS_MTK && LEDS_MTK_DISP
+	help
+	  Limit the MediaTek display backlight through its hardware brightness
+	  control. The module is named backlight_cooling.
+
+config XIAOMI_THERMAL_MESSAGE
+	bool "Xiaomi thermal message interface"
+	depends on MTK_THERMAL=y
+	help
+	  Expose the Xiaomi thermal daemon and framework message attributes
+	  in the thermal class on boards with a thermal-message node.
 
 endif

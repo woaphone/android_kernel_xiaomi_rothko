@@ -126,7 +126,13 @@ static void async_run_entry_fn(struct work_struct *work)
 		 entry->func, task_pid_nr(current));
 	calltime = ktime_get();
 
+	if (IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC) &&
+	    system_state < SYSTEM_RUNNING)
+		pr_info("rothko async: %llu %ps started\n", entry->cookie, entry->func);
 	entry->func(entry->data, entry->cookie);
+	if (IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC) &&
+	    system_state < SYSTEM_RUNNING)
+		pr_info("rothko async: %llu %ps completed\n", entry->cookie, entry->func);
 
 	pr_debug("initcall %lli_%pS returned after %lld usecs\n",
 		 (long long)entry->cookie, entry->func,

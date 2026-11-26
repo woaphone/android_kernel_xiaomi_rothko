@@ -945,6 +945,7 @@ enum pagetype {
 	PGTY_zsmalloc		= 0xf6,
 	PGTY_unaccepted		= 0xf7,
 	PGTY_large_kmalloc	= 0xf8,
+	PGTY_mali		= 0xf9,
 
 	PGTY_mapcount_underflow = 0xff
 };
@@ -1081,6 +1082,9 @@ FOLIO_TEST_FLAG_FALSE(hugetlb)
 
 PAGE_TYPE_OPS(Zsmalloc, zsmalloc, zsmalloc)
 
+/* Mali owns these PFN-mapped pages until they return to the buddy. */
+PAGE_TYPE_OPS(Mali, mali, mali)
+
 /*
  * Mark pages that has to be accepted before touched for the first time.
  *
@@ -1170,7 +1174,7 @@ PAGEFLAG_FALSE(MovableOpsIsolated, movable_ops_isolated);
 static inline bool page_has_movable_ops(const struct page *page)
 {
 	return PageMovableOps(page) &&
-	       (PageOffline(page) || PageZsmalloc(page));
+	       (PageOffline(page) || PageZsmalloc(page) || PageMali(page));
 }
 
 static __always_inline int PageAnonExclusive(const struct page *page)

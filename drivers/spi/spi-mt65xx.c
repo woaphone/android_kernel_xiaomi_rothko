@@ -10,6 +10,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/gpio/consumer.h>
@@ -30,11 +31,13 @@
 #define SPI_RX_DATA_REG			0x0014
 #define SPI_CMD_REG			0x0018
 #define SPI_STATUS0_REG			0x001c
+#define SPI_STATUS1_REG			0x0020
 #define SPI_PAD_SEL_REG			0x0024
 #define SPI_CFG2_REG			0x0028
 #define SPI_TX_SRC_REG_64		0x002c
 #define SPI_RX_DST_REG_64		0x0030
 #define SPI_CFG3_IPM_REG		0x0040
+#define SPI_CFG5_REG			0x0068
 
 #define SPI_CFG0_SCK_HIGH_OFFSET	0
 #define SPI_CFG0_SCK_LOW_OFFSET		8
@@ -76,6 +79,7 @@
 #define SPI_CMD_TX_ENDIAN		BIT(15)
 #define SPI_CMD_FINISH_IE		BIT(16)
 #define SPI_CMD_PAUSE_IE		BIT(17)
+#define SPI_CMD_CS_PIN_SEL		BIT(18)
 #define SPI_CMD_IPM_NONIDLE_MODE	BIT(19)
 #define SPI_CMD_IPM_SPIM_LOOP		BIT(21)
 #define SPI_CMD_IPM_GET_TICKDLY_OFFSET	22
@@ -108,6 +112,7 @@
 #define MTK_SPI_PAUSED			1
 
 #define MTK_SPI_32BITS_MASK		(0xffffffff)
+#define MTK_SPI_FIFO_POLLING_TIMEOUT	200000
 
 #define DMA_ADDR_EXT_BITS		(36)
 #define DMA_ADDR_DEF_BITS		(32)
@@ -128,6 +133,8 @@ struct mtk_spi_compatible {
 	bool dma_ext;
 	bool no_need_unprepare;
 	bool ipm_design;
+	bool sw_cs;
+	bool enhance_packet_len;
 };
 
 /**
@@ -228,6 +235,15 @@ static const struct mtk_spi_compatible mt6991_compat = {
 	.ipm_design = true,
 };
 
+static const struct mtk_spi_compatible mt6989_compat = {
+	.need_pad_sel = true,
+	.enhance_timing = true,
+	.dma_ext = true,
+	.ipm_design = true,
+	.sw_cs = true,
+	.enhance_packet_len = true,
+};
+
 /*
  * A piece of default chip info unless the platform
  * supplies it.
@@ -238,6 +254,9 @@ static const struct mtk_chip_config mtk_default_chip_info = {
 };
 
 static const struct of_device_id mtk_spi_of_match[] = {
+	{ .compatible = "mediatek,mt6989-spi",
+		.data = (void *)&mt6989_compat,
+	},
 	{ .compatible = "mediatek,spi-ipm",
 		.data = (void *)&mtk_ipm_compat,
 	},
@@ -292,6 +311,8 @@ static void mtk_spi_reset(struct mtk_spi *mdata)
 
 	reg_val = readl(mdata->base + SPI_CMD_REG);
 	reg_val &= ~SPI_CMD_RST;
+	if (mdata->dev_comp->sw_cs)
+		reg_val &= ~SPI_CMD_CS_PIN_SEL;
 	writel(reg_val, mdata->base + SPI_CMD_REG);
 }
 
@@ -367,8 +388,13 @@ static int mtk_spi_hw_init(struct spi_controller *host,
 {
 	u16 cpha, cpol;
 	u32 reg_val;
-	struct mtk_chip_config *chip_config = spi->controller_data;
+	const struct mtk_chip_config *chip_config = spi->controller_data;
 	struct mtk_spi *mdata = spi_controller_get_devdata(host);
+
+	if (!chip_config)
+		chip_config = spi_get_ctldata(spi);
+	if (!chip_config)
+		chip_config = &mtk_default_chip_info;
 
 	cpu_latency_qos_update_request(&mdata->qos_request, 500);
 	cpha = spi->mode & SPI_CPHA ? 1 : 0;
@@ -378,6 +404,8 @@ static int mtk_spi_hw_init(struct spi_controller *host,
 	if (mdata->dev_comp->ipm_design) {
 		/* SPI transfer without idle time until packet length done */
 		reg_val |= SPI_CMD_IPM_NONIDLE_MODE;
+		if (mdata->dev_comp->sw_cs)
+			reg_val |= SPI_CMD_CS_PIN_SEL;
 		if (spi->mode & SPI_LOOP)
 			reg_val |= SPI_CMD_IPM_SPIM_LOOP;
 		else
@@ -424,8 +452,13 @@ static int mtk_spi_hw_init(struct spi_controller *host,
 			reg_val &= ~SPI_CMD_SAMPLE_SEL;
 	}
 
-	/* set finish and pause interrupt always enable */
-	reg_val |= SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE;
+	if (mdata->dev_comp->sw_cs) {
+		reg_val |= SPI_CMD_FINISH_IE;
+		reg_val &= ~SPI_CMD_PAUSE_IE;
+	} else {
+		/* set finish and pause interrupt always enable */
+		reg_val |= SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE;
+	}
 
 	/* disable dma mode */
 	reg_val &= ~(SPI_CMD_TX_DMA | SPI_CMD_RX_DMA);
@@ -492,6 +525,18 @@ static void mtk_spi_set_cs(struct spi_device *spi, bool enable)
 		enable = !enable;
 
 	reg_val = readl(mdata->base + SPI_CMD_REG);
+	if (mdata->dev_comp->sw_cs) {
+		if (!enable) {
+			reg_val |= SPI_CMD_CS_POL;
+			writel(reg_val, mdata->base + SPI_CMD_REG);
+		} else {
+			reg_val &= ~SPI_CMD_CS_POL;
+			writel(reg_val, mdata->base + SPI_CMD_REG);
+			mdata->state = MTK_SPI_IDLE;
+			mtk_spi_reset(mdata);
+		}
+		return;
+	}
 	if (!enable) {
 		reg_val |= SPI_CMD_PAUSE_EN;
 		writel(reg_val, mdata->base + SPI_CMD_REG);
@@ -540,6 +585,18 @@ static void mtk_spi_setup_packet(struct spi_controller *host)
 {
 	u32 packet_size, packet_loop, reg_val;
 	struct mtk_spi *mdata = spi_controller_get_devdata(host);
+
+	if (mdata->dev_comp->enhance_packet_len) {
+		reg_val = readl(mdata->base + SPI_CFG1_REG);
+		reg_val &= ~(SPI_CFG1_IPM_PACKET_LENGTH_MASK |
+			     SPI_CFG1_PACKET_LOOP_MASK);
+		reg_val |= ((mdata->xfer_len - 1) & GENMASK(15, 0)) <<
+			   SPI_CFG1_PACKET_LENGTH_OFFSET;
+		writel(reg_val, mdata->base + SPI_CFG1_REG);
+		writel((mdata->xfer_len - 1) >> 16,
+		       mdata->base + SPI_CFG5_REG);
+		return;
+	}
 
 	if (mdata->dev_comp->ipm_design)
 		packet_size = min_t(u32,
@@ -595,6 +652,9 @@ static void mtk_spi_enable_transfer(struct spi_controller *host)
 static int mtk_spi_get_mult_delta(struct mtk_spi *mdata, u32 xfer_len)
 {
 	u32 mult_delta = 0;
+
+	if (mdata->dev_comp->enhance_packet_len)
+		return 0;
 
 	if (mdata->dev_comp->ipm_design) {
 		if (xfer_len > MTK_SPI_IPM_PACKET_SIZE)
@@ -708,6 +768,10 @@ static int mtk_spi_dma_transfer(struct spi_controller *host,
 	mtk_spi_prepare_transfer(host, xfer->speed_hz);
 
 	cmd = readl(mdata->base + SPI_CMD_REG);
+	if (mdata->dev_comp->sw_cs) {
+		cmd |= SPI_CMD_FINISH_IE;
+		cmd &= ~SPI_CMD_PAUSE_IE;
+	}
 	if (xfer->tx_buf)
 		cmd |= SPI_CMD_TX_DMA;
 	if (xfer->rx_buf)
@@ -736,6 +800,70 @@ static int mtk_spi_dma_transfer(struct spi_controller *host,
 	return 1;
 }
 
+static int mt6989_spi_fifo_transfer(struct spi_controller *host,
+				  struct spi_device *spi,
+				  struct spi_transfer *xfer)
+{
+	struct mtk_spi *mdata = spi_controller_get_devdata(host);
+	u32 reg_val, cnt, remainder, len, irq_status;
+	int ret;
+
+	mdata->cur_transfer = xfer;
+	mdata->num_xfered = 0;
+	mtk_spi_prepare_transfer(host, xfer->speed_hz);
+
+	reg_val = readl(mdata->base + SPI_CMD_REG);
+	reg_val &= ~(SPI_CMD_FINISH_IE | SPI_CMD_PAUSE_IE);
+	writel(reg_val, mdata->base + SPI_CMD_REG);
+
+	while (mdata->num_xfered < xfer->len) {
+		len = xfer->len - mdata->num_xfered;
+		mdata->xfer_len = min(MTK_SPI_MAX_FIFO_SIZE, len);
+		mtk_spi_setup_packet(host);
+
+		if (xfer->tx_buf) {
+			cnt = mdata->xfer_len / 4;
+			iowrite32_rep(mdata->base + SPI_TX_DATA_REG,
+				      xfer->tx_buf + mdata->num_xfered, cnt);
+			remainder = mdata->xfer_len % 4;
+			if (remainder) {
+				reg_val = 0;
+				memcpy(&reg_val,
+				       xfer->tx_buf + mdata->num_xfered + cnt * 4,
+				       remainder);
+				writel(reg_val, mdata->base + SPI_TX_DATA_REG);
+			}
+		}
+
+		mtk_spi_enable_transfer(host);
+		ret = readl_poll_timeout_atomic(mdata->base + SPI_STATUS1_REG,
+					irq_status, irq_status, 1,
+					MTK_SPI_FIFO_POLLING_TIMEOUT);
+		if (ret) {
+			dev_err(mdata->dev, "SPI PIO polling timeout\n");
+			mtk_spi_reset(mdata);
+			return ret;
+		}
+
+		reg_val = readl(mdata->base + SPI_STATUS0_REG);
+		mdata->state = reg_val & MTK_SPI_PAUSE_INT_STATUS ?
+			       MTK_SPI_PAUSED : MTK_SPI_IDLE;
+		if (xfer->rx_buf) {
+			cnt = mdata->xfer_len / 4;
+			ioread32_rep(mdata->base + SPI_RX_DATA_REG,
+				     xfer->rx_buf + mdata->num_xfered, cnt);
+			remainder = mdata->xfer_len % 4;
+			if (remainder) {
+				reg_val = readl(mdata->base + SPI_RX_DATA_REG);
+				memcpy(xfer->rx_buf + mdata->num_xfered + cnt * 4,
+				       &reg_val, remainder);
+			}
+		}
+		mdata->num_xfered += mdata->xfer_len;
+	}
+	return 0;
+}
+
 static int mtk_spi_transfer_one(struct spi_controller *host,
 				struct spi_device *spi,
 				struct spi_transfer *xfer)
@@ -761,6 +889,8 @@ static int mtk_spi_transfer_one(struct spi_controller *host,
 
 	if (host->can_dma(host, spi, xfer))
 		return mtk_spi_dma_transfer(host, spi, xfer);
+	else if (mdata->dev_comp == &mt6989_compat)
+		return mt6989_spi_fifo_transfer(host, spi, xfer);
 	else
 		return mtk_spi_fifo_transfer(host, spi, xfer);
 }
@@ -778,15 +908,37 @@ static bool mtk_spi_can_dma(struct spi_controller *host,
 static int mtk_spi_setup(struct spi_device *spi)
 {
 	struct mtk_spi *mdata = spi_controller_get_devdata(spi->controller);
+	struct device_node *np = spi->controller->dev.parent->of_node;
+	struct mtk_chip_config *chip_config;
+	u32 tick_delay;
 
-	if (!spi->controller_data)
-		spi->controller_data = (void *)&mtk_default_chip_info;
+	if (mdata->dev_comp == &mt6989_compat && !spi->controller_data &&
+	    !spi_get_ctldata(spi) &&
+	    !of_property_read_u32_index(np, "mediatek,tickdly",
+					mdata->pad_sel[0], &tick_delay)) {
+		if (tick_delay >= 8)
+			return -EINVAL;
+
+		/* SPI core runs setup before the peripheral driver is probed. */
+		chip_config = kmemdup(&mtk_default_chip_info,
+				      sizeof(*chip_config), GFP_KERNEL);
+		if (!chip_config)
+			return -ENOMEM;
+		chip_config->tick_delay = tick_delay;
+		spi_set_ctldata(spi, chip_config);
+	}
 
 	if (mdata->dev_comp->need_pad_sel && spi_get_csgpiod(spi, 0))
 		/* CS de-asserted, gpiolib will handle inversion */
 		gpiod_direction_output(spi_get_csgpiod(spi, 0), 0);
 
 	return 0;
+}
+
+static void mtk_spi_cleanup(struct spi_device *spi)
+{
+	kfree(spi_get_ctldata(spi));
+	spi_set_ctldata(spi, NULL);
 }
 
 static irqreturn_t mtk_spi_interrupt_thread(int irq, void *dev_id)
@@ -904,6 +1056,10 @@ static int mtk_spi_mem_adjust_op_size(struct spi_mem *mem,
 				      struct spi_mem_op *op)
 {
 	int opcode_len;
+	struct mtk_spi *mdata = spi_controller_get_devdata(mem->spi->controller);
+
+	if (mdata->dev_comp->enhance_packet_len)
+		return 0;
 
 	if (op->data.dir != SPI_MEM_NO_DATA) {
 		opcode_len = 1 + op->addr.nbytes + op->dummy.nbytes;
@@ -920,6 +1076,8 @@ static int mtk_spi_mem_adjust_op_size(struct spi_mem *mem,
 static bool mtk_spi_mem_supports_op(struct spi_mem *mem,
 				    const struct spi_mem_op *op)
 {
+	struct mtk_spi *mdata = spi_controller_get_devdata(mem->spi->controller);
+
 	if (!spi_mem_default_supports_op(mem, op))
 		return false;
 
@@ -927,10 +1085,16 @@ static bool mtk_spi_mem_supports_op(struct spi_mem *mem,
 	    op->addr.buswidth != op->dummy.buswidth)
 		return false;
 
-	if (op->addr.nbytes + op->dummy.nbytes > 16)
+	if (op->addr.nbytes + op->dummy.nbytes >
+	    (mdata->dev_comp->enhance_packet_len ? 15 : 16))
 		return false;
 
-	if (op->data.nbytes > MTK_SPI_IPM_PACKET_SIZE) {
+	if (mdata->dev_comp->enhance_packet_len &&
+	    op->data.dir != SPI_MEM_NO_DATA && !op->data.nbytes)
+		return false;
+
+	if (!mdata->dev_comp->enhance_packet_len &&
+	    op->data.nbytes > MTK_SPI_IPM_PACKET_SIZE) {
 		if (op->data.nbytes / MTK_SPI_IPM_PACKET_SIZE >
 		    MTK_SPI_IPM_PACKET_LOOP ||
 		    op->data.nbytes % MTK_SPI_IPM_PACKET_SIZE != 0)
@@ -988,6 +1152,8 @@ static int mtk_spi_transfer_wait(struct spi_mem *mem,
 	if (!wait_for_completion_timeout(&mdata->spimem_done,
 					 msecs_to_jiffies(ms))) {
 		dev_err(mdata->dev, "spi-mem transfer timeout\n");
+		if (mdata->dev_comp->enhance_packet_len)
+			mtk_spi_reset(mdata);
 		return -ETIMEDOUT;
 	}
 
@@ -1023,7 +1189,11 @@ static int mtk_spi_mem_exec_op(struct spi_mem *mem,
 	/* data byte len */
 	if (op->data.dir == SPI_MEM_NO_DATA) {
 		reg_val |= SPI_CFG3_IPM_NODATA_FLAG;
-		writel(0, mdata->base + SPI_CFG1_REG);
+		if (mdata->dev_comp->enhance_packet_len)
+			writel(readl(mdata->base + SPI_CFG1_REG) &
+			       SPI_CFG1_CS_IDLE_MASK, mdata->base + SPI_CFG1_REG);
+		else
+			writel(0, mdata->base + SPI_CFG1_REG);
 	} else {
 		reg_val &= ~SPI_CFG3_IPM_NODATA_FLAG;
 		mdata->xfer_len = op->data.nbytes;
@@ -1145,7 +1315,8 @@ unmap_rx_dma:
 	if (op->data.dir == SPI_MEM_DATA_IN) {
 		dma_unmap_single(mdata->dev, mdata->rx_dma,
 				 op->data.nbytes, DMA_FROM_DEVICE);
-		if (!IS_ALIGNED((size_t)op->data.buf.in, 4))
+		if (!IS_ALIGNED((size_t)op->data.buf.in, 4) &&
+		    (!mdata->dev_comp->enhance_packet_len || !ret))
 			memcpy(op->data.buf.in, rx_tmp_buf, op->data.nbytes);
 	}
 kfree_rx_tmp_buf:
@@ -1193,6 +1364,7 @@ static int mtk_spi_probe(struct platform_device *pdev)
 	host->transfer_one = mtk_spi_transfer_one;
 	host->can_dma = mtk_spi_can_dma;
 	host->setup = mtk_spi_setup;
+	host->cleanup = mtk_spi_cleanup;
 	host->set_cs_timing = mtk_spi_set_hw_cs_timing;
 	host->use_gpio_descriptors = true;
 
@@ -1481,6 +1653,26 @@ static const struct dev_pm_ops mtk_spi_pm = {
 	SET_RUNTIME_PM_OPS(mtk_spi_runtime_suspend,
 			   mtk_spi_runtime_resume, NULL)
 };
+
+void mt_spi_disable_master_clk(struct spi_device *spi)
+{
+	struct mtk_spi *mdata = spi_controller_get_devdata(spi->controller);
+
+	clk_disable_unprepare(mdata->spi_clk);
+}
+EXPORT_SYMBOL(mt_spi_disable_master_clk);
+
+void mt_spi_enable_master_clk(struct spi_device *spi)
+{
+	struct mtk_spi *mdata = spi_controller_get_devdata(spi->controller);
+	int ret;
+
+	ret = clk_prepare_enable(mdata->spi_clk);
+	if (ret)
+		dev_err(spi->controller->dev.parent,
+			"failed to enable SPI master clock: %d\n", ret);
+}
+EXPORT_SYMBOL(mt_spi_enable_master_clk);
 
 static struct platform_driver mtk_spi_driver = {
 	.driver = {

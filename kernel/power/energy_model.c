@@ -14,6 +14,7 @@
 #include <linux/cpumask.h>
 #include <linux/debugfs.h>
 #include <linux/energy_model.h>
+#include <linux/of.h>
 #include <linux/sched/topology.h>
 #include <linux/slab.h>
 
@@ -456,6 +457,10 @@ em_cpufreq_update_efficiencies(struct device *dev, struct em_perf_state *table)
 	int i, cpu;
 
 	if (!_is_cpu_device(dev))
+		return;
+
+	/* Keep the complete firmware OPP table selectable on MT6989. */
+	if (of_machine_is_compatible("mediatek,MT6989"))
 		return;
 
 	/* Try to get a CPU which is active and in this PD */

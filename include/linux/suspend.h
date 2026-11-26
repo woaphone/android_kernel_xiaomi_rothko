@@ -34,6 +34,16 @@ static inline void pm_restore_console(void)
 
 typedef int __bitwise suspend_state_t;
 
+#if defined(CONFIG_SUSPEND) && defined(CONFIG_DRM_ROTHKO_N12) && \
+	defined(CONFIG_PM_SLEEP_DEBUG)
+void rothko_s2idle_resume_stage(const char *stage);
+void rothko_s2idle_vcp_wait(const char *operation, int feature, unsigned long caller);
+#else
+static inline void rothko_s2idle_resume_stage(const char *stage) { }
+static inline void rothko_s2idle_vcp_wait(const char *operation, int feature,
+					 unsigned long caller) { }
+#endif
+
 #define PM_SUSPEND_ON		((__force suspend_state_t) 0)
 #define PM_SUSPEND_TO_IDLE	((__force suspend_state_t) 1)
 #define PM_SUSPEND_STANDBY	((__force suspend_state_t) 2)

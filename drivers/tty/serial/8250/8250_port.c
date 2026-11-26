@@ -1524,7 +1524,8 @@ static void serial8250_start_tx(struct uart_port *port)
 	/* Port locked to synchronize UART_IER access against the console. */
 	lockdep_assert_held_once(&port->lock);
 
-	if (!port->x_char && kfifo_is_empty(&port->state->port.xmit_fifo))
+	if (port->tx_dma_fault || port->tx_dma_shutdown ||
+	    (!port->x_char && kfifo_is_empty(&port->state->port.xmit_fifo)))
 		return;
 
 	serial8250_rpm_get_tx(up);
@@ -1674,6 +1675,10 @@ void serial8250_tx_chars(struct uart_8250_port *up)
 	struct tty_port *tport = &port->state->port;
 	int count;
 
+	if (port->tx_dma_fault || port->tx_dma_shutdown) {
+		serial8250_stop_tx(port);
+		return;
+	}
 	if (port->x_char) {
 		uart_xchar_out(port, UART_TX);
 		return;
@@ -2366,6 +2371,8 @@ void serial8250_do_shutdown(struct uart_port *port)
 	 * Synchronize UART_IER access against the console.
 	 */
 	scoped_guard(uart_port_lock_irqsave, port) {
+		if (up->dma && up->dma->tx_check_cookie)
+			port->tx_dma_shutdown = true;
 		up->ier = 0;
 		serial_port_out(port, UART_IER, 0);
 	}

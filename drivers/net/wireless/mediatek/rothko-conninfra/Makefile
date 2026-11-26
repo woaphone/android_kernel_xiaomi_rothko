@@ -1,0 +1,10 @@
+export DEVICE_MODULES_PATH := $(srctree)/drivers/net/wireless/mediatek/rothko-conninfra/vendor
+obj-$(CONFIG_MTK_CLKBUF_CTRL) += vendor/drivers/misc/mediatek/clkbuf/
+obj-$(CONFIG_MTK_ROTHKO_CONNINFRA) += vendor/drivers/misc/mediatek/connectivity/
+obj-$(CONFIG_MTK_ROTHKO_CONNINFRA) += conninfra/
+obj-$(CONFIG_MTK_ROTHKO_CONNFEM) += connfem/
+obj-$(CONFIG_MTK_UARTHUB) += uarthub/
+obj-$(CONFIG_MTK_ROTHKO_BT) += bt/
+obj-$(CONFIG_MTK_ROTHKO_WLAN) += wlan-adaptor/ wlan/
+obj-$(CONFIG_MTK_ROTHKO_GPS_SCP) += gps-scp/
+obj-$(CONFIG_MTK_ROTHKO_GPS_DATA_LINK) += gps-data-link/

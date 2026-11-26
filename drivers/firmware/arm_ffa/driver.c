@@ -150,6 +150,14 @@ static int ffa_version_check(u32 *version)
 	pr_info("Firmware version %d.%d found\n", FFA_MAJOR_VERSION(ver.a0),
 		FFA_MINOR_VERSION(ver.a0));
 	*version = ffa_compatible_version_find(ver.a0);
+	/* FFA_VERSION also tells firmware which ABI this endpoint will use. */
+	if (*version != FFA_DRIVER_VERSION) {
+		invoke_ffa_fn((ffa_value_t){
+			      .a0 = FFA_VERSION, .a1 = *version,
+			      }, &ver);
+		if ((s32)ver.a0 == FFA_RET_NOT_SUPPORTED)
+			return -EOPNOTSUPP;
+	}
 
 	return 0;
 }
@@ -216,6 +224,8 @@ static int ffa_features(u32 func_feat_id, u32 input_props,
 
 	if (id.a0 == FFA_ERROR)
 		return ffa_to_linux_errno((int)id.a2);
+	if ((s32)id.a0 == FFA_RET_NOT_SUPPORTED)
+		return -EOPNOTSUPP;
 
 	if (if_props_1)
 		*if_props_1 = id.a2;
@@ -369,7 +379,8 @@ ffa_partition_probe(const uuid_t *uuid, struct ffa_partition_info **buffer)
 	bool reg_mode = false;
 	struct ffa_partition_info *pbuf;
 
-	if (!ffa_features(FFA_PARTITION_INFO_GET_REGS, 0, NULL, NULL))
+	if (drv_info->version >= FFA_VERSION_1_2 &&
+	    !ffa_features(FFA_PARTITION_INFO_GET_REGS, 0, NULL, NULL))
 		reg_mode = true;
 
 	export_uuid((u8 *)uuid0_4, uuid);
@@ -1077,8 +1088,9 @@ static void ffa_drvinfo_flags_init(void)
 	    !ffa_features(FFA_FN_NATIVE(MEM_SHARE), 0, NULL, NULL))
 		drv_info->mem_ops_native = true;
 
-	if (!ffa_features(FFA_MSG_SEND_DIRECT_REQ2, 0, NULL, NULL) ||
-	    !ffa_features(FFA_MSG_SEND_DIRECT_RESP2, 0, NULL, NULL))
+	if (drv_info->version >= FFA_VERSION_1_2 &&
+	    (!ffa_features(FFA_MSG_SEND_DIRECT_REQ2, 0, NULL, NULL) ||
+	     !ffa_features(FFA_MSG_SEND_DIRECT_RESP2, 0, NULL, NULL)))
 		drv_info->msg_direct_req2_supp = true;
 }
 
@@ -1989,6 +2001,9 @@ static void ffa_notifications_cleanup(void)
 static void ffa_notifications_setup(void)
 {
 	int ret;
+
+	if (drv_info->version < FFA_VERSION_1_1)
+		return;
 
 	ret = ffa_features(FFA_NOTIFICATION_BITMAP_CREATE, 0, NULL, NULL);
 	if (!ret) {

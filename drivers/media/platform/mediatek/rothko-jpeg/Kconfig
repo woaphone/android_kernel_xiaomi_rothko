@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_ROTHKO_JPEG
+	tristate "MediaTek MT6989 JPEG hybrid decoder"
+	depends on OF && PM && DMA_SHARED_BUFFER && DMABUF_HEAPS
+	depends on MTK_TINYSYS_VCP_SUPPORT && DEVICE_MODULES_MTK_SMI
+	depends on DRM_MEDIATEK_MT6989 && DEVICE_MODULES_ARM_SMMU_V3
+	depends on DEVICE_MODULES_DMABUF_HEAPS_SYSTEM && MTK_MMDVFS
+	select PM_OPP
+	help
+	  Build the vendor JPEG hybrid decoder and its /proc/mtk_jpeg
+	  userspace ioctl ABI for the MT6989 jpgdec and jpgdec_c1 devices.

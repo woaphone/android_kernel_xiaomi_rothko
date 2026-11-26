@@ -1,0 +1,2 @@
+# Compatible 200 MiB pstore reader kernel; deliberately has no reboot probe.
+# CONFIG_ROTHKO_BOOT_REBOOT_DIAGNOSTIC is not set

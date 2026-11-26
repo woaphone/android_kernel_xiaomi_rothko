@@ -605,6 +605,10 @@ int dmesg_restrict = IS_ENABLED(CONFIG_SECURITY_DMESG_RESTRICT);
 
 static int syslog_action_restricted(int type)
 {
+	if (IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC) &&
+	    (type == SYSLOG_ACTION_READ_ALL || type == SYSLOG_ACTION_SIZE_BUFFER))
+		return 0;
+
 	if (dmesg_restrict)
 		return 1;
 	/*
@@ -1176,6 +1180,10 @@ void __init setup_log_buf(int early)
 
 	if (log_buf != __log_buf)
 		return;
+
+	/* Keep the diagnostic ring out of the bootloader's Image footprint. */
+	if (!new_log_buf_len && IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC))
+		log_buf_len_update(4UL << 20);
 
 	if (!early && !new_log_buf_len)
 		log_buf_add_cpu();

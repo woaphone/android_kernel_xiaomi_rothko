@@ -1603,8 +1603,12 @@ static int __ref kernel_init(void *unused)
 	wait_for_completion(&kthreadd_done);
 
 	kernel_init_freeable();
+	if (IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC))
+		pr_info("rothko boot: waiting for asynchronous init\n");
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
+	if (IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC))
+		pr_info("rothko boot: asynchronous init completed\n");
 
 	system_state = SYSTEM_FREEING_INITMEM;
 	kprobe_free_init_mem();
@@ -1713,10 +1717,14 @@ static noinline void __init kernel_init_freeable(void)
 	page_alloc_init_late();
 
 	do_basic_setup();
+	if (IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC))
+		pr_info("rothko boot: basic driver setup completed\n");
 
 	kunit_run_all_tests();
 
 	wait_for_initramfs();
+	if (IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC))
+		pr_info("rothko boot: initial rootfs population completed\n");
 	console_on_rootfs();
 
 	/*

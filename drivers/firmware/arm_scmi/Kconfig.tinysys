@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_TINYSYS_SCMI
+	tristate "MediaTek Tinysys SCMI protocol 0x80"
+	depends on ARM_SCMI_PROTOCOL && OF
+	depends on ARM_SCMI_TRANSPORT_MAILBOX
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  MT6989 vendor Tinysys SET, GET and feature notification protocol.
+	  The module is tinysys-scmi. It uses the SCMI mailbox transport
+	  and exports the original MediaTek client operations.

@@ -1726,8 +1726,15 @@ int usb_gadget_register_driver_owner(struct usb_gadget_driver *driver,
 	mutex_lock(&udc_lock);
 	if (!driver->is_bound) {
 		if (driver->match_existing_only) {
-			pr_warn("%s: couldn't find an available UDC or it's busy\n",
-					driver->function);
+			struct usb_udc *udc;
+
+			pr_warn_ratelimited("%s: no available UDC for '%s' (registered list %s)\n",
+				driver->function, driver->udc_name ?: "any",
+				list_empty(&udc_list) ? "empty" : "non-empty");
+			list_for_each_entry(udc, &udc_list, list)
+				pr_warn_ratelimited("UDC '%s': bound gadget '%s'\n",
+					dev_name(&udc->dev),
+					udc->driver ? udc->driver->function : "none");
 			ret = -EBUSY;
 		} else {
 			pr_info("%s: couldn't find an available UDC\n",

@@ -1,3 +1,31 @@
+# Redmi K70 Ultra (`rothko`) — Linux 6.18 port
+
+Experimental kernel source for the MediaTek MT6989 Redmi K70 Ultra. This is the kernel **`common/`** repository, not a complete Android kernel workspace and not a flashable image. It is downstream work, not an official Xiaomi or Google release.
+
+## Base and build
+
+- Android Common Kernel: `android17-6.18`, base `76bdb627cab87dfa1d901810e22ee7fae6d3dc89`.
+- Tested workspace references: AOSP `kernel/manifest` at `46a1a5274ff0b40419952c861a8958bba5f28cfc`, Kleaf (`kernel/build`) at `cdaf8a663270411b6864193b32c30f0166756677`.
+- Start from the matching AOSP kernel manifest workspace, then check this port out as its `common/` checkout. Run from the workspace root:
+
+```sh
+tools/bazel run --config=fast --jobs=8 --lto=none   --incompatible_autoload_build_config_constants=if_unset   --defconfig_fragment=//common:rothko_kernelsu_defconfigs   //common:rothko_dist -- --destdir=out/rothko/dist
+```
+
+This is the development profile used in testing: it includes KernelSU and a permissive SELinux diagnostic configuration. It is **not a production security configuration**. The underlying working tree built the diagnostic kernel; this publication-only subset has not been independently built from a fresh workspace. Device-specific image packaging, keys, original modules and proprietary firmware/userspace are not included.
+
+## Status
+
+- Android boots on the tested device. Display, touch, and torch operation were observed; torch thermal-HAL compatibility is not complete.
+- Ordinary CPU deep idle and sleep-related reboot remain unresolved. The latest source adds diagnostic observations, not a fix for either issue.
+- Under-display fingerprint authentication is not implemented in this port. Do not treat this tree as a complete device bring-up.
+
+## Source attribution
+
+The port is based on [AOSP kernel/common](https://android.googlesource.com/kernel/common), with MediaTek code from published downstream trees including [OnePlusOSS MT6989](https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_mt6989) (`d60d564c82de298fe4909657c31c29c73ba25aba`) and [Xiaomi OSS](https://github.com/MiCode/Xiaomi_Kernel_OpenSource) (`bsp-rothko-u-oss`). See also [MiCode MTK kernel modules](https://github.com/MiCode/MTK_kernel_modules). KernelSU is vendored at v3.3.1 (`0c0fdb960178fa12d80d6cbcfdcb6ad8be6a865d`); its license is in `drivers/kernelsu/LICENSE`. Existing notices have been retained; see `COPYING`, `LICENSES/` and the individual source files. Local build artifacts, personal logs, an unused restricted Mali header, and unused vendor Android packaging makefiles were excluded from this source release.
+
+---
+
 # How do I submit patches to Android Common Kernels
 
 1. BEST: Make all of your changes to upstream Linux. If appropriate, backport to the stable releases.

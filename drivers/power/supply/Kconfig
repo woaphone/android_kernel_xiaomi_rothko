@@ -1097,4 +1097,51 @@ config FUEL_GAUGE_MM8013
 	  the state of charge, temperature, cycle count, actual and design
 	  capacity, etc.
 
+config MTK_CHARGER
+	tristate "MediaTek Charging Driver"
+	depends on TCPC_CLASS
+	help
+	  MediaTek charger classes, charging control and USB PD adapter support.
+
+config MTK_PUMP_EXPRESS
+	bool "MediaTek Pump Express and Pump Express 2.0 algorithms"
+	depends on MTK_CHARGER=y && CHARGER_MT6375=y
+	help
+	  Register the PE and PE2 algorithms for compatible device tree nodes.
+	  The charger manager selects which algorithms may negotiate.
+
+config MTK_CHARGER_TYPE_DETECT
+	tristate "MediaTek charger type detection"
+	depends on MTK_CHARGER
+
+config CHARGER_MT6375
+	tristate "MT6375 charger driver"
+	depends on MFD_MT6375 && MTK_CHARGER
+	help
+	  MT6375 switching charger and OTG control.
+
+config MTK_ROTHKO_USB_POWER_SUPPLY
+	bool "Redmi K70 Ultra USB power supply reporting"
+	depends on CHARGER_MT6375
+	help
+	  Expose the USB power supply used by the stock Xiaomi health stack,
+	  using the MT6375 charger's live attachment and charger type information.
+
+config ROTHKO_SC858X_READBACK
+	bool "Redmi K70 Ultra SC858x pump status and ADC readback"
+	depends on MTK_ROTHKO_USB_POWER_SUPPLY && I2C=y && OF
+	help
+	  Read the board's master and slave pump status and last ADC samples
+	  through the USB supply attributes when no control driver is bound.
+
+config GAUGE_MT6375
+	tristate "MT6375 fuel gauge driver"
+	depends on MFD_MT6375 && MEDIATEK_MT6375_AUXADC
+	help
+	  MT6375 battery fuel gauge, coulomb service and fuelgauge daemon
+	  netlink interface.
+
+source "drivers/power/supply/rothko-ppb/Kconfig"
+source "drivers/power/supply/rothko-power-throttling/Kconfig"
+
 endif # POWER_SUPPLY

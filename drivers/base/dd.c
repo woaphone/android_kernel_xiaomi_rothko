@@ -195,6 +195,7 @@ void driver_deferred_probe_trigger(void)
 	 */
 	queue_work(system_unbound_wq, &deferred_probe_work);
 }
+EXPORT_SYMBOL_GPL(driver_deferred_probe_trigger);
 
 /**
  * device_block_probing() - Block/defer device's probes
@@ -666,6 +667,9 @@ static int really_probe(struct device *dev, const struct device_driver *drv)
 {
 	bool test_remove = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE) &&
 			   !drv->suppress_bind_attrs;
+	bool rothko_ufs_boot = IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC) &&
+			       system_state < SYSTEM_RUNNING &&
+			       !strcmp(drv->name, "ufshcd-mtk");
 	int ret, link_ret;
 
 	if (defer_all_probes) {
@@ -679,8 +683,15 @@ static int really_probe(struct device *dev, const struct device_driver *drv)
 	}
 
 	link_ret = device_links_check_suppliers(dev);
-	if (link_ret == -EPROBE_DEFER)
+	if (link_ret == -EPROBE_DEFER) {
+		if (rothko_ufs_boot) {
+			mutex_lock(&deferred_probe_mutex);
+			dev_info(dev, "rothko UFS: probe deferred before callback: %s",
+				 dev->p->deferred_probe_reason ?: "supplier not ready\n");
+			mutex_unlock(&deferred_probe_mutex);
+		}
 		return link_ret;
+	}
 
 	dev_dbg(dev, "bus: '%s': %s: probing driver %s with device\n",
 		drv->bus->name, __func__, drv->name);
@@ -716,7 +727,12 @@ re_probe:
 			goto probe_failed;
 	}
 
+	if (rothko_ufs_boot)
+		dev_info(dev, "rothko UFS: calling probe (supplier check=%d)\n",
+			 link_ret);
 	ret = call_driver_probe(dev, drv);
+	if (rothko_ufs_boot)
+		dev_info(dev, "rothko UFS: probe returned %d\n", ret);
 	if (ret) {
 		/*
 		 * If fw_devlink_best_effort is active (denoted by -EAGAIN), the
@@ -1031,6 +1047,9 @@ static void __device_attach_async_helper(void *_dev, async_cookie_t cookie)
 		.want_async	= true,
 	};
 
+	if (IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC) &&
+	    system_state < SYSTEM_RUNNING)
+		dev_info(dev, "rothko async: %llu waiting for device lock\n", cookie);
 	device_lock(dev);
 
 	/*

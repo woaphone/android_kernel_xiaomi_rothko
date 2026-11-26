@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config MTK_MBRAINK
+	tristate "MediaTek MBrain battery telemetry"
+	depends on GAUGE_MT6375
+	help
+	  Expose the MediaTek MBrain battery information ioctl backed by the
+	  MT6375 fuel gauge.

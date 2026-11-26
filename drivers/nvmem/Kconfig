@@ -28,6 +28,12 @@ source "drivers/nvmem/layouts/Kconfig"
 
 # Devices
 
+config MT6681_EFUSE
+	tristate "MediaTek MT6681 PMIC eFuse"
+	depends on MFD_MT6681
+	help
+	  Read the MT6681 factory calibration cells used by the audio codec.
+
 config NVMEM_AN8855_EFUSE
 	tristate "Airoha AN8855 eFuse support"
 	depends on COMPILE_TEST
@@ -216,6 +222,16 @@ config NVMEM_MICROCHIP_OTPC
 	  This driver enable the OTP controller available on Microchip SAMA7G5
 	  SoCs. It controls the access to the OTP memory connected to it.
 
+config NVMEM_MTK_DEVINFO
+	tristate "MediaTek bootloader device information support"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on OF
+	help
+	  Expose the real fuse words supplied in chosen/atag,devinfo as a
+	  read-only NVMEM provider, including legacy fixed calibration cells.
+	  This uses the bootloader data and does not read or program fuse MMIO.
+	  The driver can be built as a module named mtk-devinfo.
+
 config NVMEM_MTK_EFUSE
 	tristate "Mediatek SoCs EFUSE support"
 	depends on ARCH_MEDIATEK || COMPILE_TEST
@@ -226,6 +242,14 @@ config NVMEM_MTK_EFUSE
 
 	  This driver can also be built as a module. If so, the module
 	  will be called efuse-mtk.
+
+config NVMEM_MT635X_EFUSE
+	tristate "MediaTek MT6363/MT6373 PMIC eFuse support"
+	depends on OF && MFD_MTK_SPMI_PMIC
+	help
+	  Expose the read-only OTP calibration cells of MT6363 and MT6373
+	  PMICs using their parent SPMI regmap. The module is named
+	  nvmem_mt635x_efuse.
 
 config NVMEM_MXS_OCOTP
 	tristate "Freescale MXS On-Chip OTP Memory Support"

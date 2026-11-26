@@ -19,15 +19,20 @@
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/msi.h>
+#include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/of_device.h>
 #include <linux/of_pci.h>
 #include <linux/pci.h>
 #include <linux/phy/phy.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
+
+#include <linux/soc/mediatek/mtk-pcie.h>
 
 #include "../pci.h"
 
@@ -65,6 +70,7 @@
 #define PCIE_LTSSM_STATUS_REG		0x150
 #define PCIE_LTSSM_STATE_MASK		GENMASK(28, 24)
 #define PCIE_LTSSM_STATE(val)		((val & PCIE_LTSSM_STATE_MASK) >> 24)
+#define PCIE_LTSSM_STATE_L0	0x10
 #define PCIE_LTSSM_STATE_L2_IDLE	0x14
 
 #define PCIE_LINK_STATUS_REG		0x154
@@ -129,6 +135,47 @@
 #define PCIE_ATR_TLP_TYPE_MEM		PCIE_ATR_TLP_TYPE(0)
 #define PCIE_ATR_TLP_TYPE_IO		PCIE_ATR_TLP_TYPE(2)
 
+#define MT6989_PCIE_COMPAT		"mediatek,mt6989-pcie"
+#define MT6989_CFG_CTRL			0x84
+#define MT6989_DISABLE_LTSSM		BIT(2)
+#define MT6989_ASPM_CTRL		0x15c
+#define MT6989_P2_SLEEP_TIME		GENMASK(31, 28)
+#define MT6989_AXI_IF_CTRL		0x1a8
+#define MT6989_AXI0_SLV_RESP_MASK	BIT(12)
+#define MT6989_WCPL_TIMEOUT		0x340
+#define MT6989_WCPL_TIMEOUT_4MS		4
+#define MT6989_APSRC_ACK		BIT(10)
+#define MT6989_DVFS_REQ_FORCE_OFF	BIT(12)
+#define MT6989_AXI_READ_ERR		GENMASK(18, 16)
+#define MT6989_SDES_EVT			BIT(31)
+#define MT6989_CONF_DEV2_CTL		0x10a8
+#define MT6989_CPL_TIMEOUT		GENMASK(3, 0)
+#define MT6989_CPL_TIMEOUT_64US		1
+#define MT6989_CPL_TIMEOUT_4MS		2
+#define MT6989_AER_UNC_STATUS		0x1204
+#define MT6989_AER_MALF_TLP		BIT(18)
+#define MT6989_AER_CO_STATUS		0x1210
+#define MT6989_AER_RX_ERR		BIT(0)
+#define MT6989_DRIVER_OWN_IRQ		BIT(27)
+#define MT6989_MSI_GRP1_OFFSET		0x0c
+#define MT6989_MSI_GRP2_BASE		0xdc0
+#define MT6989_MSI_GRP3_BASE		0xde0
+#define MT6989_PEXTP_RST_SET		0x8
+#define MT6989_PEXTP_RST_CLR		0xc
+#define MT6989_PEXTP_RST_PORT0		GENMASK(1, 0)
+#define MT6989_PEXTP_PWRCTL_0		0x40
+#define MT6989_HW_MTCMOS_EN		BIT(0)
+#define MT6989_VLP_PROTECT_STA		0x240
+#define MT6989_PORT0_PROTECT		(BIT(13) | BIT(11))
+#define MT6989_M07_CFG			0x3c
+#define MT6989_IGNORE_SETTLE_TIME	BIT(2)
+#define MT6989_BBCK2_FORCE_ACK		GENMASK(4, 3)
+#define MT6989_CENTRAL_CFG6		0x74
+#define MT6989_PMRC7_VOTE_MASK		BIT(7)
+#define MT6989_PCIE_CLKBUF_XO_ID		1
+#define MT6989_PMRC7_BBCK2_UNBIND	0x241
+#define MT6989_PMRC7_BBCK2_BIND		0x2c0
+
 #define MAX_NUM_PHY_RESETS		3
 
 #define PCIE_MTK_RESET_TIME_US		10
@@ -142,6 +189,7 @@ struct mtk_gen3_pcie;
 #define PCIE_CONF_LINK2_LCR2_LINK_SPEED	GENMASK(3, 0)
 
 enum mtk_gen3_pcie_flags {
+	MT6989_PORT0 = BIT(1),
 	SKIP_PCIE_RSTB	= BIT(0), /* Skip PERST# assertion during device
 				   * probing or suspend/resume phase to
 				   * avoid hw bugs/issues.
@@ -221,7 +269,272 @@ struct mtk_gen3_pcie {
 	DECLARE_BITMAP(msi_irq_in_use, PCIE_MSI_IRQS_NUM);
 
 	const struct mtk_gen3_pcie_pdata *soc;
+
+	/* MT6989 WLAN port 0 */
+	void __iomem *pextp;
+	void __iomem *vlp;
+	void __iomem *srclken;
+	bool rc_vote;
+	bool ep_vote;
 };
+
+/* Serialize endpoint operations with host teardown and config TLP headers. */
+static DEFINE_RAW_SPINLOCK(mt6989_lock);
+static struct mtk_gen3_pcie *mt6989_port0;
+static struct platform_driver mtk_pcie_driver;
+
+#if IS_REACHABLE(CONFIG_MTK_CLKBUF_CTRL)
+extern int clkbuf_xo_ctrl(char *cmd, int xo_id, u32 input);
+#endif
+
+static void mt6989_update_bits(void __iomem *reg, u32 mask, u32 value)
+{
+	u32 val = readl_relaxed(reg);
+
+	writel_relaxed((val & ~mask) | value, reg);
+}
+
+static bool mt6989_sleep_protect_ready(struct mtk_gen3_pcie *pcie)
+{
+	if (readl_relaxed(pcie->vlp + MT6989_VLP_PROTECT_STA) & MT6989_PORT0_PROTECT)
+		return false;
+
+	/* The signal can briefly deassert during HW MTCMOS power-on. */
+	udelay(6);
+	return !(readl_relaxed(pcie->vlp + MT6989_VLP_PROTECT_STA) & MT6989_PORT0_PROTECT);
+}
+
+static void mt6989_select_root_config(struct mtk_gen3_pcie *pcie)
+{
+	writel_relaxed(PCIE_CFG_FORCE_BYTE_EN | PCIE_CFG_BYTE_EN(0xf) |
+		       PCIE_CFG_HEADER(0, 0), pcie->base + PCIE_CFGNUM_REG);
+}
+
+static void mt6989_set_completion_timeout(struct mtk_gen3_pcie *pcie, u16 timeout)
+{
+	u16 val;
+
+	mt6989_select_root_config(pcie);
+	val = readw_relaxed(pcie->base + MT6989_CONF_DEV2_CTL);
+	val = (val & ~MT6989_CPL_TIMEOUT) | timeout;
+	writew_relaxed(val, pcie->base + MT6989_CONF_DEV2_CTL);
+}
+
+static struct platform_device *mt6989_find_port0(void)
+{
+	struct platform_device *pdev;
+	struct device_node *np;
+
+	for_each_compatible_node(np, NULL, MT6989_PCIE_COMPAT) {
+		if (of_device_is_available(np) && of_get_pci_domain_nr(np) == 0) {
+			pdev = of_find_device_by_node(np);
+			of_node_put(np);
+			return pdev;
+		}
+	}
+
+	return NULL;
+}
+
+int mtk_pcie_probe_port(int port)
+{
+	struct platform_device *pdev;
+	int ret;
+
+	if (port != 0)
+		return -EOPNOTSUPP;
+
+	pdev = mt6989_find_port0();
+	if (!pdev)
+		return -ENODEV;
+
+	if (driver_find(mtk_pcie_driver.driver.name, &platform_bus_type) !=
+	    &mtk_pcie_driver.driver) {
+		put_device(&pdev->dev);
+		return -EPROBE_DEFER;
+	}
+	ret = device_driver_attach(&mtk_pcie_driver.driver, &pdev->dev);
+	if (ret == -EBUSY) {
+		device_lock(&pdev->dev);
+		if (pdev->dev.driver == &mtk_pcie_driver.driver)
+			ret = 0;
+		device_unlock(&pdev->dev);
+	}
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL(mtk_pcie_probe_port);
+
+int mtk_pcie_remove_port(int port)
+{
+	struct platform_device *pdev;
+	bool bound;
+	int ret = 0;
+
+	if (port != 0)
+		return -EOPNOTSUPP;
+
+	pdev = mt6989_find_port0();
+	if (!pdev)
+		return -ENODEV;
+
+	device_lock(&pdev->dev);
+	bound = pdev->dev.driver == &mtk_pcie_driver.driver;
+	if (pdev->dev.driver && !bound)
+		ret = -EBUSY;
+	device_unlock(&pdev->dev);
+	if (bound)
+		device_release_driver(&pdev->dev);
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL(mtk_pcie_remove_port);
+
+int mtk_pcie_hw_control_vote(int port, bool hw_mode_en, u8 who)
+{
+	struct mtk_gen3_pcie *pcie;
+	unsigned long flags;
+	bool enable, was_enabled;
+	u32 val;
+	int ret = 0;
+
+	if (port != 0 || who > 1)
+		return -EINVAL;
+
+	raw_spin_lock_irqsave(&mt6989_lock, flags);
+	pcie = mt6989_port0;
+	if (!pcie) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	was_enabled = pcie->rc_vote && pcie->ep_vote;
+	if (who)
+		pcie->ep_vote = hw_mode_en;
+	else
+		pcie->rc_vote = hw_mode_en;
+
+	enable = pcie->rc_vote && pcie->ep_vote;
+	mt6989_update_bits(pcie->pextp + MT6989_PEXTP_PWRCTL_0,
+			   MT6989_HW_MTCMOS_EN, enable ? MT6989_HW_MTCMOS_EN : 0);
+	if (!enable && was_enabled) {
+		ret = readl_poll_timeout_atomic(pcie->vlp + MT6989_VLP_PROTECT_STA, val,
+					       !(val & MT6989_PORT0_PROTECT), 10, 10000);
+		if (!ret && !mt6989_sleep_protect_ready(pcie))
+			ret = -ETIMEDOUT;
+	}
+out:
+	raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL(mtk_pcie_hw_control_vote);
+
+/*
+ * MT6639 status ABI: LTSSM [4:0], DL_UP [5], AXI [6], RxErr [7],
+ * MalfTLP [8], driver-own MSI [9], SDES [10].
+ */
+u32 mtk_pcie_dump_link_info(int port)
+{
+	struct mtk_gen3_pcie *pcie;
+	unsigned long flags;
+	u32 val, state = 0;
+
+	if (port != 0)
+		return 0;
+
+	raw_spin_lock_irqsave(&mt6989_lock, flags);
+	pcie = mt6989_port0;
+	if (!pcie || !mt6989_sleep_protect_ready(pcie))
+		goto out;
+
+	state = PCIE_LTSSM_STATE(readl_relaxed(pcie->base + PCIE_LTSSM_STATUS_REG));
+	if (readl_relaxed(pcie->base + PCIE_LINK_STATUS_REG) & PCIE_PORT_LINKUP)
+		state |= BIT(5);
+
+	val = readl_relaxed(pcie->base + PCIE_INT_STATUS_REG);
+	if (val & MT6989_AXI_READ_ERR)
+		state |= BIT(6);
+	if (val & MT6989_SDES_EVT)
+		state |= BIT(10);
+
+	mt6989_select_root_config(pcie);
+	if (readl_relaxed(pcie->base + MT6989_AER_CO_STATUS) & MT6989_AER_RX_ERR)
+		state |= BIT(7);
+	if (readl_relaxed(pcie->base + MT6989_AER_UNC_STATUS) & MT6989_AER_MALF_TLP)
+		state |= BIT(8);
+	if (readl_relaxed(pcie->msi_sets[1].base + PCIE_MSI_SET_STATUS_OFFSET) &
+	    MT6989_DRIVER_OWN_IRQ)
+		state |= BIT(9);
+out:
+	raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	return state;
+}
+EXPORT_SYMBOL(mtk_pcie_dump_link_info);
+
+static bool mt6989_link_ready(void)
+{
+	struct mtk_gen3_pcie *pcie;
+	unsigned long flags;
+	bool ready = false;
+	u32 ltssm;
+
+	raw_spin_lock_irqsave(&mt6989_lock, flags);
+	pcie = mt6989_port0;
+	if (pcie && mt6989_sleep_protect_ready(pcie) &&
+	    (readl_relaxed(pcie->base + PCIE_LINK_STATUS_REG) & PCIE_PORT_LINKUP)) {
+		ltssm = PCIE_LTSSM_STATE(readl_relaxed(pcie->base + PCIE_LTSSM_STATUS_REG));
+		/* L0/L0s/L1 can carry traffic or wake on a transaction. */
+		ready = ltssm >= PCIE_LTSSM_STATE_L0 &&
+			ltssm < PCIE_LTSSM_STATE_L2_IDLE;
+	}
+	raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	return ready;
+}
+
+int mtk_pcie_wait_link_ready(int port)
+{
+	bool ready;
+
+	if (port != 0)
+		return -EOPNOTSUPP;
+
+	return read_poll_timeout_atomic(mt6989_link_ready, ready, ready, 20, 10000,
+					false);
+}
+EXPORT_SYMBOL(mtk_pcie_wait_link_ready);
+
+int mtk_pcie_disable_data_trans(int port)
+{
+	struct mtk_gen3_pcie *pcie;
+	unsigned long flags;
+	int ret = 0;
+
+	if (port != 0)
+		return -EOPNOTSUPP;
+
+	raw_spin_lock_irqsave(&mt6989_lock, flags);
+	pcie = mt6989_port0;
+	if (!pcie) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!mt6989_sleep_protect_ready(pcie)) {
+		ret = -EPERM;
+		goto out;
+	}
+
+	mt6989_update_bits(pcie->base + PCIE_RST_CTRL_REG,
+			   PCIE_MAC_RSTB | PCIE_PHY_RSTB, PCIE_MAC_RSTB | PCIE_PHY_RSTB);
+	mt6989_update_bits(pcie->base + MT6989_CFG_CTRL,
+			   MT6989_DISABLE_LTSSM, MT6989_DISABLE_LTSSM);
+	mt6989_update_bits(pcie->base + PCIE_RST_CTRL_REG, PCIE_MAC_RSTB, 0);
+	/* Bound outstanding reads after MAC reset to avoid a bus timeout. */
+	mt6989_set_completion_timeout(pcie, MT6989_CPL_TIMEOUT_64US);
+out:
+	raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL(mtk_pcie_disable_data_trans);
 
 /* LTSSM state in PCIE_LTSSM_STATUS_REG bit[28:24] */
 static const char *const ltssm_str[] = {
@@ -304,6 +617,42 @@ static int mtk_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
 
 	return pci_generic_config_write32(bus, devfn, where, 4, val);
 }
+
+static int mt6989_config_read(struct pci_bus *bus, unsigned int devfn,
+			      int where, int size, u32 *val)
+{
+	struct mtk_gen3_pcie *pcie = bus->sysdata;
+	unsigned long flags;
+	int ret = PCIBIOS_DEVICE_NOT_FOUND;
+
+	raw_spin_lock_irqsave(&mt6989_lock, flags);
+	if (mt6989_sleep_protect_ready(pcie))
+		ret = mtk_pcie_config_read(bus, devfn, where, size, val);
+	else
+		*val = ~0U;
+	raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	return ret;
+}
+
+static int mt6989_config_write(struct pci_bus *bus, unsigned int devfn,
+			       int where, int size, u32 val)
+{
+	struct mtk_gen3_pcie *pcie = bus->sysdata;
+	unsigned long flags;
+	int ret = PCIBIOS_DEVICE_NOT_FOUND;
+
+	raw_spin_lock_irqsave(&mt6989_lock, flags);
+	if (mt6989_sleep_protect_ready(pcie))
+		ret = mtk_pcie_config_write(bus, devfn, where, size, val);
+	raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	return ret;
+}
+
+static struct pci_ops mt6989_pcie_ops = {
+	.map_bus = mtk_pcie_map_bus,
+	.read = mt6989_config_read,
+	.write = mt6989_config_write,
+};
 
 static struct pci_ops mtk_pcie_ops = {
 	.map_bus = mtk_pcie_map_bus,
@@ -461,8 +810,24 @@ static int mtk_pcie_startup_port(struct mtk_gen3_pcie *pcie)
 
 	/* Disable DVFSRC voltage request */
 	val = readl_relaxed(pcie->base + PCIE_MISC_CTRL_REG);
-	val |= PCIE_DISABLE_DVFSRC_VLT_REQ;
+	if (pcie->soc->flags & MT6989_PORT0) {
+		/* Bit 1 forces the DVFS request on for MT6989. */
+		val &= ~BIT(1);
+		val |= MT6989_DVFS_REQ_FORCE_OFF;
+	} else {
+		val |= PCIE_DISABLE_DVFSRC_VLT_REQ;
+	}
 	writel_relaxed(val, pcie->base + PCIE_MISC_CTRL_REG);
+
+	if (pcie->soc->flags & MT6989_PORT0) {
+		mt6989_update_bits(pcie->base + PCIE_RESOURCE_CTRL_REG,
+				   MT6989_APSRC_ACK, MT6989_APSRC_ACK);
+		mt6989_update_bits(pcie->base + MT6989_AXI_IF_CTRL,
+				   MT6989_AXI0_SLV_RESP_MASK, MT6989_AXI0_SLV_RESP_MASK);
+		writel_relaxed(MT6989_WCPL_TIMEOUT_4MS, pcie->base + MT6989_WCPL_TIMEOUT);
+		mt6989_update_bits(pcie->base + MT6989_ASPM_CTRL, MT6989_P2_SLEEP_TIME,
+				   FIELD_PREP(MT6989_P2_SLEEP_TIME, 4));
+	}
 
 	/*
 	 * Airoha EN7581 has a hw bug asserting/releasing PCIE_PE_RSTB signal
@@ -484,7 +849,14 @@ static int mtk_pcie_startup_port(struct mtk_gen3_pcie *pcie)
 		 * The deassertion of PERST# should be delayed 100ms (TPVPERL)
 		 * for the power and clock to become stable.
 		 */
-		msleep(PCIE_T_PVPERL_MS);
+		if (pcie->soc->flags & MT6989_PORT0) {
+			msleep(50);
+			val &= ~(PCIE_MAC_RSTB | PCIE_PHY_RSTB | PCIE_BRG_RSTB);
+			writel_relaxed(val, pcie->base + PCIE_RST_CTRL_REG);
+			msleep(50);
+		} else {
+			msleep(PCIE_T_PVPERL_MS);
+		}
 
 		/* De-assert reset signals */
 		val &= ~(PCIE_MAC_RSTB | PCIE_PHY_RSTB | PCIE_BRG_RSTB |
@@ -511,6 +883,8 @@ static int mtk_pcie_startup_port(struct mtk_gen3_pcie *pcie)
 	}
 
 	mtk_pcie_enable_msi(pcie);
+	if (pcie->soc->flags & MT6989_PORT0)
+		mt6989_set_completion_timeout(pcie, MT6989_CPL_TIMEOUT_4MS);
 
 	/* Set PCIe translation windows */
 	resource_list_for_each_entry(entry, &host->windows) {
@@ -621,6 +995,54 @@ static struct irq_chip mtk_msi_bottom_irq_chip = {
 	.name			= "MSI",
 };
 
+static void __iomem *mt6989_msi_group_reg(struct mtk_gen3_pcie *pcie,
+					 unsigned int set, u32 group)
+{
+	if (group == 1)
+		return pcie->msi_sets[set].base + MT6989_MSI_GRP1_OFFSET;
+	if (group == 2)
+		return pcie->base + MT6989_MSI_GRP2_BASE + set * sizeof(u32);
+	return pcie->base + MT6989_MSI_GRP3_BASE + set * sizeof(u32);
+}
+
+int mtk_msi_unmask_to_other_mcu(struct irq_data *data, u32 group)
+{
+	struct mtk_gen3_pcie *pcie;
+	unsigned long flags;
+	unsigned int set, bit;
+	void __iomem *reg;
+	int ret = 0;
+
+	if (group < 1 || group > 3)
+		return -EINVAL;
+	for (; data; data = data->parent_data)
+		if (irq_data_get_irq_chip(data) == &mtk_msi_bottom_irq_chip)
+			break;
+	if (!data)
+		return -EINVAL;
+
+	raw_spin_lock_irqsave(&mt6989_lock, flags);
+	pcie = mt6989_port0;
+	if (!pcie || data->domain != pcie->msi_bottom_domain) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!mt6989_sleep_protect_ready(pcie)) {
+		ret = -EPERM;
+		goto out;
+	}
+
+	set = data->hwirq / PCIE_MSI_IRQS_PER_SET;
+	bit = data->hwirq % PCIE_MSI_IRQS_PER_SET;
+	reg = mt6989_msi_group_reg(pcie, set, group);
+
+	mt6989_update_bits(reg, BIT(bit), BIT(bit));
+out:
+	raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL(mtk_msi_unmask_to_other_mcu);
+
 static int mtk_msi_bottom_domain_alloc(struct irq_domain *domain,
 				       unsigned int virq, unsigned int nr_irqs,
 				       void *arg)
@@ -655,8 +1077,27 @@ static void mtk_msi_bottom_domain_free(struct irq_domain *domain,
 {
 	struct mtk_gen3_pcie *pcie = domain->host_data;
 	struct irq_data *data = irq_domain_get_irq_data(domain, virq);
+	unsigned long flags, hwirq;
+	unsigned int i, group, set;
+	u32 mask;
 
 	mutex_lock(&pcie->lock);
+
+	/* The same vector can be reallocated to a different endpoint MSI. */
+	if (pcie->soc->flags & MT6989_PORT0) {
+		raw_spin_lock_irqsave(&mt6989_lock, flags);
+		if (mt6989_sleep_protect_ready(pcie)) {
+			for (i = 0; i < nr_irqs; i++) {
+				hwirq = data->hwirq + i;
+				set = hwirq / PCIE_MSI_IRQS_PER_SET;
+				mask = BIT(hwirq % PCIE_MSI_IRQS_PER_SET);
+				for (group = 1; group <= 3; group++)
+					mt6989_update_bits(mt6989_msi_group_reg(pcie, set, group),
+							   mask, 0);
+			}
+		}
+		raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	}
 
 	bitmap_release_region(pcie->msi_irq_in_use, data->hwirq,
 			      order_base_2(nr_irqs));
@@ -864,6 +1305,60 @@ static int mtk_pcie_setup_irq(struct mtk_gen3_pcie *pcie)
 	return 0;
 }
 
+static void mt6989_unmap(void *addr)
+{
+	iounmap((void __force __iomem *)addr);
+}
+
+static void __iomem *mt6989_map_node(struct device *dev, struct device_node *np)
+{
+	void __iomem *addr;
+	int ret;
+
+	if (!np)
+		return IOMEM_ERR_PTR(-ENODEV);
+
+	addr = of_iomap(np, 0);
+	of_node_put(np);
+	if (!addr)
+		return IOMEM_ERR_PTR(-ENOMEM);
+
+	ret = devm_add_action_or_reset(dev, mt6989_unmap, (void __force *)addr);
+	return ret ? IOMEM_ERR_PTR(ret) : addr;
+}
+
+static int mt6989_parse_port(struct mtk_gen3_pcie *pcie)
+{
+	struct device *dev = pcie->dev;
+	struct device_node *np = dev->of_node;
+	struct device_node *clkbuf;
+
+	/* Only the WLAN port with the stock reset and suspend modes is supported. */
+	if (of_get_pci_domain_nr(np) != 0 || !pcie->phy || !pcie->num_clks ||
+	    !of_property_read_bool(np, "mediatek,peri-reset-dis") ||
+	    !of_property_read_bool(np, "mediatek,dvfs-req-dis") ||
+	    !of_property_read_bool(np, "mediatek,suspend-mode-l12"))
+		return -EOPNOTSUPP;
+
+	pcie->pextp = mt6989_map_node(dev, of_parse_phandle(np, "pextpcfg", 0));
+	if (IS_ERR(pcie->pextp))
+		return PTR_ERR(pcie->pextp);
+
+	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6989-vlpcfg_bus");
+	pcie->vlp = mt6989_map_node(dev, np);
+	if (IS_ERR(pcie->vlp))
+		return PTR_ERR(pcie->vlp);
+
+	clkbuf = of_find_compatible_node(NULL, NULL, "mediatek,mt6989-clkbuf");
+	if (!clkbuf)
+		return -ENODEV;
+
+	np = of_parse_phandle(clkbuf, "srclken-rc", 0);
+	of_node_put(clkbuf);
+	pcie->srclken = mt6989_map_node(dev, np);
+	return PTR_ERR_OR_ZERO(pcie->srclken);
+}
+
 static int mtk_pcie_parse_port(struct mtk_gen3_pcie *pcie)
 {
 	int i, ret, num_resets = pcie->soc->phy_resets.num_resets;
@@ -925,6 +1420,9 @@ static int mtk_pcie_parse_port(struct mtk_gen3_pcie *pcie)
 		else
 			pcie->num_lanes = num_lanes;
 	}
+
+	if (pcie->soc->flags & MT6989_PORT0)
+		return mt6989_parse_port(pcie);
 
 	return 0;
 }
@@ -1103,6 +1601,109 @@ err_phy_init:
 	return err;
 }
 
+static int mt6989_clkbuf_vote(u32 value)
+{
+#if IS_REACHABLE(CONFIG_MTK_CLKBUF_CTRL)
+	return clkbuf_xo_ctrl("SET_XO_VOTER", MT6989_PCIE_CLKBUF_XO_ID, value);
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+static void mt6989_release_clock_request(struct mtk_gen3_pcie *pcie)
+{
+	mt6989_update_bits(pcie->srclken + MT6989_M07_CFG,
+			   MT6989_BBCK2_FORCE_ACK | MT6989_IGNORE_SETTLE_TIME, 0);
+	mt6989_update_bits(pcie->srclken + MT6989_CENTRAL_CFG6,
+			   MT6989_PMRC7_VOTE_MASK, 0);
+}
+
+static void mt6989_power_down_tail(struct mtk_gen3_pcie *pcie)
+{
+	int ret;
+
+	writel_relaxed(MT6989_PEXTP_RST_PORT0, pcie->pextp + MT6989_PEXTP_RST_SET);
+	ret = mt6989_clkbuf_vote(MT6989_PMRC7_BBCK2_BIND);
+	if (ret)
+		dev_err(pcie->dev, "failed to restore PMRC7 BBCK2 vote: %d\n", ret);
+	mt6989_release_clock_request(pcie);
+}
+
+static int mt6989_power_up(struct mtk_gen3_pcie *pcie)
+{
+	struct device *dev = pcie->dev;
+	struct pinctrl *pinctrl;
+	u32 val, central_cfg6, m07_cfg;
+	int ret;
+
+	if (!IS_REACHABLE(CONFIG_MTK_CLKBUF_CTRL))
+		return -EOPNOTSUPP;
+
+	central_cfg6 = readl_relaxed(pcie->srclken + MT6989_CENTRAL_CFG6);
+	m07_cfg = readl_relaxed(pcie->srclken + MT6989_M07_CFG);
+	mt6989_update_bits(pcie->srclken + MT6989_CENTRAL_CFG6,
+			   MT6989_PMRC7_VOTE_MASK, MT6989_PMRC7_VOTE_MASK);
+	mt6989_update_bits(pcie->srclken + MT6989_M07_CFG,
+			   MT6989_BBCK2_FORCE_ACK | MT6989_IGNORE_SETTLE_TIME,
+			   MT6989_BBCK2_FORCE_ACK | MT6989_IGNORE_SETTLE_TIME);
+	ret = mt6989_clkbuf_vote(MT6989_PMRC7_BBCK2_UNBIND);
+	if (ret) {
+		mt6989_update_bits(pcie->srclken + MT6989_M07_CFG,
+				   MT6989_BBCK2_FORCE_ACK | MT6989_IGNORE_SETTLE_TIME,
+				   m07_cfg & (MT6989_BBCK2_FORCE_ACK | MT6989_IGNORE_SETTLE_TIME));
+		mt6989_update_bits(pcie->srclken + MT6989_CENTRAL_CFG6,
+				   MT6989_PMRC7_VOTE_MASK,
+				   central_cfg6 & MT6989_PMRC7_VOTE_MASK);
+		return dev_err_probe(dev, ret == -ENODEV ? -EPROBE_DEFER : ret,
+				     "failed to acquire BBCK2 clock vote\n");
+	}
+	udelay(400);
+
+	writel_relaxed(MT6989_PEXTP_RST_PORT0, pcie->pextp + MT6989_PEXTP_RST_CLR);
+	ret = phy_init(pcie->phy);
+	if (ret)
+		goto err_reset;
+	ret = phy_power_on(pcie->phy);
+	if (ret)
+		goto err_phy_exit;
+
+	pm_runtime_enable(dev);
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0)
+		goto err_pm_disable;
+	ret = clk_bulk_prepare_enable(pcie->num_clks, pcie->clks);
+	if (ret)
+		goto err_pm_put;
+
+	ret = readl_poll_timeout(pcie->vlp + MT6989_VLP_PROTECT_STA, val,
+				!(val & MT6989_PORT0_PROTECT), 10, 10000);
+	if (ret)
+		goto err_clk_disable;
+
+	pinctrl = pinctrl_get_select(dev, "work");
+	if (IS_ERR(pinctrl)) {
+		ret = PTR_ERR(pinctrl);
+		goto err_clk_disable;
+	}
+	pinctrl_put(pinctrl);
+
+	mt6989_update_bits(pcie->pextp + MT6989_PEXTP_PWRCTL_0, MT6989_HW_MTCMOS_EN, 0);
+	return 0;
+
+err_clk_disable:
+	clk_bulk_disable_unprepare(pcie->num_clks, pcie->clks);
+err_pm_put:
+	pm_runtime_put_sync(dev);
+err_pm_disable:
+	pm_runtime_disable(dev);
+	phy_power_off(pcie->phy);
+err_phy_exit:
+	phy_exit(pcie->phy);
+err_reset:
+	mt6989_power_down_tail(pcie);
+	return ret;
+}
+
 static void mtk_pcie_power_down(struct mtk_gen3_pcie *pcie)
 {
 	clk_bulk_disable_unprepare(pcie->num_clks, pcie->clks);
@@ -1115,6 +1716,9 @@ static void mtk_pcie_power_down(struct mtk_gen3_pcie *pcie)
 	phy_exit(pcie->phy);
 	reset_control_bulk_assert(pcie->soc->phy_resets.num_resets,
 				  pcie->phy_resets);
+
+	if (pcie->soc->flags & MT6989_PORT0)
+		mt6989_power_down_tail(pcie);
 }
 
 static int mtk_pcie_get_controller_max_link_speed(struct mtk_gen3_pcie *pcie)
@@ -1155,7 +1759,8 @@ static int mtk_pcie_setup(struct mtk_gen3_pcie *pcie)
 		max_speed = mtk_pcie_get_controller_max_link_speed(pcie);
 
 		/* Set max_link_speed only if the controller supports it */
-		if (max_speed >= 0 && max_speed <= err) {
+		if (max_speed >= 0 && ((pcie->soc->flags & MT6989_PORT0) ?
+				      err > 0 && err <= max_speed : max_speed <= err)) {
 			pcie->max_link_speed = err;
 			dev_info(pcie->dev,
 				 "maximum controller link speed Gen%d, overriding to Gen%u",
@@ -1185,6 +1790,7 @@ static int mtk_pcie_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct mtk_gen3_pcie *pcie;
 	struct pci_host_bridge *host;
+	unsigned long flags;
 	int err;
 
 	host = devm_pci_alloc_host_bridge(dev, sizeof(*pcie));
@@ -1199,33 +1805,55 @@ static int mtk_pcie_probe(struct platform_device *pdev)
 
 	err = mtk_pcie_setup(pcie);
 	if (err)
-		return err;
+		goto probe_failed;
 
-	host->ops = &mtk_pcie_ops;
+	host->ops = pcie->soc->flags & MT6989_PORT0 ? &mt6989_pcie_ops : &mtk_pcie_ops;
 	host->sysdata = pcie;
 
-	err = pci_host_probe(host);
-	if (err) {
-		mtk_pcie_irq_teardown(pcie);
-		mtk_pcie_power_down(pcie);
-		return err;
+	if (pcie->soc->flags & MT6989_PORT0) {
+		raw_spin_lock_irqsave(&mt6989_lock, flags);
+		mt6989_port0 = pcie;
+		raw_spin_unlock_irqrestore(&mt6989_lock, flags);
 	}
 
-	return 0;
+	err = pci_host_probe(host);
+	if (!err)
+		return 0;
+
+	if (pcie->soc->flags & MT6989_PORT0) {
+		raw_spin_lock_irqsave(&mt6989_lock, flags);
+		mt6989_port0 = NULL;
+		raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	}
+	mtk_pcie_irq_teardown(pcie);
+	mtk_pcie_power_down(pcie);
+
+probe_failed:
+	if (pcie->soc->flags & MT6989_PORT0)
+		pinctrl_pm_select_sleep_state(dev);
+	return err;
 }
 
 static void mtk_pcie_remove(struct platform_device *pdev)
 {
 	struct mtk_gen3_pcie *pcie = platform_get_drvdata(pdev);
 	struct pci_host_bridge *host = pci_host_bridge_from_priv(pcie);
+	unsigned long flags;
 
 	pci_lock_rescan_remove();
 	pci_stop_root_bus(host->bus);
 	pci_remove_root_bus(host->bus);
 	pci_unlock_rescan_remove();
 
+	if (pcie->soc->flags & MT6989_PORT0) {
+		raw_spin_lock_irqsave(&mt6989_lock, flags);
+		mt6989_port0 = NULL;
+		raw_spin_unlock_irqrestore(&mt6989_lock, flags);
+	}
 	mtk_pcie_irq_teardown(pcie);
 	mtk_pcie_power_down(pcie);
+	if (pcie->soc->flags & MT6989_PORT0)
+		pinctrl_pm_select_sleep_state(pcie->dev);
 }
 
 static void mtk_pcie_irq_save(struct mtk_gen3_pcie *pcie)
@@ -1285,6 +1913,9 @@ static int mtk_pcie_suspend_noirq(struct device *dev)
 	int err;
 	u32 val;
 
+	if (pcie->soc->flags & MT6989_PORT0)
+		return mtk_pcie_hw_control_vote(0, true, 0);
+
 	/* Trigger link to L2 state */
 	err = mtk_pcie_turn_off_link(pcie);
 	if (err) {
@@ -1311,6 +1942,9 @@ static int mtk_pcie_resume_noirq(struct device *dev)
 {
 	struct mtk_gen3_pcie *pcie = dev_get_drvdata(dev);
 	int err;
+
+	if (pcie->soc->flags & MT6989_PORT0)
+		return mtk_pcie_hw_control_vote(0, false, 0);
 
 	err = pcie->soc->power_up(pcie);
 	if (err)
@@ -1360,7 +1994,13 @@ static const struct mtk_gen3_pcie_pdata mtk_pcie_soc_en7581 = {
 	.flags = SKIP_PCIE_RSTB,
 };
 
+static const struct mtk_gen3_pcie_pdata mtk_pcie_soc_mt6989 = {
+	.power_up = mt6989_power_up,
+	.flags = MT6989_PORT0,
+};
+
 static const struct of_device_id mtk_pcie_of_match[] = {
+	{ .compatible = MT6989_PCIE_COMPAT, .data = &mtk_pcie_soc_mt6989 },
 	{ .compatible = "airoha,en7581-pcie", .data = &mtk_pcie_soc_en7581 },
 	{ .compatible = "mediatek,mt8192-pcie", .data = &mtk_pcie_soc_mt8192 },
 	{ .compatible = "mediatek,mt8196-pcie", .data = &mtk_pcie_soc_mt8196 },

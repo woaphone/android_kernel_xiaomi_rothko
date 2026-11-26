@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
@@ -25,6 +26,10 @@
 #define TIMEOUT_USEC			300000
 
 #define FDVFS_FDIV_HZ (26 * 1000)
+#define MT6989_CPUFREQ_FW_MAGIC	0x55aa55aa
+#define MT6989_CPUFREQ_FW_STATE	0x9c
+#define MT6989_CPUFREQ_SCALING	0x4cc
+#define MT6989_FDVFS_MAGIC	0xabcd0001
 
 enum {
 	REG_FREQ_LUT_TABLE,
@@ -41,6 +46,7 @@ struct mtk_cpufreq_priv {
 	struct device *dev;
 	const struct mtk_cpufreq_variant *variant;
 	void __iomem *fdvfs;
+	bool perf_state_in_khz;
 };
 
 struct mtk_cpufreq_domain {
@@ -92,6 +98,87 @@ static const struct mtk_cpufreq_variant cpufreq_mtk_mt8196_variant = {
 	.is_hybrid_dvfs = true,
 };
 
+static int mtk_cpufreq_hw_mt6989_init(struct mtk_cpufreq_priv *priv)
+{
+	struct device_node *hvfs, *sysram, *fdvfs;
+	void __iomem *base;
+	u32 magic, state;
+	int index;
+
+	hvfs = of_find_compatible_node(NULL, NULL, "mediatek,cpufreq-hybrid");
+	if (!hvfs)
+		return dev_err_probe(priv->dev, -ENODEV, "Missing MT6989 CPU DVFS SRAM\n");
+
+	sysram = of_parse_phandle(hvfs, "csram-sys-base", 0);
+	if (!sysram) {
+		of_node_put(hvfs);
+		return dev_err_probe(priv->dev, -ENODEV, "Missing CPU DVFS firmware status\n");
+	}
+
+	base = of_iomap(sysram, 0);
+	of_node_put(sysram);
+	if (!base) {
+		of_node_put(hvfs);
+		return -ENOMEM;
+	}
+
+	magic = readl_relaxed(base);
+	state = readl_relaxed(base + MT6989_CPUFREQ_FW_STATE);
+	iounmap(base);
+	if (magic != MT6989_CPUFREQ_FW_MAGIC || !state) {
+		of_node_put(hvfs);
+		return dev_err_probe(priv->dev, -ENODEV, "CPU DVFS firmware is not enabled\n");
+	}
+
+	index = of_property_match_string(hvfs, "reg-names", "CSRAM");
+	if (index < 0) {
+		of_node_put(hvfs);
+		return index;
+	}
+
+	/* Read the mode without reserving the overlapping performance domains. */
+	base = of_iomap(hvfs, index);
+	of_node_put(hvfs);
+	if (!base)
+		return -ENOMEM;
+
+	priv->perf_state_in_khz = !!readl_relaxed(base + MT6989_CPUFREQ_SCALING);
+	iounmap(base);
+
+	fdvfs = of_find_compatible_node(NULL, NULL, "mediatek,fdvfs");
+	if (!fdvfs)
+		return dev_err_probe(priv->dev, -ENODEV, "Missing MT6989 FDVFS resources\n");
+
+	base = of_iomap(fdvfs, 2);
+	if (!base) {
+		of_node_put(fdvfs);
+		return -ENOMEM;
+	}
+
+	magic = readl_relaxed(base);
+	iounmap(base);
+	if (magic == MT6989_FDVFS_MAGIC)
+		priv->fdvfs = devm_of_iomap(priv->dev, fdvfs, 0, NULL);
+	of_node_put(fdvfs);
+	if (IS_ERR(priv->fdvfs))
+		return dev_err_probe(priv->dev, PTR_ERR(priv->fdvfs),
+				     "Failed to map MT6989 FDVFS requests\n");
+
+	return 0;
+}
+
+static const struct mtk_cpufreq_variant cpufreq_mtk_mt6989_variant = {
+	.init = mtk_cpufreq_hw_mt6989_init,
+	.reg_offsets = {
+		[REG_FREQ_LUT_TABLE]	= 0x0,
+		[REG_FREQ_ENABLE]	= 0x84,
+		[REG_FREQ_PERF_STATE]	= 0x88,
+		[REG_FREQ_HW_STATE]	= 0x8c,
+		[REG_EM_POWER_TBL]	= 0x90,
+		[REG_FREQ_LATENCY]	= 0x114,
+	},
+};
+
 static int __maybe_unused
 mtk_cpufreq_get_cpu_power(struct device *cpu_dev, unsigned long *uW,
 			  unsigned long *KHz)
@@ -116,6 +203,9 @@ mtk_cpufreq_get_cpu_power(struct device *cpu_dev, unsigned long *uW,
 	/* Provide micro-Watts value to the Energy Model */
 	*uW = readl_relaxed(data->reg_bases[REG_EM_POWER_TBL] +
 			    i * LUT_ROW_SIZE);
+	/* Match the power-table conversion used by MT6989 CPU DVFS firmware. */
+	if (data->parent->variant == &cpufreq_mtk_mt6989_variant)
+		*uW /= 1000;
 
 	return 0;
 }
@@ -137,11 +227,16 @@ static int mtk_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 				       unsigned int index)
 {
 	struct mtk_cpufreq_domain *data = policy->driver_data;
+	struct mtk_cpufreq_priv *priv = data->parent;
 	unsigned int target_freq;
 
-	if (data->parent->fdvfs) {
-		target_freq = policy->freq_table[index].frequency;
+	target_freq = policy->freq_table[index].frequency;
+	/* MT6989's indexed slow path takes precedence over FDVFS support. */
+	if (priv->fdvfs && (priv->variant != &cpufreq_mtk_mt6989_variant ||
+			   priv->perf_state_in_khz)) {
 		mtk_cpufreq_hw_fdvfs_switch(target_freq, policy);
+	} else if (priv->perf_state_in_khz) {
+		writel_relaxed(target_freq, data->reg_bases[REG_FREQ_PERF_STATE]);
 	} else {
 		writel_relaxed(index, data->reg_bases[REG_FREQ_PERF_STATE]);
 	}
@@ -162,6 +257,18 @@ static unsigned int mtk_cpufreq_hw_get(unsigned int cpu)
 	data = policy->driver_data;
 
 	index = readl_relaxed(data->reg_bases[REG_FREQ_PERF_STATE]);
+	if (data->parent->variant == &cpufreq_mtk_mt6989_variant) {
+		if (index < data->nr_opp)
+			return data->table[index].frequency;
+		if (index >= data->table[data->nr_opp - 1].frequency &&
+		    index <= data->table[0].frequency)
+			return index;
+
+		/* Zero reports an unknown frequency to the cpufreq core. */
+		dev_err_ratelimited(data->parent->dev,
+				    "Invalid CPU%u performance state: %u\n", cpu, index);
+		return 0;
+	}
 	index = min(index, LUT_MAX_ENTRIES - 1);
 
 	return data->table[index].frequency;
@@ -175,8 +282,11 @@ static unsigned int mtk_cpufreq_hw_fast_switch(struct cpufreq_policy *policy,
 
 	index = cpufreq_table_find_index_dl(policy, target_freq, false);
 
+	/* Fast requests use FDVFS whenever its request interface is live. */
 	if (data->parent->fdvfs)
 		mtk_cpufreq_hw_fdvfs_switch(target_freq, policy);
+	else if (data->parent->perf_state_in_khz)
+		writel_relaxed(target_freq, data->reg_bases[REG_FREQ_PERF_STATE]);
 	else
 		writel_relaxed(index, data->reg_bases[REG_FREQ_PERF_STATE]);
 
@@ -374,23 +484,29 @@ static int mtk_cpufreq_hw_driver_probe(struct platform_device *pdev)
 	struct device *cpu_dev;
 	struct regulator *cpu_reg;
 
-	/* Make sure that all CPU supplies are available before proceeding. */
-	for_each_present_cpu(cpu) {
-		cpu_dev = get_cpu_device(cpu);
-		if (!cpu_dev)
-			return dev_err_probe(&pdev->dev, -EPROBE_DEFER,
-					     "Failed to get cpu%d device\n", cpu);
-
-		cpu_reg = devm_regulator_get(cpu_dev, "cpu");
-		if (IS_ERR(cpu_reg))
-			return dev_err_probe(&pdev->dev, PTR_ERR(cpu_reg),
-					     "CPU%d regulator get failed\n", cpu);
-	}
-
-
 	data = of_device_get_match_data(&pdev->dev);
 	if (!data)
 		return -EINVAL;
+
+	/* Stock MT6989 keeps the generic compatible and delegates rails to firmware. */
+	if (data == &cpufreq_mtk_base_variant &&
+	    of_machine_is_compatible("mediatek,MT6989"))
+		data = &cpufreq_mtk_mt6989_variant;
+
+	if (data != &cpufreq_mtk_mt6989_variant) {
+		/* Make sure that all CPU supplies are available before proceeding. */
+		for_each_present_cpu(cpu) {
+			cpu_dev = get_cpu_device(cpu);
+			if (!cpu_dev)
+				return dev_err_probe(&pdev->dev, -EPROBE_DEFER,
+						     "Failed to get cpu%d device\n", cpu);
+
+			cpu_reg = devm_regulator_get(cpu_dev, "cpu");
+			if (IS_ERR(cpu_reg))
+				return dev_err_probe(&pdev->dev, PTR_ERR(cpu_reg),
+						     "CPU%d regulator get failed\n", cpu);
+		}
+	}
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)

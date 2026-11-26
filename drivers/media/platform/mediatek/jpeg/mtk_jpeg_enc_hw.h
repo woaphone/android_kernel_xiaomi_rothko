@@ -13,6 +13,7 @@
 #include "mtk_jpeg_core.h"
 
 #define JPEG_ENC_INT_STATUS_DONE	BIT(0)
+#define JPEG_ENC_INT_STATUS_STALL	BIT(1)
 #define JPEG_ENC_INT_STATUS_MASK_ALLIRQ	0x13
 
 #define JPEG_ENC_DST_ADDR_OFFSET_MASK	GENMASK(3, 0)
@@ -22,6 +23,13 @@
 #define JPEG_ENC_CTRL_FILE_FORMAT_BIT	BIT(5)
 #define JPEG_ENC_CTRL_INT_EN_BIT	BIT(2)
 #define JPEG_ENC_CTRL_ENABLE_BIT	BIT(0)
+#define V4L2_PIX_FMT_NV12_AFBC		v4l2_fourcc('M', 'C', 'N', '8')
+#define JPEG_ENC_Q_TBL_ADDR		0x404
+#define JPEG_ENC_CTRL_Q_TBL_EN		BIT(19)
+#define JPEG_ENC_AFBC_CONFIG		0x544
+#define JPEG_ENC_CTRL_RDMA_PADDING_EN	BIT(20)
+#define JPEG_ENC_CTRL_RDMA_RIGHT_PADDING_EN BIT(29)
+#define JPEG_ENC_CTRL_RDMA_PADDING_0_EN	BIT(30)
 #define JPEG_ENC_RESET_BIT		BIT(0)
 
 #define JPEG_ENC_YUV_FORMAT_YUYV	0
@@ -87,6 +95,7 @@ struct mtk_jpeg_enc_qlt {
 void mtk_jpeg_enc_reset(void __iomem *base);
 u32 mtk_jpeg_enc_get_file_size(void __iomem *base, bool support_34bit);
 void mtk_jpeg_enc_start(void __iomem *enc_reg_base);
+void mtk_jpeg_enc_set_qtable(void __iomem *base, dma_addr_t addr);
 void mtk_jpeg_set_enc_src(struct mtk_jpeg_ctx *ctx,  void __iomem *base,
 			  struct vb2_buffer *src_buf);
 void mtk_jpeg_set_enc_dst(struct mtk_jpeg_ctx *ctx, void __iomem *base,

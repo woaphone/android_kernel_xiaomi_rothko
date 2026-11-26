@@ -95,7 +95,8 @@ static const char * const iommu_group_resv_type_string[] = {
 #define IOMMU_CMD_LINE_DMA_API		BIT(0)
 #define IOMMU_CMD_LINE_STRICT		BIT(1)
 
-static int bus_iommu_probe(const struct bus_type *bus);
+static int bus_iommu_probe(const struct bus_type *bus,
+			   struct fwnode_handle *iommu_fwnode);
 static int iommu_bus_notifier(struct notifier_block *nb,
 			      unsigned long action, void *data);
 static void iommu_release_device(struct device *dev);
@@ -274,7 +275,7 @@ int iommu_device_register(struct iommu_device *iommu,
 	spin_unlock(&iommu_device_lock);
 
 	for (int i = 0; i < ARRAY_SIZE(iommu_buses) && !err; i++)
-		err = bus_iommu_probe(iommu_buses[i]);
+		err = bus_iommu_probe(iommu_buses[i], iommu->fwnode);
 	if (err)
 		iommu_device_unregister(iommu);
 	else
@@ -337,7 +338,7 @@ int iommu_device_register_bus(struct iommu_device *iommu,
 	list_add_tail(&iommu->list, &iommu_device_list);
 	spin_unlock(&iommu_device_lock);
 
-	err = bus_iommu_probe(bus);
+	err = bus_iommu_probe(bus, iommu->fwnode);
 	if (err) {
 		iommu_device_unregister_bus(iommu, bus, nb);
 		return err;
@@ -436,7 +437,8 @@ EXPORT_SYMBOL_GPL(dev_iommu_priv_set);
  * Init the dev->iommu and dev->iommu_group in the struct device and get the
  * driver probed
  */
-static int iommu_init_device(struct device *dev)
+static int iommu_init_device(struct device *dev,
+			     struct fwnode_handle *iommu_fwnode)
 {
 	const struct iommu_ops *ops;
 	struct iommu_device *iommu_dev;
@@ -467,6 +469,11 @@ static int iommu_init_device(struct device *dev)
 	 * be present, and that any of their registered instances has suitable
 	 * ops for probing, and thus cheekily co-opt the same mechanism.
 	 */
+	/* A bus rescan must not fail registration on another provider's error. */
+	if (iommu_fwnode && dev->iommu->fwspec &&
+	    dev->iommu->fwspec->iommu_fwnode != iommu_fwnode)
+		return -ENODEV;
+
 	ops = iommu_fwspec_ops(dev->iommu->fwspec);
 	if (!ops) {
 		ret = -ENODEV;
@@ -582,7 +589,8 @@ static struct iommu_domain *pasid_array_entry_to_domain(void *entry)
 
 DEFINE_MUTEX(iommu_probe_device_lock);
 
-static int __iommu_probe_device(struct device *dev, struct list_head *group_list)
+static int __iommu_probe_device(struct device *dev, struct list_head *group_list,
+				struct fwnode_handle *iommu_fwnode)
 {
 	struct iommu_group *group;
 	struct group_device *gdev;
@@ -601,7 +609,7 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
 	if (dev->iommu_group)
 		return 0;
 
-	ret = iommu_init_device(dev);
+	ret = iommu_init_device(dev, iommu_fwnode);
 	if (ret)
 		return ret;
 	/*
@@ -669,7 +677,7 @@ int iommu_probe_device(struct device *dev)
 	int ret;
 
 	mutex_lock(&iommu_probe_device_lock);
-	ret = __iommu_probe_device(dev, NULL);
+	ret = __iommu_probe_device(dev, NULL, NULL);
 	mutex_unlock(&iommu_probe_device_lock);
 	if (ret)
 		return ret;
@@ -1752,13 +1760,18 @@ struct iommu_domain *iommu_group_default_domain(struct iommu_group *group)
 	return group->default_domain;
 }
 
+struct iommu_bus_probe_data {
+	struct list_head groups;
+	struct fwnode_handle *iommu_fwnode;
+};
+
 static int probe_iommu_group(struct device *dev, void *data)
 {
-	struct list_head *group_list = data;
+	struct iommu_bus_probe_data *probe = data;
 	int ret;
 
 	mutex_lock(&iommu_probe_device_lock);
-	ret = __iommu_probe_device(dev, group_list);
+	ret = __iommu_probe_device(dev, &probe->groups, probe->iommu_fwnode);
 	mutex_unlock(&iommu_probe_device_lock);
 	if (ret == -ENODEV)
 		ret = 0;
@@ -1905,17 +1918,21 @@ static void iommu_group_do_probe_finalize(struct device *dev)
 		ops->probe_finalize(dev);
 }
 
-static int bus_iommu_probe(const struct bus_type *bus)
+static int bus_iommu_probe(const struct bus_type *bus,
+			   struct fwnode_handle *iommu_fwnode)
 {
+	struct iommu_bus_probe_data probe = {
+		.groups = LIST_HEAD_INIT(probe.groups),
+		.iommu_fwnode = iommu_fwnode,
+	};
 	struct iommu_group *group, *next;
-	LIST_HEAD(group_list);
 	int ret;
 
-	ret = bus_for_each_dev(bus, NULL, &group_list, probe_iommu_group);
+	ret = bus_for_each_dev(bus, NULL, &probe, probe_iommu_group);
 	if (ret)
-		return ret;
+		goto out;
 
-	list_for_each_entry_safe(group, next, &group_list, entry) {
+	list_for_each_entry_safe(group, next, &probe.groups, entry) {
 		struct group_device *gdev;
 
 		mutex_lock(&group->mutex);
@@ -1931,7 +1948,7 @@ static int bus_iommu_probe(const struct bus_type *bus)
 		ret = iommu_setup_default_domain(group, 0);
 		if (ret) {
 			mutex_unlock(&group->mutex);
-			return ret;
+			goto out;
 		}
 		for_each_group_device(group, gdev)
 			iommu_setup_dma_ops(gdev->dev);
@@ -1947,7 +1964,13 @@ static int bus_iommu_probe(const struct bus_type *bus)
 			iommu_group_do_probe_finalize(gdev->dev);
 	}
 
-	return 0;
+out:
+	list_for_each_entry_safe(group, next, &probe.groups, entry) {
+		mutex_lock(&group->mutex);
+		list_del_init(&group->entry);
+		mutex_unlock(&group->mutex);
+	}
+	return ret;
 }
 
 /**

@@ -15,13 +15,17 @@ enum mtk_dvfsrc_cmd {
 	MTK_DVFSRC_CMD_OPP,
 	MTK_DVFSRC_CMD_VCORE_LEVEL,
 	MTK_DVFSRC_CMD_VSCP_LEVEL,
+	MTK_DVFSRC_CMD_DRAM_GEAR,
 	MTK_DVFSRC_CMD_MAX,
 };
 
 #if IS_ENABLED(CONFIG_MTK_DVFSRC)
 
+struct device_node;
+
 int mtk_dvfsrc_send_request(const struct device *dev, u32 cmd, u64 data);
 int mtk_dvfsrc_query_info(const struct device *dev, u32 cmd, int *data);
+u32 dvfsrc_get_required_opp_peak_bw(struct device_node *np, int index);
 
 #else
 

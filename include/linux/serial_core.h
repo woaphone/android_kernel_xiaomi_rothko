@@ -601,7 +601,7 @@ struct uart_port {
 	struct serial_iso7816   iso7816;
 	void			*private_data;		/* generic platform data pointer */
 
-	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_USE2(1, bool tx_dma_fault, bool tx_dma_shutdown);
 	ANDROID_KABI_RESERVE(2);
 };
 
@@ -1155,7 +1155,8 @@ int uart_resume_port(struct uart_driver *reg, struct uart_port *port);
 static inline int uart_tx_stopped(struct uart_port *port)
 {
 	struct tty_struct *tty = port->state->port.tty;
-	if ((tty && tty->flow.stopped) || port->hw_stopped)
+	if ((tty && tty->flow.stopped) || port->hw_stopped ||
+	    port->tx_dma_fault || port->tx_dma_shutdown)
 		return 1;
 	return 0;
 }

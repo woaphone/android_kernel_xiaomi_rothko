@@ -285,7 +285,12 @@ static int mtk_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 		err = hw->soc->bias_set_combo(hw, desc, 0, arg);
 		break;
 	case PIN_CONFIG_INPUT_ENABLE:
-		/* regard all non-zero value as enable */
+		/* input-enable must also release a bootloader output direction. */
+		if (arg) {
+			err = mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_DIR, MTK_INPUT);
+			if (err)
+				break;
+		}
 		err = mtk_hw_set_value(hw, desc, PINCTRL_PIN_REG_IES, !!arg);
 		break;
 	case PIN_CONFIG_SLEW_RATE:
@@ -811,8 +816,10 @@ static int mtk_pconf_group_set(struct pinctrl_dev *pctldev, unsigned group,
 	 * Disable advanced drive strength mode if drive-strength-microamp
 	 * is not set. However, mediatek,drive-strength-adv takes precedence
 	 * as its value can explicitly request the mode be enabled or not.
+	 * SoCs with pinmux-dependent drive circuitry select it in set_pinmux.
 	 */
-	if (hw->soc->adv_drive_set && !drive_strength_uA_found &&
+	if (hw->soc->adv_drive_set && !hw->soc->set_pinmux &&
+	    !drive_strength_uA_found &&
 	    !adv_drve_strength_found)
 		hw->soc->adv_drive_set(hw, &hw->soc->pins[grp->pin], 0);
 

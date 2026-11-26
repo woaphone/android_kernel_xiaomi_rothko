@@ -13,6 +13,7 @@
 #include <linux/errno.h>
 #include <linux/linkage.h>
 #include <linux/of.h>
+#include <linux/percpu.h>
 #include <linux/pm.h>
 #include <linux/printk.h>
 #include <linux/psci.h>
@@ -180,6 +181,13 @@ int psci_set_osi_mode(bool enable)
 	return psci_to_linux_errno(err);
 }
 
+static DEFINE_PER_CPU(int, psci_cpu_suspend_raw_error);
+
+int psci_cpu_suspend_last_raw_error(void)
+{
+	return this_cpu_read(psci_cpu_suspend_raw_error);
+}
+
 static __always_inline int
 __psci_cpu_suspend(u32 fn, u32 state, unsigned long entry_point)
 {
@@ -187,10 +195,13 @@ __psci_cpu_suspend(u32 fn, u32 state, unsigned long entry_point)
 	bool deny = false;
 
 	trace_android_rvh_psci_cpu_suspend(state, &deny);
-	if (deny)
+	if (deny) {
+		this_cpu_write(psci_cpu_suspend_raw_error, 0);
 		return -EPERM;
+	}
 
 	err = invoke_psci_fn(fn, state, entry_point, 0);
+	this_cpu_write(psci_cpu_suspend_raw_error, err);
 	return psci_to_linux_errno(err);
 }
 

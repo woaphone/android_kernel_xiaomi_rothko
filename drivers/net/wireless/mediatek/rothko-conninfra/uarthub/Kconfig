@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_UARTHUB
+	bool "MT6989 UART HUB"
+	depends on MTK_ROTHKO_BT && SERIAL_8250_MT6577=y && COMMON_CLK
+	help
+	  Enable the MT6989 UART HUB routing and host ownership interface
+	  used by the native MT6639 Bluetooth UART driver.

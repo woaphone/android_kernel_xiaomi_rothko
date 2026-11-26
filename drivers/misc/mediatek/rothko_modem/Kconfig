@@ -1,0 +1,6 @@
+source "drivers/misc/mediatek/rothko_modem/ccci_util/Kconfig"
+source "drivers/misc/mediatek/rothko_modem/eccci/Kconfig"
+source "drivers/misc/mediatek/rothko_modem/ccmni/Kconfig"
+source "drivers/misc/mediatek/rothko_modem/conn_md/Kconfig"
+source "drivers/misc/mediatek/rothko_modem/memory-amms/Kconfig"
+source "drivers/misc/mediatek/rothko_modem/rps/Kconfig"

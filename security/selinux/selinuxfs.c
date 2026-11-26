@@ -157,7 +157,8 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
 	if (sscanf(page, "%d", &scan_value) != 1)
 		goto out;
 
-	new_value = !!scan_value;
+	new_value = !IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC) &&
+		    !!scan_value;
 
 	old_value = enforcing_enabled();
 	if (new_value != old_value) {

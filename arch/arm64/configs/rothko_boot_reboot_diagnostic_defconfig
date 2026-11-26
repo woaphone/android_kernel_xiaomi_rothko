@@ -1,0 +1,2 @@
+# Diagnostic only: reboot at approximately 50 seconds after kernel start.
+CONFIG_ROTHKO_BOOT_REBOOT_DIAGNOSTIC=y

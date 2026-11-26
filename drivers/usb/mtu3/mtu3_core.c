@@ -359,6 +359,7 @@ void mtu3_start(struct mtu3 *mtu)
 
 	mtu3_dev_power_on(mtu);
 	mtu3_csr_init(mtu);
+	ssusb_set_force_vbus(mtu->ssusb, true);
 	mtu3_set_speed(mtu, mtu->speed);
 
 	/* Initialize the default interrupts */
@@ -379,6 +380,7 @@ void mtu3_stop(struct mtu3 *mtu)
 		mtu3_dev_on_off(mtu, 0);
 
 	mtu->is_active = 0;
+	ssusb_set_force_vbus(mtu->ssusb, false);
 	mtu3_dev_power_down(mtu);
 }
 

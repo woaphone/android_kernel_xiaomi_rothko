@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MTK_POWER_THROTTLING_COMMON
+	bool "MTK MT6989 battery power throttling interfaces"
+	depends on ARCH_MEDIATEK
+
+config PMIC_LBAT_SERVICE
+	bool "MediaTek PMIC battery voltage interrupt service"
+	depends on REGMAP && IRQ_DOMAIN
+	select MTK_POWER_THROTTLING_COMMON
+
+config MTK_BATTERY_OC_POWER_THROTTLING
+	bool "MediaTek PMIC battery overcurrent throttling"
+	depends on REGMAP && IRQ_DOMAIN
+	select MTK_POWER_THROTTLING_COMMON
+
+config MTK_LOW_BATTERY_POWER_THROTTLING
+	bool "MediaTek low battery voltage throttling"
+	depends on POWER_SUPPLY && REGMAP && IRQ_DOMAIN
+	select MTK_POWER_THROTTLING_COMMON
+	select PMIC_LBAT_SERVICE

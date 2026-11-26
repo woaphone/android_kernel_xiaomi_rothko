@@ -1818,4 +1818,58 @@ config REGULATOR_QCOM_LABIBB
 	  boost regulator and IBB can be used as a negative boost regulator
 	  for LCD display panel.
 
+config REGULATOR_MT6316
+	tristate "MediaTek MT6316 PMIC"
+	depends on MFD_MTK_SPMI_PMIC
+	select REGMAP_SPMI
+	help
+	  Say y here to select this option to enable the power regulator of
+	  MediaTek MT6316 PMIC.
+	  This driver supports the control of different power rails of device
+	  through regulator interface.
+
+config REGULATOR_MT6363
+	tristate "MT6363 SPMI Regulator driver"
+	depends on MFD_MTK_SPMI_PMIC
+	help
+	  Say y here to select this option to enable the power regulator of
+	  MediaTek MT6363 PMIC.
+	  This driver supports the control of different power rails of device
+	  through regulator interface.
+
+	  The driver can also be build as a module.
+	  If so, the module will be called mt6363_regulator
+
+config REGULATOR_MT6373
+	tristate "MT6373 SPMI Regulator driver"
+	depends on MFD_MTK_SPMI_PMIC
+	help
+	  Say y here to select this option to enable the power regulator of
+	  MediaTek MT6373 PMIC.
+	  This driver supports the control of different power rails of device
+	  through regulator interface.
+
+	  The driver can also be build as a module.
+	  If so, the module will be called mt6373_regulator
+
+config REGULATOR_MT6681
+	tristate "MT6681 I2C Regulator driver"
+	depends on MFD_MT6681
+	help
+	  Say y here to select this option to enable the power regulator of
+	  MediaTek MT6681 PMIC.
+	  This driver supports the control of different power rails of device
+	  through regulator interface.
+
+	  The driver can also be build as a module.
+	  If so, the module will be called mt6681_regulator
+
+
+config REGULATOR_ROTHKO_WL2868C
+	tristate "Xiaomi rothko WL2868C camera regulators"
+	depends on I2C && OF
+	select REGMAP_I2C
+	help
+	  Enable the seven WL2868C outputs using the Xiaomi factory binding.
+
 endif

@@ -1756,11 +1756,12 @@ EXPORT_SYMBOL_GPL(nf_conntrack_free);
 /* Allocate a new conntrack: we return -ENOMEM if classification
    failed due to stress.  Otherwise it really is unclassifiable. */
 static noinline struct nf_conntrack_tuple_hash *
-init_conntrack(struct net *net, struct nf_conn *tmpl,
+init_conntrack(const struct nf_hook_state *state, struct nf_conn *tmpl,
 	       const struct nf_conntrack_tuple *tuple,
 	       struct sk_buff *skb,
 	       unsigned int dataoff, u32 hash)
 {
+	struct net *net = state->net;
 	struct nf_conn *ct;
 	struct nf_conn_help *help;
 	struct nf_conntrack_tuple repl_tuple;
@@ -1837,6 +1838,18 @@ init_conntrack(struct net *net, struct nf_conn *tmpl,
 	if (!exp && tmpl)
 		__nf_ct_try_assign_helper(ct, tmpl, GFP_ATOMIC);
 
+#if IS_ENABLED(CONFIG_ROTHKO_MINET)
+	/* Reserve storage before handing out the first reference. The minet
+	 * hook only writes the UID, including on already confirmed entries.
+	 */
+	if (READ_ONCE(nf_ct_minet_active) && net_eq(net, &init_net) &&
+	    state->hook == NF_INET_LOCAL_OUT && !exp &&
+	    (state->pf == NFPROTO_IPV4 || state->pf == NFPROTO_IPV6) &&
+	    (tuple->dst.protonum == IPPROTO_TCP ||
+	     tuple->dst.protonum == IPPROTO_UDP))
+		nf_ct_ext_add(ct, NF_CT_EXT_MINET, GFP_ATOMIC);
+#endif
+
 	/* Other CPU might have obtained a pointer to this object before it was
 	 * released.  Because refcount is 0, refcount_inc_not_zero() will fail.
 	 *
@@ -1897,8 +1910,7 @@ resolve_normal_ct(struct nf_conn *tmpl,
 	}
 
 	if (!h) {
-		h = init_conntrack(state->net, tmpl, &tuple,
-				   skb, dataoff, hash);
+		h = init_conntrack(state, tmpl, &tuple, skb, dataoff, hash);
 		if (!h)
 			return 0;
 		if (IS_ERR(h))

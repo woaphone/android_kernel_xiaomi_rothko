@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_C2PS
+	bool "MediaTek MT6989 camera per-task performance control"
+	depends on ARCH_MEDIATEK && PROC_FS && UCLAMP_TASK
+	depends on ANDROID_VENDOR_HOOKS
+	help
+	  Expose the rothko camera HAL ioctl at /proc/c2ps/c2ps_ioctl.
+	  Apply and restore fixed per-thread utilization clamps for registered
+	  tasks. The HAL needs its stock node permissions and CAP_SYS_NICE.
+	  ACTIVATE and ADD_TASK select only this fixed policy. Gear limits,
+	  VIP controls, task-group tuning and adaptive inputs are unavailable.
+	  Scene changes, VSYNC/CAMFPS and single-shot requests are unsupported.

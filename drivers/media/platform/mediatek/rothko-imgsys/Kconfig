@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_MTK_ISP_HCP
+	tristate "MediaTek MT6989 ISP7SP hetero control processor"
+	depends on VIDEO_DEV && OF && DEVICE_MODULES_ARM_SMMU_V3
+	depends on DEVICE_MODULES_DMABUF_HEAPS_SYSTEM
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  HCP daemon interface and ISP7SP working buffers for MT6989.
+
+config VIDEO_MTK_ISP_IMGSYS_7SP
+	bool "MediaTek MT6989 ISP7SP image system"
+	depends on VIDEO_MTK_ISP_HCP=y && MEDIA_CONTROLLER
+	depends on MTK_CMDQ_MBOX_EXT && DEVICE_MODULES_MTK_SMI
+	depends on MTK_MMDVFS && MTK_TINYSYS_VCP_SUPPORT
+	depends on INTERCONNECT_MTK_EXTENSION
+	select VIDEOBUF2_DMA_SG
+	help
+	  ISP7SP V4L2 request pipeline, CMDQ execution and ISP hardware modules.
+
+source "drivers/media/platform/mediatek/rothko-imgsys/vendor/drivers/interconnect/mediatek/Kconfig"

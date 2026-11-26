@@ -165,6 +165,8 @@ config IFB
 
 source "drivers/net/team/Kconfig"
 
+source "drivers/net/rothko_miwill/Kconfig"
+
 config MACVLAN
 	tristate "MAC-VLAN support"
 	help

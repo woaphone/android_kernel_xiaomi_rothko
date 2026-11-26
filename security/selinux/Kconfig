@@ -37,6 +37,16 @@ config SECURITY_SELINUX_DEVELOP
 	  permissive mode (if permitted by the policy) via
 	  /sys/fs/selinux/enforce.
 
+config SECURITY_SELINUX_ROTHKO_DIAGNOSTIC
+	bool "rothko permissive kernel log diagnostic image"
+	depends on ARCH_MEDIATEK && SECURITY_SELINUX_DEVELOP
+	default n
+	help
+	  Keep SELinux permissive even when Android init requests enforcing.
+	  Allow read-only kernel log and buffer-size requests regardless of
+	  dmesg_restrict; retain normal permissions for log control operations.
+	  Enable only for the rothko bring-up diagnostic boot image.
+
 config SECURITY_SELINUX_AVC_STATS
 	bool "SELinux AVC Statistics"
 	depends on SECURITY_SELINUX

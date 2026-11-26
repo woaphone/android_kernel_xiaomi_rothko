@@ -1,0 +1,9 @@
+# Sources consumed by the rothko built-in Kbuild drivers.
+filegroup(
+    name = "rothko_builtin_sources",
+    srcs = glob(
+        ["**"],
+        exclude = ["BUILD.bazel", "**/*.bzl"],
+    ),
+    visibility = ["//common:__pkg__"],
+)

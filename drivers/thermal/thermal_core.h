@@ -265,6 +265,8 @@ void thermal_zone_device_critical_reboot(struct thermal_zone_device *tz);
 void thermal_zone_device_critical_shutdown(struct thermal_zone_device *tz);
 void thermal_governor_update_tz(struct thermal_zone_device *tz,
 				enum thermal_notify_event reason);
+struct device *thermal_class_device_register(const char *name, void *drvdata,
+					     const struct attribute_group **groups);
 
 /* Helpers */
 #define for_each_trip_desc(__tz, __td)	\

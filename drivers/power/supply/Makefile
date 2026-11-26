@@ -125,3 +125,21 @@ obj-$(CONFIG_CHARGER_SURFACE)	+= surface_charger.o
 obj-$(CONFIG_BATTERY_UG3105)	+= ug3105_battery.o
 obj-$(CONFIG_CHARGER_QCOM_SMB2)	+= qcom_smbx.o
 obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
+obj-$(CONFIG_GAUGE_MT6375) += mt6375-battery.o
+mt6375-battery-y := mtk_battery_coulomb_service.o mtk_battery.o \
+	mtk_battery_algo.o mt6375-gauge.o mtk_battery_daemon.o
+ccflags-$(CONFIG_MTK_CHARGER) += -I$(srctree)/drivers/usb/typec/mtk-tcpc/inc
+obj-$(CONFIG_MTK_CHARGER) += charger_class.o adapter_class.o \
+	mtk_charger_algorithm_class.o
+obj-$(CONFIG_MTK_PUMP_EXPRESS) += mtk_pep.o mtk_pep20.o
+mtk_pep-y := mtk_pe.o mtk_pe_hal.o
+mtk_pep20-y := mtk_pe2.o mtk_pe2_hal.o
+obj-$(CONFIG_MTK_CHARGER) += mtk_charger_framework.o \
+	mtk_pd_charging.o mtk_pd_adapter.o
+mtk_charger_framework-y := mtk_charger.o mtk_charger_intf.o \
+	mtk_basic_charger.o mtk_pulse_charger.o mtk_adapter_switch.o
+mtk_pd_charging-y := mtk_pd.o mtk_pd_hal.o
+obj-$(CONFIG_MTK_CHARGER_TYPE_DETECT) += mtk_chg_type_det.o
+obj-$(CONFIG_CHARGER_MT6375) += mt6375-charger.o
+obj-$(CONFIG_MTK_PEAK_POWER_BUDGET) += rothko-ppb/
+obj-$(CONFIG_MTK_POWER_THROTTLING_COMMON) += rothko-power-throttling/

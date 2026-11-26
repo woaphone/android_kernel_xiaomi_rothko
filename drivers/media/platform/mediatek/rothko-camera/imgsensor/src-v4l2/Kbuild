@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+ROTHKO_CAMERA_PATH := $(srctree)/drivers/media/platform/mediatek/rothko-camera
+IMGSENSOR_DRIVER_PATH := $(ROTHKO_CAMERA_PATH)/imgsensor/src-v4l2
+subdir-ccflags-y += -DROTHKO_CAM
+subdir-ccflags-y += -I$(IMGSENSOR_DRIVER_PATH) -I$(ROTHKO_CAMERA_PATH)/imgsensor/inc
+subdir-ccflags-y += -I$(IMGSENSOR_DRIVER_PATH)/frame-sync -I$(IMGSENSOR_DRIVER_PATH)/async-setting -I$(IMGSENSOR_DRIVER_PATH)/async-setting/task-queue
+subdir-ccflags-y += -I$(ROTHKO_CAMERA_PATH)/camsys/isp7sp/cam
+obj-y += imgsensor-glue/
+obj-$(CONFIG_MTK_V4L2_IMGSENSOR) += imgsensor.o
+imgsensor-objs := adaptor-hw.o adaptor-drv.o adaptor-i2c.o adaptor-ctrls.o adaptor-ioctl.o adaptor-command.o adaptor-common-ctrl.o adaptor-subdrv-ctrl.o adaptor-fsync-ctrls.o adaptor-trace.o adaptor-util.o
+imgsensor-objs += frame-sync/frame_sync.o frame-sync/frame_sync_algo.o frame-sync/frame_monitor.o frame-sync/frame_sync_util.o frame-sync/frame_sync_console.o frame-sync/sensor_recorder.o frame-sync/hw_sensor_sync_algo.o frame-sync/custom/custom_hw_sync.o
+imgsensor-objs += virt-sensor/virt-sensor-drv.o async-setting/async-setting.o async-setting/task-queue/task-queue.o
+rothko_sensor_drivers := $(subst $",,$(CONFIG_CUSTOM_KERNEL_IMGSENSOR))
+$(foreach drv,$(rothko_sensor_drivers),$(eval subdrv-rpath := common/$(drv))$(eval include $(IMGSENSOR_DRIVER_PATH)/common/$(drv)/Makefile))
+comma := ,
+empty :=
+space := $(empty) $(empty)
+IMGSENSOR_SUBDRVS := $(subst $(space),$(comma),$(foreach e,$(rothko_sensor_drivers),E($(e))))
+ifneq ($(IMGSENSOR_SUBDRVS),)
+subdir-ccflags-y += -D'IMGSENSOR_SUBDRVS=$(IMGSENSOR_SUBDRVS)'
+endif

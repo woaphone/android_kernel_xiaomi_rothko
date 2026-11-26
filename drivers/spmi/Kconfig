@@ -54,4 +54,12 @@ config SPMI_MTK_PMIF
 	  This is required for communicating with Mediatek PMICs and
 	  other devices that have the SPMI interface.
 
+config SPMI_MT6989_PMIF
+	tristate "MediaTek MT6989 dual-PMIF SPMI controller"
+	depends on OF && (ARCH_MEDIATEK || COMPILE_TEST)
+	select IRQ_DOMAIN
+	help
+	  Support the dual PMIF and SPMI masters on MediaTek MT6989,
+	  including slave routing and PMIC RCS interrupts.
+
 endif

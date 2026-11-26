@@ -10,6 +10,7 @@
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/unaligned.h>
 
 #include <linux/power/bq27xxx_battery.h>
@@ -181,7 +182,9 @@ static int bq27xxx_battery_i2c_probe(struct i2c_client *client)
 
 	di->dev = &client->dev;
 	di->chip = id->driver_data;
-	di->name = name;
+	/* The stock board exposes this legacy DT gauge as bms. */
+	di->name = of_device_is_compatible(client->dev.of_node, "bq28z610") ?
+		   "bms" : name;
 
 	di->bus.read = bq27xxx_battery_i2c_read;
 	di->bus.write = bq27xxx_battery_i2c_write;
@@ -291,6 +294,7 @@ static const struct of_device_id bq27xxx_battery_i2c_of_match_table[] = {
 	{ .compatible = "ti,bq27621" },
 	{ .compatible = "ti,bq27z561" },
 	{ .compatible = "ti,bq28z610" },
+	{ .compatible = "bq28z610" },
 	{ .compatible = "ti,bq34z100" },
 	{ .compatible = "ti,bq78z100" },
 	{},

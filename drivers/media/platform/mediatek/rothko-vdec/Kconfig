@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_ROTHKO_VDEC
+	bool "MediaTek MT6989 VCP hardware video decoder"
+	depends on VIDEO_DEV && VIDEO_ROTHKO_VENC
+	depends on MTK_TINYSYS_VCP_SUPPORT && DEVICE_MODULES_MTK_SMI
+	depends on ARCH_MEDIATEK && DRM_MEDIATEK_MT6989 && DEVICE_MODULES_ARM_SMMU_V3
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_MEM2MEM_DEV
+	help
+	  Enable the MT6989 VCP decoder using its firmware IPI, hardware IRQ,
+	  DMA-BUF queues and vendor SMMU/SMI interfaces. The common codec and
+	  DVFS objects are supplied by the existing rothko codec integration.

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0
+config DEVICE_MODULES_DMABUF_HEAPS_SYSTEM
+    tristate "MT6989 DMA-BUF system and multimedia heaps"
+    depends on DMABUF_HEAPS
+
+config DEVICE_MODULES_DMABUF_HEAPS_REFILL
+    tristate "MT6989 DMA-BUF heap refill"
+    depends on DEVICE_MODULES_DMABUF_HEAPS_SYSTEM
+
+config DMABUF_HEAPS_DEBUG
+    tristate "MT6989 DMA-BUF debug heap"
+    depends on DEVICE_MODULES_DMABUF_HEAPS_SYSTEM

@@ -7,6 +7,7 @@
  * Author: Chunfeng Yun <chunfeng.yun@mediatek.com>
  */
 
+#include <linux/of.h>
 #include <linux/string_choices.h>
 #include "mtu3.h"
 #include "mtu3_trace.h"
@@ -488,6 +489,7 @@ static int mtu3_gadget_set_self_powered(struct usb_gadget *gadget,
 static int mtu3_gadget_pullup(struct usb_gadget *gadget, int is_on)
 {
 	struct mtu3 *mtu = gadget_to_mtu3(gadget);
+	struct device_node *np = mtu->dev->of_node;
 	unsigned long flags;
 
 	dev_dbg(mtu->dev, "%s (%s) for %sactive device\n", __func__,
@@ -508,6 +510,14 @@ static int mtu3_gadget_pullup(struct usb_gadget *gadget, int is_on)
 	}
 
 	spin_unlock_irqrestore(&mtu->lock, flags);
+
+	/* Let the charger start BC1.2 after the gadget requests pull-up. */
+	if (is_on) {
+		struct property *block = of_find_property(np, "cdp-block", NULL);
+
+		if (block && !of_remove_property(np, block))
+			dev_info(mtu->dev, "released cdp-block\n");
+	}
 	pm_runtime_put(mtu->dev);
 
 	return 0;

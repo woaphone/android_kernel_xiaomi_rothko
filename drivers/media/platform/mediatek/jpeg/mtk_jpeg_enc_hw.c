@@ -81,6 +81,16 @@ void mtk_jpeg_enc_start(void __iomem *base)
 }
 EXPORT_SYMBOL_GPL(mtk_jpeg_enc_start);
 
+void mtk_jpeg_enc_set_qtable(void __iomem *base, dma_addr_t addr)
+{
+	u32 ctrl = readl(base + JPEG_ENC_CTRL);
+
+	writel(lower_32_bits(addr), base + JPEG_ENC_Q_TBL_ADDR);
+	writel(upper_32_bits(addr), base + JPEG_ENC_Q_TBL_ADDR_EXT);
+	writel(ctrl | JPEG_ENC_CTRL_Q_TBL_EN, base + JPEG_ENC_CTRL);
+}
+EXPORT_SYMBOL_GPL(mtk_jpeg_enc_set_qtable);
+
 void mtk_jpeg_set_enc_src(struct mtk_jpeg_ctx *ctx,  void __iomem *base,
 			  struct vb2_buffer *src_buf)
 {
@@ -112,6 +122,7 @@ void mtk_jpeg_set_enc_dst(struct mtk_jpeg_ctx *ctx, void __iomem *base,
 			  struct vb2_buffer *dst_buf)
 {
 	dma_addr_t dma_addr;
+	dma_addr_t stall_addr;
 	size_t size;
 	u32 dma_addr_offset;
 	u32 dma_addr_offsetmask;
@@ -119,19 +130,25 @@ void mtk_jpeg_set_enc_dst(struct mtk_jpeg_ctx *ctx, void __iomem *base,
 	bool support_34bit = ctx->jpeg->variant->support_34bit;
 
 	dma_addr = vb2_dma_contig_plane_dma_addr(dst_buf, 0);
-	dma_addr_offset = ctx->enable_exif ? MTK_JPEG_MAX_EXIF_SIZE : 0;
-	dma_addr_offsetmask = dma_addr & JPEG_ENC_DST_ADDR_OFFSET_MASK;
 	size = vb2_plane_size(dst_buf, 0);
+	stall_addr = (dma_addr + size) & ~0xf;
+	if (ctx->jpeg->mt6989) {
+		dma_addr += dst_buf->planes[0].data_offset;
+		dma_addr_offset = 0;
+	} else {
+		dma_addr_offset = ctx->enable_exif ? MTK_JPEG_MAX_EXIF_SIZE : 0;
+	}
+	dma_addr_offsetmask = dma_addr & JPEG_ENC_DST_ADDR_OFFSET_MASK;
 
 	writel(dma_addr_offset & ~0xf, base + JPEG_ENC_OFFSET_ADDR);
 	writel(dma_addr_offsetmask & 0xf, base + JPEG_ENC_BYTE_OFFSET_MASK);
 	writel(dma_addr & ~0xf, base + JPEG_ENC_DST_ADDR0);
-	writel((dma_addr + size) & ~0xf, base + JPEG_ENC_STALL_ADDR0);
+	writel(lower_32_bits(stall_addr), base + JPEG_ENC_STALL_ADDR0);
 
 	if (support_34bit) {
 		addr_ext = FIELD_PREP(MTK_JPEG_ADDR_MASK, upper_32_bits(dma_addr));
 		writel(addr_ext, base + JPEG_ENC_DEST_ADDR0_EXT);
-		writel(addr_ext + size, base + JPEG_ENC_STALL_ADDR0_EXT);
+		writel(upper_32_bits(stall_addr), base + JPEG_ENC_STALL_ADDR0_EXT);
 	}
 }
 EXPORT_SYMBOL_GPL(mtk_jpeg_set_enc_dst);
@@ -148,12 +165,14 @@ void mtk_jpeg_set_enc_params(struct mtk_jpeg_ctx *ctx,  void __iomem *base)
 	u32 mem_stride;
 	u32 i, enc_quality;
 	u32 nr_enc_quality = ARRAY_SIZE(mtk_jpeg_enc_quality);
+	bool afbc = enc_format == V4L2_PIX_FMT_NV12_AFBC;
+	bool yuv420 = enc_format == V4L2_PIX_FMT_NV12M ||
+		      enc_format == V4L2_PIX_FMT_NV21M || afbc;
 
 	value = width << 16 | height;
 	writel(value, base + JPEG_ENC_IMG_SIZE);
 
-	if (enc_format == V4L2_PIX_FMT_NV12M ||
-	    enc_format == V4L2_PIX_FMT_NV21M)
+	if (yuv420)
 	    /*
 	     * Total 8 x 8 block number of luma and chroma.
 	     * The number of blocks is counted from 0.
@@ -165,15 +184,14 @@ void mtk_jpeg_set_enc_params(struct mtk_jpeg_ctx *ctx,  void __iomem *base)
 			  DIV_ROUND_UP(height, 8) * 4 - 1;
 	writel(blk_num, base + JPEG_ENC_BLK_NUM);
 
-	if (enc_format == V4L2_PIX_FMT_NV12M ||
-	    enc_format == V4L2_PIX_FMT_NV21M) {
+	if (yuv420) {
 		/* 4:2:0 */
 		img_stride = round_up(width, 16);
 		mem_stride = bytesperline;
 	} else {
 		/* 4:2:2 */
 		img_stride = round_up(width * 2, 32);
-		mem_stride = img_stride;
+		mem_stride = ctx->jpeg->mt6989 ? bytesperline : img_stride;
 	}
 	writel(img_stride, base + JPEG_ENC_IMG_STRIDE);
 	writel(mem_stride, base + JPEG_ENC_STRIDE);
@@ -185,9 +203,35 @@ void mtk_jpeg_set_enc_params(struct mtk_jpeg_ctx *ctx,  void __iomem *base)
 			break;
 		}
 	}
+	if (ctx->jpeg->mt6989) {
+		/* Enable AFBC and YUV transform with the MT6989 burst layout. */
+		writel(afbc ? 0x010f4341 : 0, base + JPEG_ENC_AFBC_CONFIG);
+	}
+
+	if (ctx->jpeg->mt6989) {
+		/* MT6989 ROM quantization presets, in ascending quality order. */
+		static const struct mtk_jpeg_enc_qlt presets[] = {
+			{ 24, 0xc }, { 30, 0x4 }, { 34, 0x8 }, { 38, 0x0 },
+			{ 44, 0xe }, { 52, 0xa }, { 60, 0x1 }, { 66, 0x5 },
+			{ 72, 0xf }, { 78, 0x6 }, { 82, 0xb }, { 85, 0x2 },
+			{ 90, 0x7 }, { 95, 0x3 }, { 97, 0x10 },
+		};
+
+		enc_quality = presets[0].hardware_value;
+		for (i = 1; i < ARRAY_SIZE(presets); i++) {
+			if (ctx->enc_quality < presets[i].quality_param)
+				break;
+			enc_quality = presets[i].hardware_value;
+		}
+	}
 	writel(enc_quality, base + JPEG_ENC_QUALITY);
 
 	value = readl(base + JPEG_ENC_CTRL);
+	if (ctx->jpeg->mt6989) {
+		value |= JPEG_ENC_CTRL_RDMA_PADDING_EN |
+			 JPEG_ENC_CTRL_RDMA_RIGHT_PADDING_EN;
+		value &= ~(JPEG_ENC_CTRL_RDMA_PADDING_0_EN | JPEG_ENC_CTRL_Q_TBL_EN);
+	}
 	value &= ~JPEG_ENC_CTRL_YUV_FORMAT_MASK;
 	value |= (ctx->out_q.fmt->hw_format & 3) << 3;
 	if (ctx->enable_exif)

@@ -982,6 +982,16 @@ static void thermal_release(struct device *dev)
 
 static struct class *thermal_class;
 
+struct device *thermal_class_device_register(const char *name, void *drvdata,
+					     const struct attribute_group **groups)
+{
+	if (!thermal_class)
+		return ERR_PTR(-ENODEV);
+
+	return device_create_with_groups(thermal_class, NULL, 0, drvdata, groups,
+					 "%s", name);
+}
+
 static inline
 void print_bind_err_msg(struct thermal_zone_device *tz,
 			const struct thermal_trip_desc *td,

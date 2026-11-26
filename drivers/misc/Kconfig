@@ -687,4 +687,32 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
+source "drivers/misc/mediatek/ise_lpm/Kconfig"
+source "drivers/misc/mediatek/trusted_mem/Kconfig"
+source "drivers/gpu/drm/mediatek/mt6989/vendor/drivers/misc/mediatek/scp/Kconfig"
+source "drivers/misc/mediatek/rothko_modem/Kconfig"
+source "drivers/misc/mediatek/geniezone/Kconfig"
+source "drivers/misc/mediatek/rothko-sensorhub/Kconfig"
+source "drivers/misc/mediatek/sspm/Kconfig"
+source "drivers/misc/mediatek/cm_mgr/Kconfig"
+source "drivers/misc/mediatek/performance/Kconfig"
+source "drivers/misc/mediatek/rothko-irtx/Kconfig"
+source "drivers/misc/mediatek/c2ps/Kconfig"
+source "drivers/misc/mediatek/mdpm/Kconfig"
+source "drivers/misc/mediatek/dlpt/Kconfig"
+
+config MTPROF
+	tristate "MediaTek boot profiler"
+	depends on ARCH_MEDIATEK && PROC_FS && TRACEPOINTS
+	help
+	  Expose bootloader timings, kernel initcall timings and Android boot
+	  events through /proc/bootprof.
+
+config ROTHKO_HWID
+	bool "Xiaomi rothko bootloader hardware identity"
+	depends on ARCH_MEDIATEK
+	help
+	  Publish the product name and country variant supplied by the stock
+	  bootloader for the N12 display stack.
+
 endmenu

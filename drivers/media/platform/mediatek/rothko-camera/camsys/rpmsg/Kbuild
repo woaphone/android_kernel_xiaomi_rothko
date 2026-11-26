@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
+ccflags-y += -I$(srctree)/drivers/rpmsg -I$(src)
+obj-$(CONFIG_RPMSG_MTK_CCD) += ccd_rpmsg.o
+ccd_rpmsg-objs := mtk_ccd_rpmsg.o mtk_ccd_rpmsg_ipi.o

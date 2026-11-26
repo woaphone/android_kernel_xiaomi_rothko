@@ -18,9 +18,12 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/compiler.h>
+#include <linux/console.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/mm.h>
+#include <linux/rothko_pstore.h>
+#include <linux/timekeeping.h>
 
 #include "internal.h"
 #include "ram_internal.h"
@@ -107,6 +110,138 @@ struct ramoops_context {
 };
 
 static struct platform_device *dummy;
+static bool ramoops_rothko_registered;
+
+#if defined(CONFIG_DRM_ROTHKO_N12) && defined(CONFIG_PSTORE_CONSOLE) && \
+    defined(CONFIG_PSTORE_RAM)
+static DEFINE_RAW_SPINLOCK(rothko_stage_lock);
+static struct persistent_ram_zone *rothko_stage_zone;
+
+static void rothko_pstore_set_stage_zone(struct persistent_ram_zone *zone)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&rothko_stage_lock, flags);
+	rothko_stage_zone = zone;
+	raw_spin_unlock_irqrestore(&rothko_stage_lock, flags);
+}
+
+void rothko_pstore_suspend_stage(unsigned int attempt, const char *stage, int status)
+{
+	unsigned long flags;
+	char buf[112];
+	int len;
+
+	len = scnprintf(buf, sizeof(buf), "[ROTHKO-S2IDLE %llu #%u] %s ret=%d\n",
+			ktime_get_mono_fast_ns(), attempt, stage, status);
+	raw_spin_lock_irqsave(&rothko_stage_lock, flags);
+	if (rothko_stage_zone) {
+		persistent_ram_write(rothko_stage_zone, buf, len);
+		wmb();
+	}
+	raw_spin_unlock_irqrestore(&rothko_stage_lock, flags);
+}
+#else
+static inline void rothko_pstore_set_stage_zone(struct persistent_ram_zone *zone) { }
+#endif
+
+#ifdef CONFIG_ROTHKO_PSTORE_HIGHMEM
+static struct persistent_ram_zone *ramoops_early_cprz;
+static bool ramoops_early_console_active;
+static int ramoops_early_error = -ENODEV;
+
+#ifdef CONFIG_ROTHKO_PM_PSTORE_DIAGNOSTIC
+void rothko_pstore_mark(const char *fmt, ...)
+{
+	struct persistent_ram_zone *prz = READ_ONCE(ramoops_early_cprz);
+	char buf[224];
+	va_list args;
+	unsigned int len;
+
+	if (IS_ERR_OR_NULL(prz))
+		return;
+
+	len = scnprintf(buf, sizeof(buf), "[ROTHKO-PM mono_ns=%llu cpu=%u seq=%u] ",
+			ktime_get_mono_fast_ns(), raw_smp_processor_id(),
+			rothko_pstore_attempt());
+	va_start(args, fmt);
+	len += vscnprintf(buf + len, sizeof(buf) - len - 1, fmt, args);
+	va_end(args);
+	buf[len++] = '\n';
+	persistent_ram_write(prz, buf, len);
+	wmb();
+}
+#endif
+
+static void ramoops_early_console_write(struct console *console,
+					const char *text, unsigned int count)
+{
+	persistent_ram_write(ramoops_early_cprz, text, count);
+}
+
+static struct console ramoops_early_console = {
+	.name = "earlyramoops",
+	.write = ramoops_early_console_write,
+	.flags = CON_PRINTBUFFER | CON_ENABLED | CON_ANYTIME,
+	.index = -1,
+};
+
+static int __init ramoops_early_console_init(void)
+{
+	struct persistent_ram_ecc_info ecc_info = { };
+	size_t old_size;
+
+	if (!rothko_pstore_highmem_active())
+		return 0;
+
+	ramoops_early_cprz = persistent_ram_new(ROTHKO_PSTORE_PHYS_ADDR,
+						ROTHKO_PSTORE_SIZE, 0,
+						&ecc_info, 0, 0,
+						"ramoops:early-console");
+	if (IS_ERR(ramoops_early_cprz)) {
+		ramoops_early_error = PTR_ERR(ramoops_early_cprz);
+		ramoops_early_cprz = NULL;
+		pr_err("early highmem console failed: %d\n", ramoops_early_error);
+		return ramoops_early_error;
+	}
+	ramoops_early_cprz->type = PSTORE_TYPE_CONSOLE;
+
+	old_size = persistent_ram_old_size(ramoops_early_cprz);
+	if (old_size) {
+		pr_info("early persistent console preserving %zu-byte old record\n",
+			old_size);
+		return 0;
+	}
+
+	register_console(&ramoops_early_console);
+	ramoops_early_console_active = true;
+	pr_info("early highmem console active at 0x%llx+0x%lx\n",
+		ROTHKO_PSTORE_PHYS_ADDR, ROTHKO_PSTORE_SIZE);
+	return 0;
+}
+console_initcall(ramoops_early_console_init);
+#endif
+
+static bool ramoops_is_rothko_highmem(const struct ramoops_platform_data *pdata)
+{
+	return rothko_pstore_highmem_active() &&
+	       pdata->mem_address == ROTHKO_PSTORE_PHYS_ADDR &&
+	       pdata->mem_size == ROTHKO_PSTORE_SIZE &&
+	       pdata->console_size == ROTHKO_PSTORE_SIZE &&
+	       !pdata->record_size && !pdata->ftrace_size && !pdata->pmsg_size;
+}
+
+static void ramoops_force_rothko_highmem(struct ramoops_platform_data *pdata)
+{
+	if (!rothko_pstore_highmem_active())
+		return;
+
+	memset(pdata, 0, sizeof(*pdata));
+	pdata->mem_address = ROTHKO_PSTORE_PHYS_ADDR;
+	pdata->mem_size = ROTHKO_PSTORE_SIZE;
+	pdata->console_size = ROTHKO_PSTORE_SIZE;
+	pdata->max_reason = KMSG_DUMP_OOPS;
+}
 
 static int ramoops_pstore_open(struct pstore_info *psi)
 {
@@ -319,6 +454,11 @@ static int notrace ramoops_pstore_write(struct pstore_record *record)
 	if (record->type == PSTORE_TYPE_CONSOLE) {
 		if (!cxt->cprz)
 			return -ENOMEM;
+#ifdef CONFIG_ROTHKO_PSTORE_HIGHMEM
+		if (ramoops_early_console_active &&
+		    cxt->cprz == ramoops_early_cprz)
+			return 0;
+#endif
 		persistent_ram_write(cxt->cprz, record->buf, record->size);
 		return 0;
 	} else if (record->type == PSTORE_TYPE_FTRACE) {
@@ -461,6 +601,11 @@ static void ramoops_free_przs(struct ramoops_context *cxt)
 	persistent_ram_free(&cxt->mprz);
 
 	/* Free console PRZ */
+#ifdef CONFIG_ROTHKO_PSTORE_HIGHMEM
+	/* The built-in early console owns this zone for the kernel lifetime. */
+	if (cxt->cprz == ramoops_early_cprz)
+		cxt->cprz = NULL;
+#endif
 	persistent_ram_free(&cxt->cprz);
 
 	/* Free dump PRZs */
@@ -734,7 +879,7 @@ static int ramoops_probe(struct platform_device *pdev)
 	 * Only a single ramoops area allowed at a time, so fail extra
 	 * probes.
 	 */
-	if (cxt->max_dump_cnt) {
+	if (cxt->max_dump_cnt || ramoops_rothko_registered) {
 		pr_err("already initialized\n");
 		goto fail_out;
 	}
@@ -755,6 +900,8 @@ static int ramoops_probe(struct platform_device *pdev)
 		goto fail_out;
 	}
 
+	ramoops_force_rothko_highmem(pdata);
+
 	if (!pdata->mem_size || (!pdata->record_size && !pdata->console_size &&
 			!pdata->ftrace_size && !pdata->pmsg_size)) {
 		pr_err("The memory size and the record/console size must be "
@@ -765,7 +912,8 @@ static int ramoops_probe(struct platform_device *pdev)
 
 	if (pdata->record_size && !is_power_of_2(pdata->record_size))
 		pdata->record_size = rounddown_pow_of_two(pdata->record_size);
-	if (pdata->console_size && !is_power_of_2(pdata->console_size))
+	if (pdata->console_size && !is_power_of_2(pdata->console_size) &&
+	    !ramoops_is_rothko_highmem(pdata))
 		pdata->console_size = rounddown_pow_of_two(pdata->console_size);
 	if (pdata->ftrace_size && !is_power_of_2(pdata->ftrace_size))
 		pdata->ftrace_size = rounddown_pow_of_two(pdata->ftrace_size);
@@ -792,10 +940,26 @@ static int ramoops_probe(struct platform_device *pdev)
 	if (err)
 		goto fail_init;
 
-	err = ramoops_init_prz("console", dev, cxt, &cxt->cprz, &paddr,
-			       cxt->console_size, 0);
-	if (err)
-		goto fail_init;
+#ifdef CONFIG_ROTHKO_PSTORE_HIGHMEM
+	if (ramoops_is_rothko_highmem(pdata)) {
+		if (!ramoops_early_cprz) {
+			err = ramoops_early_error;
+			pr_err("early highmem console zone unavailable: %d\n", err);
+			goto fail_init;
+		}
+		cxt->cprz = ramoops_early_cprz;
+		if (persistent_ram_old_size(cxt->cprz))
+			persistent_ram_zap(cxt->cprz);
+		paddr += cxt->console_size;
+		pr_info("using early-owned console zone without remapping\n");
+	} else
+#endif
+	{
+		err = ramoops_init_prz("console", dev, cxt, &cxt->cprz, &paddr,
+				       cxt->console_size, 0);
+		if (err)
+			goto fail_init;
+	}
 
 	err = ramoops_init_prz("pmsg", dev, cxt, &cxt->mprz, &paddr,
 				cxt->pmsg_size, 0);
@@ -853,6 +1017,10 @@ static int ramoops_probe(struct platform_device *pdev)
 		goto fail_buf;
 	}
 
+	/* An ECC zone has shared parity workspace with its console writer. */
+	if (!cxt->ecc_info.ecc_size)
+		rothko_pstore_set_stage_zone(cxt->cprz);
+
 	/*
 	 * Update the module parameter variables as well so they are visible
 	 * through /sys/module/ramoops/parameters/
@@ -869,6 +1037,9 @@ static int ramoops_probe(struct platform_device *pdev)
 		cxt->size, (unsigned long long)cxt->phys_addr,
 		cxt->ecc_info.ecc_size);
 
+#ifdef CONFIG_ROTHKO_PSTORE_HIGHMEM
+	ramoops_rothko_registered = ramoops_is_rothko_highmem(pdata);
+#endif
 	return 0;
 
 fail_buf:
@@ -885,12 +1056,16 @@ static void ramoops_remove(struct platform_device *pdev)
 {
 	struct ramoops_context *cxt = &oops_cxt;
 
+	rothko_pstore_set_stage_zone(NULL);
 	pstore_unregister(&cxt->pstore);
 
 	kvfree(cxt->pstore.buf);
 	cxt->pstore.bufsize = 0;
 
 	ramoops_free_przs(cxt);
+#ifdef CONFIG_ROTHKO_PSTORE_HIGHMEM
+	ramoops_rothko_registered = false;
+#endif
 }
 
 static const struct of_device_id dt_match[] = {
@@ -926,6 +1101,19 @@ static void __init ramoops_register_dummy(void)
 			mem_address = start;
 			mem_size = size;
 		}
+	}
+
+	if (rothko_pstore_highmem_active()) {
+		mem_address = ROTHKO_PSTORE_PHYS_ADDR;
+		mem_size = ROTHKO_PSTORE_SIZE;
+		mem_type = 0;
+		record_size = 0;
+		ramoops_console_size = ROTHKO_PSTORE_SIZE;
+		ramoops_ftrace_size = 0;
+		ramoops_pmsg_size = 0;
+		ramoops_ecc = 0;
+		pr_info("forcing one 0x%lx-byte console zone at 0x%llx\n",
+			ROTHKO_PSTORE_SIZE, ROTHKO_PSTORE_PHYS_ADDR);
 	}
 
 	/*

@@ -5,6 +5,7 @@
  * Author: Chunfeng Yun <chunfeng.yun@mediatek.com>
  */
 
+#include <linux/arm-smccc.h>
 #include <linux/dma-mapping.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
@@ -14,10 +15,110 @@
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/reset.h>
+#include <linux/soc/mediatek/mtk_sip_svc.h>
 
 #include "mtu3.h"
 #include "mtu3_dr.h"
 #include "mtu3_debug.h"
+
+/* MT6989 IPPC resource requests, from the vendor MTU3 driver. */
+#define U3D_SSUSB_SPM_CTRL	0x40
+#define U3D_SSUSB_SPM_CTRL_ACK	0x44
+#define SSUSB_SPM_EMI_EN		BIT(6)
+#define SSUSB_SPM_DDR_EN		BIT(4)
+#define SSUSB_SPM_VRF18_REQ	BIT(3)
+#define SSUSB_SPM_APSRC_REQ	BIT(2)
+#define SSUSB_SPM_INFRE_REQ	BIT(1)
+#define SSUSB_SPM_SRCCLKENA	BIT(0)
+#define SSUSB_SPM_REQ_MSK \
+	(SSUSB_SPM_SRCCLKENA | SSUSB_SPM_INFRE_REQ | SSUSB_SPM_APSRC_REQ | \
+	 SSUSB_SPM_VRF18_REQ | SSUSB_SPM_DDR_EN | SSUSB_SPM_EMI_EN)
+#define SSUSB_SPM_FORCE_HW_REQ_MSK	GENMASK(14, 8)
+#define MTK_SIP_KERNEL_USB_CONTROL	MTK_SIP_SMC_CMD(0x527)
+
+enum ssusb_smc_request {
+	SSUSB_SMC_HWRECS_RESUME = 2,
+	SSUSB_SMC_HWRECS_SUSPEND = 3,
+};
+
+int ssusb_set_power_state(struct ssusb_mtk *ssusb, enum mtu3_power_state state)
+{
+	struct arm_smccc_res res;
+	void __iomem *ibase = ssusb->ippc_base;
+	u32 request, value;
+	int smc_req = -1;
+	int ret;
+
+	if (!ssusb->clk_mgr)
+		return 0;
+
+	request = mtu3_readl(ibase, U3D_SSUSB_SPM_CTRL);
+	request &= ~SSUSB_SPM_FORCE_HW_REQ_MSK;
+	switch (state) {
+	case MTU3_STATE_POWER_ON:
+		request |= SSUSB_SPM_REQ_MSK;
+		break;
+	case MTU3_STATE_POWER_OFF:
+		request &= ~SSUSB_SPM_REQ_MSK;
+		break;
+	case MTU3_STATE_RESUME:
+		request |= SSUSB_SPM_REQ_MSK;
+		smc_req = SSUSB_SMC_HWRECS_RESUME;
+		break;
+	case MTU3_STATE_SUSPEND:
+		request &= ~SSUSB_SPM_REQ_MSK;
+		smc_req = SSUSB_SMC_HWRECS_SUSPEND;
+		break;
+	}
+	mtu3_writel(ibase, U3D_SSUSB_SPM_CTRL, request);
+	ret = readl_poll_timeout_atomic(ibase + U3D_SSUSB_SPM_CTRL_ACK,
+		value, (value & SSUSB_SPM_REQ_MSK) ==
+		(request & SSUSB_SPM_REQ_MSK), 100, 20000);
+	if (ret) {
+		dev_err(ssusb->dev, "resource ACK timeout: request %#x, ACK %#x\n",
+			request, value);
+		return ret;
+	}
+	mdelay(2);
+	if (smc_req >= 0)
+		arm_smccc_smc(MTK_SIP_KERNEL_USB_CONTROL, smc_req,
+			     0, 0, 0, 0, 0, 0, &res);
+	return 0;
+}
+
+void ssusb_set_force_vbus(struct ssusb_mtk *ssusb, bool on)
+{
+	u32 u2ctl, misc;
+
+	if (!ssusb->force_vbus)
+		return;
+
+	u2ctl = mtu3_readl(ssusb->ippc_base, SSUSB_U2_CTRL(0));
+	misc = mtu3_readl(ssusb->mac_base, U3D_MISC_CTRL);
+	if (on) {
+		u2ctl &= ~SSUSB_U2_PORT_OTG_SEL;
+		misc |= VBUS_FRC_EN | VBUS_ON;
+	} else {
+		u2ctl |= SSUSB_U2_PORT_OTG_SEL;
+		misc &= ~(VBUS_FRC_EN | VBUS_ON);
+	}
+	mtu3_writel(ssusb->ippc_base, SSUSB_U2_CTRL(0), u2ctl);
+	mtu3_writel(ssusb->mac_base, U3D_MISC_CTRL, misc);
+}
+
+int ssusb_phy_set_mode(struct ssusb_mtk *ssusb, enum phy_mode mode)
+{
+	int i, ret;
+
+	if (!ssusb->mt6989)
+		return 0;
+	for (i = 0; i < ssusb->num_phys; i++) {
+		ret = phy_set_mode(ssusb->phys[i], mode);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
 
 /* u2-port0 should be powered on and enabled; */
 int ssusb_check_clocks(struct ssusb_mtk *ssusb, u32 ex_clks)
@@ -148,6 +249,13 @@ static int ssusb_rscs_init(struct ssusb_mtk *ssusb)
 		goto phy_init_err;
 	}
 
+	ret = ssusb_phy_set_mode(ssusb,
+		ssusb->dr_mode == USB_DR_MODE_PERIPHERAL ? PHY_MODE_USB_DEVICE :
+		ssusb->dr_mode == USB_DR_MODE_HOST ? PHY_MODE_USB_HOST : PHY_MODE_USB_OTG);
+	if (ret) {
+		dev_err(ssusb->dev, "failed to set PHY mode: %d\n", ret);
+		goto phy_err;
+	}
 	ret = ssusb_phy_power_on(ssusb);
 	if (ret) {
 		dev_err(ssusb->dev, "failed to power on phy\n");
@@ -168,6 +276,7 @@ vusb33_err:
 
 static void ssusb_rscs_exit(struct ssusb_mtk *ssusb)
 {
+	ssusb_set_power_state(ssusb, MTU3_STATE_POWER_OFF);
 	clk_bulk_disable_unprepare(BULK_CLKS_CNT, ssusb->clks);
 	regulator_disable(ssusb->vusb33);
 	ssusb_phy_power_off(ssusb);
@@ -224,6 +333,8 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
 	int i;
 	int ret;
 
+	ssusb->mt6989 = of_machine_is_compatible("mediatek,MT6989");
+
 	ssusb->vusb33 = devm_regulator_get(dev, "vusb33");
 	if (IS_ERR(ssusb->vusb33)) {
 		dev_err(dev, "failed to get vusb33\n");
@@ -234,7 +345,9 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
 	clks[1].id = "ref_ck";
 	clks[2].id = "mcu_ck";
 	clks[3].id = "dma_ck";
-	clks[4].id = "xhci_ck";
+	clks[4].id = ssusb->mt6989 &&
+		    of_property_match_string(node, "clock-names", "host_ck") >= 0 ?
+			"host_ck" : "xhci_ck";
 	clks[5].id = "frmcnt_ck";
 	ret = devm_clk_bulk_get_optional(dev, BULK_CLKS_CNT, clks);
 	if (ret)
@@ -267,9 +380,21 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
 	if (ssusb->wakeup_irq == -EPROBE_DEFER)
 		return ssusb->wakeup_irq;
 
+	ssusb->force_vbus = ssusb->mt6989 &&
+			    of_property_read_bool(node, "mediatek,force-vbus");
+	ssusb->clk_mgr = ssusb->mt6989 &&
+			 of_property_read_bool(node, "mediatek,clk-mgr");
+	of_property_read_u32(node, "mediatek,hwrscs-vers", &ssusb->hwrscs_vers);
+	if (ssusb->clk_mgr && ssusb->hwrscs_vers != 1)
+		return dev_err_probe(dev, -EINVAL, "unsupported hwrscs version %u\n",
+				     ssusb->hwrscs_vers);
+
 	ssusb->dr_mode = usb_get_dr_mode(dev);
 	if (ssusb->dr_mode == USB_DR_MODE_UNKNOWN)
 		ssusb->dr_mode = USB_DR_MODE_OTG;
+	/* Apply the configured gadget-only mode before fetching host resources. */
+	if (IS_ENABLED(CONFIG_USB_MTU3_GADGET))
+		ssusb->dr_mode = USB_DR_MODE_PERIPHERAL;
 
 	of_property_read_u32(node, "mediatek,u3p-dis-msk", &ssusb->u3p_dis_msk);
 
@@ -356,7 +481,12 @@ static int mtu3_probe(struct platform_device *pdev)
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_set_autosuspend_delay(dev, 4000);
 	pm_runtime_enable(dev);
-	pm_runtime_get_sync(dev);
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret) {
+		pm_runtime_disable(dev);
+		ssusb_debugfs_remove_root(ssusb);
+		return dev_err_probe(dev, ret, "failed to power USB domain\n");
+	}
 
 	device_init_wakeup(dev, true);
 
@@ -381,6 +511,9 @@ static int mtu3_probe(struct platform_device *pdev)
 
 	ssusb_ip_sw_reset(ssusb);
 	ssusb_u3_drd_check(ssusb);
+	ret = ssusb_set_power_state(ssusb, MTU3_STATE_POWER_ON);
+	if (ret)
+		goto comm_exit;
 
 	if (IS_ENABLED(CONFIG_USB_MTU3_HOST))
 		ssusb->dr_mode = USB_DR_MODE_HOST;
@@ -515,6 +648,13 @@ static int mtu3_suspend_common(struct device *dev, pm_message_t msg)
 	struct ssusb_mtk *ssusb = dev_get_drvdata(dev);
 	int ret = 0;
 
+	/* Vendor clk-mgr keeps the peripheral active across runtime PM. */
+	if (ssusb->clk_mgr && !ssusb->is_host)
+		return 0;
+	ret = ssusb_set_power_state(ssusb, MTU3_STATE_SUSPEND);
+	if (ret)
+		return ret;
+
 	dev_dbg(dev, "%s\n", __func__);
 
 	switch (ssusb->dr_mode) {
@@ -549,8 +689,11 @@ static int mtu3_suspend_common(struct device *dev, pm_message_t msg)
 	return 0;
 
 sleep_err:
+	ssusb_set_power_state(ssusb, MTU3_STATE_RESUME);
 	resume_ip_and_ports(ssusb, msg);
+	return ret;
 err:
+	ssusb_set_power_state(ssusb, MTU3_STATE_RESUME);
 	return ret;
 }
 
@@ -558,6 +701,9 @@ static int mtu3_resume_common(struct device *dev, pm_message_t msg)
 {
 	struct ssusb_mtk *ssusb = dev_get_drvdata(dev);
 	int ret;
+
+	if (ssusb->clk_mgr && !ssusb->is_host)
+		return 0;
 
 	dev_dbg(dev, "%s\n", __func__);
 
@@ -570,7 +716,10 @@ static int mtu3_resume_common(struct device *dev, pm_message_t msg)
 	if (ret)
 		goto phy_err;
 
-	return resume_ip_and_ports(ssusb, msg);
+	ret = resume_ip_and_ports(ssusb, msg);
+	if (ret)
+		return ret;
+	return ssusb_set_power_state(ssusb, MTU3_STATE_RESUME);
 
 phy_err:
 	clk_bulk_disable_unprepare(BULK_CLKS_CNT, ssusb->clks);

@@ -8,8 +8,23 @@
 #include <linux/tty_flip.h>
 #include <linux/serial_reg.h>
 #include <linux/dma-mapping.h>
+#include <linux/mm.h>
 
 #include "8250.h"
+
+static void serial8250_latch_tx_dma_fault(struct uart_8250_port *p)
+{
+	struct uart_port *port = &p->port;
+	struct tty_struct *tty = port->state->port.tty;
+
+	lockdep_assert_held(&port->lock);
+	port->tx_dma_fault = true;
+	port->x_char = 0;
+	if (tty)
+		set_bit(TTY_IO_ERROR, &tty->flags);
+	port->ops->stop_tx(port);
+	uart_write_wakeup(port);
+}
 
 static void __dma_tx_complete(void *param)
 {
@@ -19,10 +34,22 @@ static void __dma_tx_complete(void *param)
 	unsigned long	flags;
 	int		ret;
 
-	dma_sync_single_for_cpu(dma->txchan->device->dev, dma->tx_addr,
-				UART_XMIT_SIZE, DMA_TO_DEVICE);
+	if (!dma->tx_check_cookie)
+		dma_sync_single_for_cpu(dma->txchan->device->dev, dma->tx_addr,
+					UART_XMIT_SIZE, DMA_TO_DEVICE);
 
 	uart_port_lock_irqsave(&p->port, &flags);
+
+	if (dma->tx_check_cookie) {
+		/* A callback already queued at flush may belong to the old TX. */
+		if (p->port.tx_dma_shutdown || p->port.tx_dma_fault ||
+		    !dma->tx_running ||
+		    dma_async_is_tx_complete(dma->txchan, dma->tx_cookie, NULL, NULL) !=
+		    DMA_COMPLETE)
+			goto unlock;
+		dma_sync_single_for_cpu(dma->txchan->device->dev, dma->tx_addr,
+					UART_XMIT_SIZE, DMA_TO_DEVICE);
+	}
 
 	dma->tx_running = 0;
 
@@ -32,9 +59,10 @@ static void __dma_tx_complete(void *param)
 		uart_write_wakeup(&p->port);
 
 	ret = serial8250_tx_dma(p);
-	if (ret || !dma->tx_running)
+	if (!p->port.tx_dma_fault && (ret || !dma->tx_running))
 		serial8250_set_THRI(p);
 
+unlock:
 	uart_port_unlock_irqrestore(&p->port, flags);
 }
 
@@ -94,8 +122,14 @@ int serial8250_tx_dma(struct uart_8250_port *p)
 	int i;
 	int ret;
 
+	if (up->tx_dma_shutdown || up->tx_dma_fault)
+		return 0;
+
 	if (dma->tx_running) {
-		if (up->x_char) {
+		/* MTK APDMA cannot pause and resume TX under the port lock.
+		 * Its completion sends x_char before submitting the next DMA.
+		 */
+		if (up->x_char && !dma->tx_check_cookie) {
 			dmaengine_pause(dma->txchan);
 			uart_xchar_out(up, UART_TX);
 			dmaengine_resume(dma->txchan);
@@ -126,6 +160,12 @@ int serial8250_tx_dma(struct uart_8250_port *p)
 				       DMA_MEM_TO_DEV,
 				       DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
 	if (!desc) {
+		/* PIO would advance the software ring without advancing APDMA. */
+		if (dma->tx_check_cookie) {
+			dev_err_ratelimited(up->dev, "TX DMA descriptor rejected; reopen required\n");
+			serial8250_latch_tx_dma_fault(p);
+			return 0;
+		}
 		ret = -EBUSY;
 		goto err;
 	}
@@ -166,6 +206,20 @@ void serial8250_tx_dma_flush(struct uart_8250_port *p)
 	 * We can't use `dmaengine_terminate_sync` because `uart_flush_buffer` is
 	 * holding the uart port spinlock.
 	 */
+	if (dma->tx_check_cookie) {
+		int ret = dmaengine_terminate_async(dma->txchan);
+
+		if (ret) {
+			serial8250_latch_tx_dma_fault(p);
+			dev_err_ratelimited(p->port.dev, "TX DMA failed to stop: %d\n", ret);
+		} else {
+			dma_sync_single_for_cpu(dma->txchan->device->dev, dma->tx_addr,
+						UART_XMIT_SIZE, DMA_TO_DEVICE);
+			serial_out(p, UART_FCR, p->fcr | UART_FCR_CLEAR_XMIT);
+		}
+		dma->tx_running = 0;
+		return;
+	}
 	dmaengine_terminate_async(dma->txchan);
 
 	/*
@@ -304,6 +358,11 @@ int serial8250_request_dma(struct uart_8250_port *p)
 		goto err;
 	}
 
+	if (dma->tx_check_cookie) {
+		dma->tx_page = virt_to_page(p->port.state->port.xmit_buf);
+		get_page(dma->tx_page);
+	}
+
 	dev_dbg_ratelimited(p->port.dev, "got both dma channels\n");
 
 	return 0;
@@ -318,25 +377,72 @@ EXPORT_SYMBOL_GPL(serial8250_request_dma);
 void serial8250_release_dma(struct uart_8250_port *p)
 {
 	struct uart_8250_dma *dma = p->dma;
+	int rx_ret = 0;
 
 	if (!dma)
 		return;
 
-	/* Release RX resources */
-	dmaengine_terminate_sync(dma->rxchan);
-	dma_free_coherent(dma->rxchan->device->dev, dma->rx_size, dma->rx_buf,
-			  dma->rx_addr);
-	dma_release_channel(dma->rxchan);
-	dma->rxchan = NULL;
+	if (dma->tx_check_cookie) {
+		guard(uart_port_lock_irqsave)(&p->port);
 
-	/* Release TX resources */
-	dmaengine_terminate_sync(dma->txchan);
+		p->port.tx_dma_shutdown = true;
+		dma->tx_running = 0;
+		dma->tx_size = 0;
+	}
+
+	if (dma->rxchan) {
+		if (dma->tx_check_cookie) {
+			rx_ret = dmaengine_terminate_async(dma->rxchan);
+			dmaengine_synchronize(dma->rxchan);
+		} else {
+			dmaengine_terminate_sync(dma->rxchan);
+		}
+		if (!rx_ret) {
+			dma_free_coherent(dma->rxchan->device->dev, dma->rx_size,
+					  dma->rx_buf, dma->rx_addr);
+			dma_release_channel(dma->rxchan);
+			dma->rxchan = NULL;
+		} else {
+			dev_err_ratelimited(p->port.dev,
+					    "RX DMA ring retained after stop failure: %d\n", rx_ret);
+		}
+	}
+
+	if (!dma->txchan)
+		goto finish;
+	if (dma->tx_check_cookie) {
+		int ret;
+
+		ret = dmaengine_terminate_async(dma->txchan);
+		dmaengine_synchronize(dma->txchan);
+		if (ret) {
+			guard(uart_port_lock_irqsave)(&p->port);
+
+			p->port.tx_dma_fault = true;
+			/* The controller may still read the ring after a STOP timeout. */
+			dev_err(p->port.dev, "TX DMA ring retained after stop failure: %d\n", ret);
+			return;
+		}
+	} else {
+		dmaengine_terminate_sync(dma->txchan);
+	}
 	dma_unmap_single(dma->txchan->device->dev, dma->tx_addr,
 			 UART_XMIT_SIZE, DMA_TO_DEVICE);
 	dma_release_channel(dma->txchan);
 	dma->txchan = NULL;
+	if (dma->tx_page) {
+		put_page(dma->tx_page);
+		dma->tx_page = NULL;
+	}
 	dma->tx_running = 0;
+finish:
+	if (dma->tx_check_cookie) {
+		guard(uart_port_lock_irqsave)(&p->port);
 
-	dev_dbg_ratelimited(p->port.dev, "dma channels released\n");
+		p->port.tx_dma_fault = rx_ret != 0;
+	}
+
+	if (!rx_ret)
+		dev_dbg_ratelimited(p->port.dev, "dma channels released\n");
 }
 EXPORT_SYMBOL_GPL(serial8250_release_dma);

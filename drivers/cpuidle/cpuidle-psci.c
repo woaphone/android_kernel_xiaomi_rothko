@@ -14,6 +14,7 @@
 #include <linux/cpumask.h>
 #include <linux/cpu_pm.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/device/faux.h>
@@ -23,6 +24,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/syscore_ops.h>
+#include <linux/suspend.h>
+#include <uapi/linux/psci.h>
 
 #include <asm/cpuidle.h>
 #include <trace/hooks/cpuidle_psci.h>
@@ -45,7 +48,51 @@ struct psci_cpuidle_domain_state {
 
 static DEFINE_PER_CPU_READ_MOSTLY(struct psci_cpuidle_data, psci_cpuidle_data);
 static DEFINE_PER_CPU(struct psci_cpuidle_domain_state, psci_domain_state);
+static DEFINE_PER_CPU(bool, psci_idle_pm_enter_failed);
+static DEFINE_PER_CPU(unsigned long, psci_idle_suspend_reported);
 static bool psci_cpuidle_use_syscore;
+static bool mt6989_idle_wfi_on_reject __ro_after_init;
+
+/* Firmware can start accepting these requests after platform initialization. */
+static DEFINE_PER_CPU(ktime_t[CPUIDLE_STATE_MAX], mt6989_retry_after);
+#define MT6989_INVALID_STATE_RETRY_MS	32
+
+static __cpuidle int psci_idle_fallback_wfi(void)
+{
+	ct_cpuidle_enter();
+	cpu_do_idle();
+	ct_cpuidle_exit();
+	return 0;
+}
+
+/* A rejected CPU_SUSPEND can return immediately, with no IRQ to service. */
+static __cpuidle int psci_idle_rejected(struct cpuidle_device *dev, int idx,
+					int err)
+{
+	if (!mt6989_idle_wfi_on_reject || err != -EINVAL ||
+	    pm_suspend_in_progress() || need_resched() ||
+	    dev->states_usage[0].disable)
+		return -1;
+
+	/* The core accounts the returned WFI state; retain the failed attempt. */
+	dev->states_usage[idx].rejected++;
+	return psci_idle_fallback_wfi();
+}
+
+static void psci_idle_report_suspend_failure(struct cpuidle_device *dev,
+					    int idx, u32 state, int ret,
+					    bool s2idle)
+{
+	unsigned long bit = BIT(idx + (s2idle ? CPUIDLE_STATE_MAX : 0));
+
+	if (this_cpu_read(psci_idle_suspend_reported) & bit)
+		return;
+
+	this_cpu_or(psci_idle_suspend_reported, bit);
+	pr_warn("CPU%u idle state %d (%#x), s2idle=%d: PSCI suspend failed: %d (firmware status %d)\n",
+		dev->cpu, idx, state, s2idle, ret,
+		psci_cpu_suspend_last_raw_error());
+}
 
 void psci_set_domain_state(struct generic_pm_domain *pd, unsigned int state_idx,
 			   u32 state)
@@ -74,8 +121,14 @@ static __cpuidle int __psci_enter_domain_idle_state(struct cpuidle_device *dev,
 	int ret;
 
 	ret = cpu_pm_enter();
-	if (ret)
+	if (ret) {
+		if (!this_cpu_read(psci_idle_pm_enter_failed))
+			pr_warn("CPU%u state %d CPU PM enter failed: %d\n",
+				dev->cpu, idx, ret);
+		this_cpu_write(psci_idle_pm_enter_failed, true);
 		return -1;
+	}
+	this_cpu_write(psci_idle_pm_enter_failed, false);
 
 	/* Do runtime PM to manage a hierarchical CPU toplogy. */
 	trace_android_vh_cpuidle_psci_enter(dev, s2idle);
@@ -90,7 +143,9 @@ static __cpuidle int __psci_enter_domain_idle_state(struct cpuidle_device *dev,
 		state = ds->state;
 
 	trace_psci_domain_idle_enter(dev->cpu, state, s2idle);
-	ret = psci_cpu_suspend_enter(state) ? -1 : idx;
+	ret = psci_cpu_suspend_enter(state);
+	if (ret)
+		psci_idle_report_suspend_failure(dev, idx, state, ret, s2idle);
 	trace_psci_domain_idle_exit(dev->cpu, state, s2idle);
 
 	if (s2idle)
@@ -103,12 +158,14 @@ static __cpuidle int __psci_enter_domain_idle_state(struct cpuidle_device *dev,
 	cpu_pm_exit();
 
 	/* Correct domain-idlestate statistics if we failed to enter. */
-	if (ret == -1 && ds->state)
+	if (ret && ds->state)
 		pm_genpd_inc_rejected(ds->pd, ds->state_idx);
 
 	/* Clear the domain state to start fresh when back from idle. */
 	psci_clear_domain_state();
-	return ret;
+	if (ret)
+		return s2idle ? -1 : psci_idle_rejected(dev, idx, ret);
+	return idx;
 }
 
 static int psci_enter_domain_idle_state(struct cpuidle_device *dev,
@@ -121,7 +178,14 @@ static int psci_enter_s2idle_domain_idle_state(struct cpuidle_device *dev,
 					       struct cpuidle_driver *drv,
 					       int idx)
 {
-	return __psci_enter_domain_idle_state(dev, drv, idx, true);
+	int ret;
+
+	/* Keep the MT6989 suspend source set only around this CPU's s2idle entry. */
+	mt6989_lpm_suspend_source(dev->cpu, true);
+	ret = __psci_enter_domain_idle_state(dev, drv, idx, true);
+	mt6989_lpm_suspend_source(dev->cpu, false);
+
+	return ret;
 }
 
 static int psci_idle_cpuhp_up(unsigned int cpu)
@@ -216,12 +280,69 @@ static void psci_idle_init_cpuhp(void)
 		pr_warn("Failed %d while setup cpuhp state\n", err);
 }
 
+static __always_inline int __psci_enter_idle_state(struct cpuidle_device *dev,
+						   int idx, bool s2idle)
+{
+	u32 *states = __this_cpu_read(psci_cpuidle_data.psci_states);
+	ktime_t *retry_after = NULL;
+	int ret;
+
+	if (!idx) {
+		cpu_do_idle();
+		return idx;
+	}
+
+	/* Only cache CPU-local requests with a fixed PSCI state argument. */
+	if (!s2idle && mt6989_idle_wfi_on_reject && !pm_suspend_in_progress() &&
+	    !dev->states_usage[0].disable) {
+		retry_after = &(*this_cpu_ptr(&mt6989_retry_after))[idx];
+		if (*retry_after) {
+			if (ktime_before(ktime_get(), *retry_after) && !need_resched())
+				return psci_idle_fallback_wfi();
+			*retry_after = 0;
+		}
+	}
+
+	ret = cpu_pm_enter();
+	if (ret) {
+		if (!this_cpu_read(psci_idle_pm_enter_failed))
+			pr_warn("CPU%u state %d CPU PM enter failed: %d\n",
+				dev->cpu, idx, ret);
+		this_cpu_write(psci_idle_pm_enter_failed, true);
+		return -1;
+	}
+	this_cpu_write(psci_idle_pm_enter_failed, false);
+
+	ret = psci_cpu_suspend_enter(states[idx]);
+	if (ret) {
+		if (retry_after && ret == -EINVAL &&
+		    psci_cpu_suspend_last_raw_error() == PSCI_RET_INVALID_PARAMS)
+			*retry_after = ktime_add_ms(ktime_get(), MT6989_INVALID_STATE_RETRY_MS);
+		psci_idle_report_suspend_failure(dev, idx, states[idx], ret, s2idle);
+	}
+
+	cpu_pm_exit();
+	if (ret)
+		return s2idle ? -1 : psci_idle_rejected(dev, idx, ret);
+	return idx;
+}
+
 static __cpuidle int psci_enter_idle_state(struct cpuidle_device *dev,
 					   struct cpuidle_driver *drv, int idx)
 {
-	u32 *state = __this_cpu_read(psci_cpuidle_data.psci_states);
+	return __psci_enter_idle_state(dev, idx, false);
+}
 
-	return CPU_PM_CPU_IDLE_ENTER_PARAM_RCU(psci_cpu_suspend_enter, idx, state[idx]);
+static __cpuidle int mt6989_enter_s2idle_state(struct cpuidle_device *dev,
+					      struct cpuidle_driver *drv, int idx)
+{
+	int ret;
+
+	mt6989_lpm_suspend_source(dev->cpu, true);
+	ret = __psci_enter_idle_state(dev, idx, true);
+	mt6989_lpm_suspend_source(dev->cpu, false);
+
+	return ret;
 }
 
 static const struct of_device_id psci_idle_state_match[] = {
@@ -310,6 +431,14 @@ static int psci_dt_cpu_init_idle(struct device *dev, struct cpuidle_driver *drv,
 	ret = psci_dt_cpu_init_topology(drv, data, state_count, cpu);
 	if (ret < 0)
 		return ret;
+
+	/* The platform-coordinated PSCI path also needs SUSPEND_SRC. */
+	if (IS_ENABLED(CONFIG_MTK_ROTHKO_LPM) && mt6989_idle_wfi_on_reject) {
+		for (i = 1; i < state_count; i++) {
+			if (drv->states[i].enter_s2idle == psci_enter_idle_state)
+				drv->states[i].enter_s2idle = mt6989_enter_s2idle_state;
+		}
+	}
 
 	/* Idle states parsed correctly, store them in the per-cpu struct. */
 	data->psci_states = psci_states;
@@ -478,6 +607,8 @@ static bool __init dt_idle_state_present(void)
 static int __init psci_idle_init(void)
 {
 	struct faux_device *fdev;
+
+	mt6989_idle_wfi_on_reject = of_machine_is_compatible("mediatek,MT6989");
 
 	if (!dt_idle_state_present())
 		return 0;

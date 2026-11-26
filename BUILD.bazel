@@ -44,6 +44,7 @@ load(
     "get_gki_unprotected_modules_list",
     "get_kunit_modules_list",
     "get_kunit_modules_superset",
+    "get_rothko_gki_modules_list",
 )
 
 package(
@@ -3670,3 +3671,136 @@ pkg_zip(
 exports_files([
     "Makefile",
 ])
+
+# Redmi K70 Ultra (MT6989): full 6.18 kernel build with board drivers.
+exports_files([
+    "arch/arm64/configs/rothko_usb_gadget_defconfig",
+    "arch/arm64/configs/rothko_pstore_200m_defconfig",
+])
+
+filegroup(
+    name = "rothko_permissive_diagnostic_defconfigs",
+    srcs = [
+        "arch/arm64/configs/rothko_usb_gadget_defconfig",
+        "arch/arm64/configs/rothko_selinux_permissive_defconfig",
+    ],
+)
+
+filegroup(
+    name = "rothko_kernelsu_defconfigs",
+    srcs = [
+        ":rothko_permissive_diagnostic_defconfigs",
+        "arch/arm64/configs/rothko_kernelsu_defconfig",
+    ],
+)
+
+filegroup(
+    name = "rothko_sleep_pstore_defconfigs",
+    srcs = [
+        ":rothko_kernelsu_defconfigs",
+        "arch/arm64/configs/rothko_pstore_200m_defconfig",
+        "arch/arm64/configs/rothko_sleep_pstore_defconfig",
+    ],
+)
+
+filegroup(
+    name = "rothko_permissive_pstore_diagnostic_defconfigs",
+    srcs = [
+        ":rothko_permissive_diagnostic_defconfigs",
+        "arch/arm64/configs/rothko_pstore_200m_defconfig",
+    ],
+)
+
+filegroup(
+    name = "rothko_usb_pstore_diagnostic_defconfigs",
+    srcs = [
+        "arch/arm64/configs/rothko_usb_gadget_defconfig",
+        "arch/arm64/configs/rothko_pstore_200m_defconfig",
+    ],
+)
+
+filegroup(
+    name = "rothko_boot_reboot_diagnostic_defconfigs",
+    srcs = [
+        "arch/arm64/configs/rothko_pstore_200m_defconfig",
+        "arch/arm64/configs/rothko_selinux_permissive_defconfig",
+        "arch/arm64/configs/rothko_boot_reboot_diagnostic_defconfig",
+    ],
+)
+
+filegroup(
+    name = "rothko_pstore_reader_diagnostic_defconfigs",
+    srcs = [
+        "arch/arm64/configs/rothko_pstore_200m_defconfig",
+        "arch/arm64/configs/rothko_selinux_permissive_defconfig",
+        "arch/arm64/configs/rothko_pstore_reader_diagnostic_defconfig",
+        "arch/arm64/configs/rothko_usb_gadget_defconfig",
+    ],
+)
+
+write_file(
+    name = "rothko_build_config",
+    out = "build.config.rothko.generated",
+    content = [
+        '. "${ROOT_DIR}/${KERNEL_DIR}/build.config.constants"',
+        "BRANCH=\"rothko-6.18\"",
+        "KMI_GENERATION=\"\"",
+        "",
+    ],
+)
+
+kernel_build(
+    name = "rothko_aarch64",
+    srcs = [
+        ":kernel_aarch64_sources",
+        "//common/drivers/net/wireless/mediatek/rothko-conninfra/bt:rothko_builtin_sources",
+        "//common/drivers/net/wireless/mediatek/rothko-conninfra/connfem:rothko_builtin_sources",
+        "//common/drivers/net/wireless/mediatek/rothko-conninfra/conninfra:rothko_builtin_sources",
+        "//common/drivers/net/wireless/mediatek/rothko-conninfra/gps-scp:rothko_builtin_sources",
+    ],
+    outs = DEFAULT_GKI_OUTS + [".config", "Module.symvers"],
+    arch = "arm64",
+    build_config = ":rothko_build_config",
+    defconfig = "arch/arm64/configs/gki_defconfig",
+    generated_headers_for_module = _GENERATED_HEADERS_FOR_MODULE,
+    kcflags = COMMON_KCFLAGS,
+    make_goals = _GKI_AARCH64_MAKE_GOALS,
+    makefile = ":Makefile",
+    module_implicit_outs = get_rothko_gki_modules_list() + get_kunit_modules_list("arm64"),
+    post_defconfig_fragments = ["arch/arm64/configs/rothko_gki.fragment"],
+    module_outs = [
+        "drivers/media/platform/mediatek/rothko-camera/camera_dpe_isp7sp.ko",
+        "drivers/media/platform/mediatek/rothko-camera/camera_eeprom_v4l2.ko",
+        "net/rothko_minet/minet.ko",
+        "drivers/net/rothko_miwill/miwill.ko",
+        "drivers/media/platform/mediatek/rothko-camera/main2_vcm.ko",
+        "drivers/media/platform/mediatek/rothko-camera/main_vcm.ko",
+        "drivers/media/platform/mediatek/rothko-camera/pda_drv_mt6989.ko",
+        "drivers/misc/mediatek/rothko-irtx/mtk-pwm.ko",
+        "drivers/misc/mediatek/rothko-irtx/mtk_irtx_pwm.ko",
+        "drivers/nvmem/nvmem_mt635x_efuse.ko",
+        "drivers/thermal/mediatek/backlight_cooling.ko",
+        "drivers/thermal/mediatek/charger_cooling.ko",
+        "drivers/thermal/mediatek/pmic_temp.ko",
+    ],
+)
+
+kernel_modules_install(
+    name = "rothko_modules_install",
+    kernel_build = ":rothko_aarch64",
+)
+
+pkg_files(
+    name = "rothko_dist_files",
+    srcs = [
+        ":rothko_aarch64",
+        ":rothko_modules_install",
+    ],
+    strip_prefix = strip_prefix.files_only(),
+)
+
+pkg_install(
+    name = "rothko_dist",
+    srcs = [":rothko_dist_files"],
+    destdir = "out/rothko/dist",
+)

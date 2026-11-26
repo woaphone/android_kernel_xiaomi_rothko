@@ -163,6 +163,15 @@ config SCHED_CORE
 	  which is the likely usage by Linux distributions, there should
 	  be no measurable impact on performance.
 
+config MT6989_OPP_CAPACITY
+	bool "MediaTek MT6989 firmware OPP capacity tables"
+	depends on ARM64 && ARCH_MEDIATEK && OF_ADDRESS && ARM_MEDIATEK_CPUFREQ_HW
+	help
+	  Provide a read-only snapshot of the firmware CPU frequency and
+	  capacity pairs in CSRAM for the three MT6989 performance domains.
+	  Scheduler consumers can explicitly request the base table. This
+	  option does not select a governor or configure workload tables.
+
 config SCHED_CLASS_EXT
 	bool "Extensible Scheduling Class"
 	depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF

@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_MITEE
+ tristate "Xiaomi MT6989 MiTEE over FF-A"
+ depends on ARM64 && ARM_FFA_TRANSPORT && TEE && !OPTEE
+ depends on RPMB || !RPMB
+ help
+   MiTEE ioctl and Xiaomi FF-A physical message ABI used by rothko.

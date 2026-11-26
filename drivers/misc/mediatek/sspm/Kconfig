@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_TINYSYS_SSPM_SUPPORT
+	tristate "MediaTek SSPM v3 platform service"
+	depends on ARM64 && OF_RESERVED_MEM && MTK_TINYSYS_SCMI
+	help
+	  Initialize SSPM shared memory and synchronize the SSPM clock on
+	  MT6989. The module is sspm_v3.

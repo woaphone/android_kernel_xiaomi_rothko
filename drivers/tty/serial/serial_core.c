@@ -596,7 +596,7 @@ static int uart_put_char(struct tty_struct *tty, u8 c)
 		return 0;
 	}
 
-	if (port)
+	if (port && !port->tx_dma_fault && !port->tx_dma_shutdown)
 		ret = kfifo_put(&state->port.xmit_fifo, c);
 	uart_port_unlock_deref(port, flags);
 	return ret;
@@ -627,7 +627,9 @@ static ssize_t uart_write(struct tty_struct *tty, const u8 *buf, size_t count)
 		return 0;
 	}
 
-	if (port)
+	if (port && port->tx_dma_fault)
+		ret = -EIO;
+	else if (port && !port->tx_dma_shutdown)
 		ret = kfifo_in(&state->port.xmit_fifo, buf, count);
 
 	__uart_start(state);
@@ -643,7 +645,8 @@ static unsigned int uart_write_room(struct tty_struct *tty)
 	unsigned int ret;
 
 	port = uart_port_ref_lock(state, &flags);
-	if (!state->port.xmit_buf)
+	if (!state->port.xmit_buf ||
+	    (port && (port->tx_dma_fault || port->tx_dma_shutdown)))
 		ret = 0;
 	else
 		ret = kfifo_avail(&state->port.xmit_fifo);

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config MTK_ISE_LPM_SUPPORT
+	tristate "Specify Interface Support iSE low power control"
+	depends on MTK_TINYSYS_SCMI && OF
+	help
+	  support iSE power control
+	  Set Y to enable this feature.
+	  If unsure,
+	  Set N to stay with legancy feature.

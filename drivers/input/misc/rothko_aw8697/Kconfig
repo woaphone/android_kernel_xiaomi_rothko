@@ -1,0 +1,7 @@
+config ROTHKO_AW8697_HAPTIC
+	tristate "Rothko AW86927 haptic controller"
+	depends on I2C && INPUT && GPIOLIB && OF && PINCTRL
+	select REGMAP_I2C
+	select FW_LOADER
+	help
+	  Enable force feedback for the Awinic AW86927 on stock Rothko.

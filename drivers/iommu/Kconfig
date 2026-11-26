@@ -399,4 +399,6 @@ config PKVM_PVIOMMU_SELFTEST
 	help
 	  Basic test for PKVM_PVIOMMU
 
+source "drivers/iommu/mt6989/Kconfig"
+
 endif # IOMMU_SUPPORT

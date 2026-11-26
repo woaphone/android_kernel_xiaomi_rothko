@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: GPL-2.0
+config DRM_MEDIATEK_MT6989
+	tristate "MediaTek MT6989 mobile display controller"
+	depends on DRM && OF && COMMON_CLK && MMU
+	select DRM_KMS_HELPER
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_DP_HELPER
+	select DRM_MIPI_DSI
+	select DRM_GEM_DMA_HELPER
+	select SYNC_FILE
+	select MTK_MML
+	select MTK_DPC
+	select MTK_CMDQ_MBOX_EXT
+	help
+	  MediaTek V2 DRM/DSI/DSC/MIPI TX implementation for MT6989.
+	  Uses the original vendor command-queue, display/MML paths and UAPI.
+
+source "drivers/gpu/drm/mediatek/mt6989/mediatek_v2/Kconfig"
+
+config DRM_ROTHKO_N12
+	bool "Redmi K70 Ultra N12 42/02/0a and 36/02/0b panels and Novatek VIS"
+	depends on DRM_MEDIATEK_MT6989=y && ROTHKO_HWID
+	depends on SPI_MT65XX=y && SPI_MEM && GPIOLIB_LEGACY
+	depends on COMMON_CLK_MT6685_335=y && BACKLIGHT_CLASS_DEVICE=y
+	help
+	  Build the N12 command-mode DSI panel and its Novatek VIS SPI
+	  controller for Redmi K70 Ultra (rothko).
+
+source "drivers/gpu/drm/mediatek/mt6989/mml/Kconfig"
+source "drivers/gpu/drm/mediatek/mt6989/dpc/Kconfig"
+
+config MTK_CMDQ_MBOX_EXT
+	tristate "MT6989 hardware CMDQ mailbox extension"
+	depends on MAILBOX && ARM64
+
+config MTK_MDP_MT6989
+	bool "MT6989 Media Data Path for Android Codec2"
+	depends on DRM_MEDIATEK_MT6989=y && MTK_CMDQ_MBOX_EXT=y
+	depends on MTK_MMDVFS=y && INTERCONNECT_MTK_EXTENSION=y
+	select SYNC_FILE
+	help
+	  Enable the MT6989 MDP command queue and sync timelines used by
+	  Android's hardware video decoder for output format conversion.
+
+source "drivers/gpu/drm/mediatek/mt6989/vendor/drivers/misc/mediatek/mminfra/Kconfig"
+source "drivers/gpu/drm/mediatek/mt6989/vendor/drivers/misc/mediatek/mmp/Kconfig"
+source "drivers/gpu/drm/mediatek/mt6989/vendor/drivers/misc/mediatek/mtk-interconnect/Kconfig"
+source "drivers/gpu/drm/mediatek/mt6989/vendor/drivers/misc/mediatek/slbc/Kconfig"
+
+config MTK_MMDVFS
+	tristate "MT6989 multimedia DVFS"
+	depends on ARCH_MEDIATEK && REGULATOR_MTK_DVFSRC
+
+config DEVICE_MODULES_MTK_SMI
+	tristate "MT6989 vendor SMI bus controller"
+	depends on ARCH_MEDIATEK && OF
+
+source "drivers/gpu/drm/mediatek/mt6989/vendor/drivers/misc/mediatek/vcp/Kconfig"
+
+source "drivers/gpu/drm/mediatek/mt6989/leds/Kconfig"

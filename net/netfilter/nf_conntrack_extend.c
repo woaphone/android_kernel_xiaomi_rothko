@@ -29,6 +29,11 @@
 
 atomic_t nf_conntrack_ext_genid __read_mostly = ATOMIC_INIT(1);
 
+#if IS_ENABLED(CONFIG_ROTHKO_MINET)
+bool nf_ct_minet_active __read_mostly;
+EXPORT_SYMBOL_GPL(nf_ct_minet_active);
+#endif
+
 static const u8 nf_ct_ext_type_len[NF_CT_EXT_NUM] = {
 	[NF_CT_EXT_HELPER] = sizeof(struct nf_conn_help),
 #if IS_ENABLED(CONFIG_NF_NAT)
@@ -54,12 +59,15 @@ static const u8 nf_ct_ext_type_len[NF_CT_EXT_NUM] = {
 #if IS_ENABLED(CONFIG_NET_ACT_CT)
 	[NF_CT_EXT_ACT_CT] = sizeof(struct nf_conn_act_ct_ext),
 #endif
+#if IS_ENABLED(CONFIG_ROTHKO_MINET)
+	[NF_CT_EXT_MINET] = sizeof(struct nf_conn_minet),
+#endif
 };
 
 static __always_inline unsigned int total_extension_size(void)
 {
 	/* remember to add new extensions below */
-	BUILD_BUG_ON(NF_CT_EXT_NUM > 10);
+	BUILD_BUG_ON(NF_CT_EXT_NUM > 10 + IS_ENABLED(CONFIG_ROTHKO_MINET));
 
 	return sizeof(struct nf_ct_ext) +
 	       sizeof(struct nf_conn_help)
@@ -85,6 +93,9 @@ static __always_inline unsigned int total_extension_size(void)
 #endif
 #if IS_ENABLED(CONFIG_NET_ACT_CT)
 		+ sizeof(struct nf_conn_act_ct_ext)
+#endif
+#if IS_ENABLED(CONFIG_ROTHKO_MINET)
+		+ sizeof(struct nf_conn_minet)
 #endif
 	;
 }

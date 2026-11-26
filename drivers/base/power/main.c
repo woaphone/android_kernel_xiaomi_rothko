@@ -23,6 +23,8 @@
 #include <linux/mutex.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/rothko_hwid.h>
+#include <linux/rothko_pstore.h>
 #include <linux/pm-trace.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/interrupt.h>
@@ -174,10 +176,11 @@ void device_pm_remove(struct device *dev)
 
 	pr_debug("Removing info for %s:%s\n",
 		 dev->bus ? dev->bus->name : "No Bus", dev_name(dev));
-	complete_all(&dev->power.completion);
 	mutex_lock(&dpm_list_mtx);
 	list_del_init(&dev->power.entry);
 	dev->power.in_dpm_list = false;
+	/* Do not let a DPM list walk reinitialize the final completion. */
+	complete_all(&dev->power.completion);
 	mutex_unlock(&dpm_list_mtx);
 	device_wakeup_disable(dev);
 	pm_runtime_remove(dev);
@@ -247,21 +250,66 @@ static void initcall_debug_report(struct device *dev, ktime_t calltime,
 		 (unsigned long long)ktime_us_delta(rettime, calltime));
 }
 
+/* Set before noirq dispatch, cleared after all workers and IRQ handling. */
+static unsigned int noirq_attempt;
+
+static unsigned int rothko_noirq_attempt(pm_message_t state)
+{
+	unsigned int attempt = rothko_s2idle_attempt();
+	const char *name;
+
+	if (!IS_ENABLED(CONFIG_DRM_ROTHKO_N12) || !attempt || state.event != PM_EVENT_RESUME)
+		return 0;
+
+	name = product_name_get();
+	return name && !strcmp(name, "rothko") ? attempt : 0;
+}
+
+/* Leave room for the timestamp, attempt and status in the 112-byte record. */
+static __printf(3, 4) void noirq_mark(unsigned int attempt, int ret,
+				     const char *fmt, ...)
+{
+	char stage[56];
+	va_list args;
+
+	va_start(args, fmt);
+	vscnprintf(stage, sizeof(stage), fmt, args);
+	va_end(args);
+	rothko_pstore_suspend_stage(attempt, stage, ret);
+}
+
 /**
- * dpm_wait - Wait for a PM operation to complete.
+ * dpm_wait_on - Wait for a PM operation to complete.
  * @dev: Device to wait for.
  * @async: If unset, wait only if the device's power.async_suspend flag is set.
+ * @attempt: Active noirq diagnostic attempt, or zero.
+ * @waiter: Device waiting for its superior when recording.
+ * @relation: Parent (P) or supplier (S) when recording.
  */
-static void dpm_wait(struct device *dev, bool async)
+static void dpm_wait_on(struct device *dev, bool async, unsigned int attempt,
+			struct device *waiter, char relation)
 {
 	if (!dev)
 		return;
 
 	if (async || (pm_async_enabled && dev->power.async_suspend)) {
+		bool record = attempt && !completion_done(&dev->power.completion);
+
 		trace_android_vh_dpm_wait_start(dev);
+		if (record)
+			noirq_mark(attempt, 0, "NQ W+ %d %c %.18s %.18s",
+				   task_pid_nr(current), relation,
+				   dev_name(waiter), dev_name(dev));
 		wait_for_completion(&dev->power.completion);
+		if (record)
+			noirq_mark(attempt, 0, "NQ W- %d", task_pid_nr(current));
 		trace_android_vh_dpm_wait_finish(dev);
 	}
+}
+
+static void dpm_wait(struct device *dev, bool async)
+{
+	dpm_wait_on(dev, async, 0, NULL, 0);
 }
 
 static int dpm_wait_fn(struct device *dev, void *async_ptr)
@@ -275,7 +323,7 @@ static void dpm_wait_for_children(struct device *dev, bool async)
 	device_for_each_child(dev, &async, dpm_wait_fn);
 }
 
-static void dpm_wait_for_suppliers(struct device *dev, bool async)
+static void dpm_wait_for_suppliers(struct device *dev, bool async, unsigned int attempt)
 {
 	struct device_link *link;
 	int idx;
@@ -292,12 +340,12 @@ static void dpm_wait_for_suppliers(struct device *dev, bool async)
 	dev_for_each_link_to_supplier(link, dev)
 		if (READ_ONCE(link->status) != DL_STATE_DORMANT &&
 		    !device_link_flag_is_sync_state_only(link->flags))
-			dpm_wait(link->supplier, async);
+			dpm_wait_on(link->supplier, async, attempt, dev, 'S');
 
 	device_links_read_unlock(idx);
 }
 
-static bool dpm_wait_for_superior(struct device *dev, bool async)
+static bool dpm_wait_for_superior(struct device *dev, bool async, unsigned int attempt)
 {
 	struct device *parent;
 
@@ -319,10 +367,10 @@ static bool dpm_wait_for_superior(struct device *dev, bool async)
 
 	mutex_unlock(&dpm_list_mtx);
 
-	dpm_wait(parent, async);
+	dpm_wait_on(parent, async, attempt, dev, 'P');
 	put_device(parent);
 
-	dpm_wait_for_suppliers(dev, async);
+	dpm_wait_for_suppliers(dev, async, attempt);
 
 	/*
 	 * If the parent's callback has deleted the device, attempting to resume
@@ -494,8 +542,8 @@ static void dpm_show_time(ktime_t starttime, pm_message_t state, int error,
 		  usecs / USEC_PER_MSEC, usecs % USEC_PER_MSEC);
 }
 
-static int dpm_run_callback(pm_callback_t cb, struct device *dev,
-			    pm_message_t state, const char *info)
+static int __dpm_run_callback(pm_callback_t cb, struct device *dev,
+			      pm_message_t state, const char *info, unsigned int attempt)
 {
 	ktime_t calltime;
 	int error;
@@ -507,13 +555,24 @@ static int dpm_run_callback(pm_callback_t cb, struct device *dev,
 
 	pm_dev_dbg(dev, state, info);
 	trace_device_pm_callback_start(dev, info, state.event);
+	if (attempt)
+		noirq_mark(attempt, 0, "NQ C+ %d %.16s %ps", task_pid_nr(current),
+			   dev_name(dev), cb);
 	error = cb(dev);
+	if (attempt)
+		noirq_mark(attempt, error, "NQ C- %d", task_pid_nr(current));
 	trace_device_pm_callback_end(dev, error);
 	suspend_report_result(dev, cb, error);
 
 	initcall_debug_report(dev, calltime, cb, error);
 
 	return error;
+}
+
+static int dpm_run_callback(pm_callback_t cb, struct device *dev,
+			    pm_message_t state, const char *info)
+{
+	return __dpm_run_callback(cb, dev, state, info, 0);
 }
 
 #ifdef CONFIG_DPM_WATCHDOG
@@ -694,8 +753,12 @@ static bool is_async(struct device *dev)
 		&& !pm_trace_is_enabled();
 }
 
+static void async_resume_noirq(void *data, async_cookie_t cookie);
+
 static bool __dpm_async(struct device *dev, async_func_t func)
 {
+	unsigned int attempt;
+
 	if (dev->power.work_in_progress)
 		return true;
 
@@ -706,8 +769,13 @@ static bool __dpm_async(struct device *dev, async_func_t func)
 
 	get_device(dev);
 
+	attempt = func == async_resume_noirq ? READ_ONCE(noirq_attempt) : 0;
+	if (attempt)
+		noirq_mark(attempt, 0, "NQ Q+ %p %.24s", dev, dev_name(dev));
 	if (async_schedule_dev_nocall(func, dev))
 		return true;
+	if (attempt)
+		noirq_mark(attempt, 0, "NQ Q! %p", dev);
 
 	put_device(dev);
 
@@ -731,20 +799,24 @@ static int dpm_async_with_cleanup(struct device *dev, void *fn)
 	return 0;
 }
 
-static void dpm_async_resume_children(struct device *dev, async_func_t func)
+static int dpm_async_resume_ready(struct device *dev, void *fn)
 {
-	/*
-	 * Prevent racing with dpm_clear_async_state() during initial list
-	 * walks in dpm_noirq_resume_devices(), dpm_resume_early(), and
-	 * dpm_resume().
-	 */
-	guard(mutex)(&dpm_list_mtx);
+	struct device_link *link;
 
-	/*
-	 * Start processing "async" children of the device unless it's been
-	 * started already for them.
-	 */
-	device_for_each_child(dev, func, dpm_async_with_cleanup);
+	/* The ordered list walk will handle devices that are not ready yet. */
+	if (!is_async(dev) || completion_done(&dev->power.completion))
+		return 0;
+
+	if (dev->parent && !completion_done(&dev->parent->power.completion))
+		return 0;
+
+	dev_for_each_link_to_supplier(link, dev)
+		if (READ_ONCE(link->status) != DL_STATE_DORMANT &&
+		    !device_link_flag_is_sync_state_only(link->flags) &&
+		    !completion_done(&link->supplier->power.completion))
+			return 0;
+
+	return dpm_async_with_cleanup(dev, fn);
 }
 
 static void dpm_async_resume_subordinate(struct device *dev, async_func_t func)
@@ -752,14 +824,16 @@ static void dpm_async_resume_subordinate(struct device *dev, async_func_t func)
 	struct device_link *link;
 	int idx;
 
-	dpm_async_resume_children(dev, func);
-
+	/* Serialize the readiness checks with the initial completion resets. */
+	guard(mutex)(&dpm_list_mtx);
 	idx = device_links_read_lock();
 
-	/* Start processing the device's "async" consumers. */
+	/* Avoid occupying an async worker waiting for another superior. */
+	device_for_each_child(dev, func, dpm_async_resume_ready);
 	dev_for_each_link_to_consumer(link, dev)
-		if (READ_ONCE(link->status) != DL_STATE_DORMANT)
-			dpm_async_with_cleanup(link->consumer, func);
+		if (READ_ONCE(link->status) != DL_STATE_DORMANT &&
+		    !device_link_flag_is_sync_state_only(link->flags))
+			dpm_async_resume_ready(link->consumer, func);
 
 	device_links_read_unlock(idx);
 }
@@ -782,8 +856,6 @@ static bool dpm_root_device(struct device *dev)
 	return !dev->parent && list_empty(&dev->links.suppliers);
 }
 
-static void async_resume_noirq(void *data, async_cookie_t cookie);
-
 /**
  * device_resume_noirq - Execute a "noirq resume" callback for given device.
  * @dev: Device to handle.
@@ -795,6 +867,7 @@ static void async_resume_noirq(void *data, async_cookie_t cookie);
  */
 static void device_resume_noirq(struct device *dev, pm_message_t state, bool async)
 {
+	unsigned int attempt = READ_ONCE(noirq_attempt);
 	pm_callback_t callback = NULL;
 	const char *info = NULL;
 	bool skip_resume;
@@ -822,7 +895,7 @@ static void device_resume_noirq(struct device *dev, pm_message_t state, bool asy
 		goto Out;
 	}
 
-	if (!dpm_wait_for_superior(dev, async))
+	if (!dpm_wait_for_superior(dev, async, attempt))
 		goto Out;
 
 	dpm_watchdog_set(&wd, dev);
@@ -867,7 +940,7 @@ static void device_resume_noirq(struct device *dev, pm_message_t state, bool asy
 	}
 
 Run:
-	error = dpm_run_callback(callback, dev, state, info);
+	error = __dpm_run_callback(callback, dev, state, info, attempt);
 
 Skip:
 	dpm_watchdog_clear(&wd);
@@ -889,12 +962,17 @@ Out:
 static void async_resume_noirq(void *data, async_cookie_t cookie)
 {
 	struct device *dev = data;
+	unsigned int attempt = READ_ONCE(noirq_attempt);
 
+	if (attempt)
+		noirq_mark(attempt, 0, "NQ Q> %p %d", dev, task_pid_nr(current));
 	device_resume_noirq(dev, pm_transition, true);
+	if (attempt)
+		noirq_mark(attempt, 0, "NQ Q- %p", dev);
 	put_device(dev);
 }
 
-static void dpm_noirq_resume_devices(pm_message_t state)
+static void dpm_noirq_resume_devices(pm_message_t state, unsigned int attempt)
 {
 	struct device *dev;
 	ktime_t starttime = ktime_get();
@@ -933,7 +1011,11 @@ static void dpm_noirq_resume_devices(pm_message_t state)
 		}
 	}
 	mutex_unlock(&dpm_list_mtx);
+	if (attempt)
+		rothko_pstore_suspend_stage(attempt, "NQ J+", 0);
 	async_synchronize_full();
+	if (attempt)
+		rothko_pstore_suspend_stage(attempt, "NQ J-", READ_ONCE(async_error));
 	dpm_show_time(starttime, state, 0, "noirq");
 	if (READ_ONCE(async_error))
 		dpm_save_failed_step(SUSPEND_RESUME_NOIRQ);
@@ -950,10 +1032,24 @@ static void dpm_noirq_resume_devices(pm_message_t state)
  */
 void dpm_resume_noirq(pm_message_t state)
 {
-	dpm_noirq_resume_devices(state);
+	unsigned int attempt = rothko_noirq_attempt(state);
 
+	WRITE_ONCE(noirq_attempt, attempt);
+	if (attempt)
+		rothko_pstore_suspend_stage(attempt, "NQ walk+", 0);
+	dpm_noirq_resume_devices(state, attempt);
+
+	if (attempt)
+		rothko_pstore_suspend_stage(attempt, "NQ I+", 0);
 	resume_device_irqs();
+	if (attempt) {
+		rothko_pstore_suspend_stage(attempt, "NQ I-", 0);
+		rothko_pstore_suspend_stage(attempt, "NQ D+", 0);
+	}
 	device_wakeup_disarm_wake_irqs();
+	if (attempt)
+		rothko_pstore_suspend_stage(attempt, "NQ D-", 0);
+	WRITE_ONCE(noirq_attempt, 0);
 }
 
 static void async_resume_early(void *data, async_cookie_t cookie);
@@ -985,7 +1081,7 @@ static void device_resume_early(struct device *dev, pm_message_t state, bool asy
 	if (dev->power.syscore)
 		goto Skip;
 
-	if (!dpm_wait_for_superior(dev, async))
+	if (!dpm_wait_for_superior(dev, async, 0))
 		goto Out;
 
 	dpm_watchdog_set(&wd, dev);
@@ -1146,7 +1242,7 @@ static void device_resume(struct device *dev, pm_message_t state, bool async)
 		goto Complete;
 	}
 
-	if (!dpm_wait_for_superior(dev, async))
+	if (!dpm_wait_for_superior(dev, async, 0))
 		goto Complete;
 
 	dpm_watchdog_set(&wd, dev);
@@ -1267,12 +1363,15 @@ void dpm_resume(pm_message_t state)
 		}
 	}
 	mutex_unlock(&dpm_list_mtx);
+	rothko_s2idle_resume_stage("device resume async join");
 	async_synchronize_full();
 	dpm_show_time(starttime, state, 0, NULL);
 	if (READ_ONCE(async_error))
 		dpm_save_failed_step(SUSPEND_RESUME);
 
+	rothko_s2idle_resume_stage("cpufreq resume");
 	cpufreq_resume();
+	rothko_s2idle_resume_stage("devfreq resume");
 	devfreq_resume();
 	trace_suspend_resume(TPS("dpm_resume"), state.event, false);
 }
@@ -1377,7 +1476,9 @@ void dpm_complete(pm_message_t state)
 void dpm_resume_end(pm_message_t state)
 {
 	dpm_resume(state);
+	rothko_s2idle_resume_stage("restore gfp mask");
 	pm_restore_gfp_mask();
+	rothko_s2idle_resume_stage("device complete");
 	dpm_complete(state);
 }
 EXPORT_SYMBOL_GPL(dpm_resume_end);
@@ -1727,6 +1828,7 @@ static void device_suspend_late(struct device *dev, pm_message_t state, bool asy
 		goto Complete;
 
 	if (pm_wakeup_pending()) {
+		log_suspend_abort_reason("Wakeup pending during late suspend");
 		WRITE_ONCE(async_error, -EBUSY);
 		goto Complete;
 	}

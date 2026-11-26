@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_TINYSYS_MBOX
+	tristate "MediaTek Tinysys SCMI mailbox"
+	depends on MAILBOX
+	depends on ARM64 && OF
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  Two-channel MT6989 Tinysys doorbell controller for SCMI shared
+	  memory, including SSPM secure interrupt clearing.

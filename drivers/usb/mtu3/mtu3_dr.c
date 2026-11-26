@@ -133,6 +133,7 @@ static void ssusb_mode_sw_work(struct work_struct *work)
 	struct mtu3 *mtu = ssusb->u3d;
 	enum usb_role desired_role = otg_sx->desired_role;
 	enum usb_role current_role;
+	int ret;
 
 	current_role = ssusb->is_host ? USB_ROLE_HOST : USB_ROLE_DEVICE;
 
@@ -152,6 +153,9 @@ static void ssusb_mode_sw_work(struct work_struct *work)
 
 	switch (desired_role) {
 	case USB_ROLE_HOST:
+		ret = ssusb_phy_set_mode(ssusb, PHY_MODE_USB_HOST);
+		if (ret)
+			goto mode_err;
 		ssusb_set_force_mode(ssusb, MTU3_DR_FORCE_HOST);
 		mtu3_stop(mtu);
 		switch_port_to_host(ssusb);
@@ -159,6 +163,9 @@ static void ssusb_mode_sw_work(struct work_struct *work)
 		ssusb->is_host = true;
 		break;
 	case USB_ROLE_DEVICE:
+		ret = ssusb_phy_set_mode(ssusb, PHY_MODE_USB_DEVICE);
+		if (ret)
+			goto mode_err;
 		ssusb_set_force_mode(ssusb, MTU3_DR_FORCE_DEVICE);
 		ssusb->is_host = false;
 		ssusb_set_vbus(otg_sx, 0);
@@ -169,6 +176,11 @@ static void ssusb_mode_sw_work(struct work_struct *work)
 	default:
 		dev_err(ssusb->dev, "invalid role\n");
 	}
+	pm_runtime_put(ssusb->dev);
+	return;
+
+mode_err:
+	dev_err(ssusb->dev, "failed to change PHY mode: %d\n", ret);
 	pm_runtime_put(ssusb->dev);
 }
 

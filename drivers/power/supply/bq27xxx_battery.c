@@ -841,6 +841,7 @@ static enum power_supply_property bq28z610_props[] = {
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CURRENT_AVG,
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 	POWER_SUPPLY_PROP_TEMP,
@@ -2118,6 +2119,8 @@ static int bq27xxx_simple_value(int value,
 	return 0;
 }
 
+#define BQ28Z610_REG_CURRENT	0x0c
+
 static int bq27xxx_battery_get_property(struct power_supply *psy,
 					enum power_supply_property psp,
 					union power_supply_propval *val)
@@ -2144,6 +2147,16 @@ static int bq27xxx_battery_get_property(struct power_supply *psy,
 		val->intval = di->cache.flags < 0 ? 0 : 1;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		if (di->chip == BQ28Z610) {
+			/* The BQ28Z610 Current() command is separate from AverageCurrent(). */
+			ret = di->bus.read(di, BQ28Z610_REG_CURRENT, false);
+			if (ret < 0)
+				return ret;
+			val->intval = (s16)ret * 1000;
+			return 0;
+		}
+		fallthrough;
+	case POWER_SUPPLY_PROP_CURRENT_AVG:
 		ret = bq27xxx_battery_current_and_status(di, val, NULL, NULL);
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
@@ -2226,6 +2239,7 @@ static void bq27xxx_external_power_changed(struct power_supply *psy)
 
 int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
 {
+	static char *bms_supplied_to[] = { "battery" };
 	struct power_supply_desc *psy_desc;
 	struct power_supply_config psy_cfg = {
 		.fwnode = dev_fwnode(di->dev),
@@ -2250,6 +2264,12 @@ int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
 
 	psy_desc->name = di->name;
 	psy_desc->type = POWER_SUPPLY_TYPE_BATTERY;
+	if (of_device_is_compatible(di->dev->of_node, "bq28z610")) {
+		/* Keep Android's primary battery supply separate from the gauge. */
+		psy_desc->type = POWER_SUPPLY_TYPE_UNKNOWN;
+		psy_cfg.supplied_to = bms_supplied_to;
+		psy_cfg.num_supplicants = ARRAY_SIZE(bms_supplied_to);
+	}
 	psy_desc->properties = bq27xxx_chip_data[di->chip].props;
 	psy_desc->num_properties = bq27xxx_chip_data[di->chip].props_size;
 	psy_desc->get_property = bq27xxx_battery_get_property;

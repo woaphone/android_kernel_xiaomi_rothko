@@ -18,6 +18,7 @@
 #include <linux/gfp.h>
 #include <linux/math.h>
 #include <linux/memblock.h>
+#include <linux/rothko_pstore.h>
 #include <linux/sort.h>
 #include <linux/of.h>
 #include <linux/of_fdt.h>
@@ -202,6 +203,38 @@ static int __init early_mem(char *p)
 }
 early_param("mem", early_mem);
 
+#ifdef CONFIG_ROTHKO_PSTORE_HIGHMEM
+bool rothko_pstore_highmem_ready __ro_after_init;
+
+static void __init reserve_rothko_pstore_highmem(void)
+{
+	phys_addr_t base = ROTHKO_PSTORE_PHYS_ADDR;
+	phys_addr_t size = ROTHKO_PSTORE_SIZE;
+	int ret;
+
+	if (!memblock_is_region_memory(base, size)) {
+		pr_err("rothko pstore: 0x%llx@0x%llx is outside System RAM\n",
+		       (unsigned long long)size, (unsigned long long)base);
+		return;
+	}
+	if (memblock_is_region_reserved(base, size) ||
+	    !memblock_is_map_memory(base)) {
+		pr_err("rothko pstore: 0x%llx@0x%llx overlaps reserved memory\n",
+		       (unsigned long long)size, (unsigned long long)base);
+		return;
+	}
+
+	ret = memblock_mark_nomap(base, size);
+	if (ret) {
+		pr_err("rothko pstore: failed to reserve high memory: %d\n", ret);
+		return;
+	}
+	rothko_pstore_highmem_ready = true;
+	pr_info("rothko pstore: reserved 0x%llx@0x%llx as NOMAP\n",
+		(unsigned long long)size, (unsigned long long)base);
+}
+#endif
+
 void __init arm64_memblock_init(void)
 {
 	s64 linear_region_size = PAGE_END - _PAGE_OFFSET(vabits_actual);
@@ -307,6 +340,9 @@ void __init arm64_memblock_init(void)
 	}
 
 	early_init_fdt_scan_reserved_mem();
+#ifdef CONFIG_ROTHKO_PSTORE_HIGHMEM
+	reserve_rothko_pstore_highmem();
+#endif
 }
 
 void __init bootmem_init(void)

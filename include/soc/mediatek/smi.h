@@ -27,4 +27,8 @@ struct mtk_smi_larb_iommu {
 
 #endif
 
+#if IS_ENABLED(CONFIG_DEVICE_MODULES_MTK_SMI)
+s32 mtk_smi_dbg_hang_detect(char *user);
+#endif
+
 #endif

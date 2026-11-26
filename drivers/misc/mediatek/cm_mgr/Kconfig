@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_CM_IPI
+	tristate "MediaTek CM IPI over Tinysys SCMI"
+	depends on MTK_TINYSYS_SCMI
+	help
+	  MediaTek CPU memory management firmware transport. The module is
+	  mtk_cm_ipi.
+
+config MTK_CM_MGR
+	tristate "MediaTek CPU memory latency management"
+	depends on MTK_CM_IPI && CPU_FREQ && TRACEPOINTS && INTERCONNECT
+	help
+	  Common CM manager code shared by the SoC-specific driver. The module
+	  is mtk_cm_mgr.
+
+config MTK_CM_MGR_MT6989
+	tristate "MediaTek MT6989 CM manager"
+	depends on MTK_CM_MGR && MTK_DVFSRC && MTK_DRAMC
+	help
+	  Manage MT6989 DRAM votes using the CM firmware interface and DVFSRC
+	  interconnect. The module is mtk_cm_mgr_mt6989.

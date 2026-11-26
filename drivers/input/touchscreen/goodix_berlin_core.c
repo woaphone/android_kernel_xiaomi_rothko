@@ -29,6 +29,8 @@
 #include <linux/input.h>
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
+#include <linux/mutex.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
@@ -36,6 +38,7 @@
 #include <linux/unaligned.h>
 
 #include "goodix_berlin.h"
+#include "rothko/ft3683/xiaomi_touch_common.h"
 
 #define GOODIX_BERLIN_MAX_TOUCH			10
 
@@ -44,6 +47,7 @@
 #define GOODIX_BERLIN_TOUCH_EVENT		BIT(7)
 #define GOODIX_BERLIN_REQUEST_EVENT		BIT(6)
 #define GOODIX_BERLIN_TOUCH_COUNT_MASK		GENMASK(3, 0)
+#define GOODIX_BERLIN_PALM_STATUS		BIT(4)
 
 #define GOODIX_BERLIN_REQUEST_CODE_RESET	3
 
@@ -59,6 +63,18 @@
 #define GOODIX_BERLIN_IC_INFO_MAX_LEN		SZ_1K
 
 #define GOODIX_BERLIN_CHECKSUM_SIZE		sizeof(u16)
+#define GOODIX_BERLIN_CMD_SIZE			16
+#define GOODIX_BERLIN_CMD_ACK_OK		0x80
+#define GOODIX_BERLIN_CMD_PALM			0x70
+#define GOODIX_BERLIN_CMD_HTC_SCAN		0x90
+#define GOODIX_BERLIN_CMD_REPORT_MODE		0x91
+#define GOODIX_BERLIN_CMD_REPORT_RATE		0xc1
+#define GOODIX_BERLIN_REPORT_DIRECT		0x81
+
+#define GOODIX_XIAOMI_CMD_SET_MODE		0
+#define GOODIX_XIAOMI_MODE_REPORT_RATE		202
+#define GOODIX_BERLIN_CMD_GAME_ON		0x17
+#define GOODIX_BERLIN_CMD_GAME_OFF		0x18
 
 struct goodix_berlin_fw_version {
 	u8 rom_pid[6];
@@ -161,6 +177,24 @@ struct goodix_berlin_event {
 		GOODIX_BERLIN_CHECKSUM_SIZE];
 };
 
+struct goodix_berlin_game {
+	u8 enabled;
+	u8 up;
+	u8 tolerance;
+	u8 aim;
+	u8 tap;
+	u8 edge;
+	u8 orientation;
+};
+
+static const struct goodix_berlin_game goodix_rothko_game_default = {
+	.up = 3,
+	.tolerance = 2,
+	.aim = 2,
+	.tap = 2,
+	.edge = 2,
+};
+
 struct goodix_berlin_core {
 	struct device *dev;
 	struct regmap *regmap;
@@ -171,8 +205,20 @@ struct goodix_berlin_core {
 	struct goodix_berlin_fw_version fw_version;
 	struct input_dev *input_dev;
 	int irq;
+	u32 resolution_factor;
+	struct mutex cmd_lock;
+	bool suspended;
+	bool palm_enabled;
+	bool report_rate_set;
+	u8 report_rate;
+	bool game_configured;
+	u8 pending_expert;
+	struct goodix_berlin_game game;
+	u8 game_data[2];
+	u8 palm;
 
 	/* Runtime parameters extracted from IC_INFO buffer  */
+	u32 cmd_addr;
 	u32 touch_data_addr;
 
 	const struct goodix_berlin_ic_data *ic_data;
@@ -271,14 +317,18 @@ static int goodix_berlin_power_on(struct goodix_berlin_core *cd)
 	gpiod_set_value_cansleep(cd->reset_gpio, 0);
 
 	/* Vendor waits 4ms for Firmware to initialize */
-	usleep_range(4000, 4100);
+	if (device_is_compatible(cd->dev, "xiaomi,touch-spi"))
+		msleep(GOODIX_BERLIN_NORMAL_RESET_DELAY_MS);
+	else
+		usleep_range(4000, 4100);
 
 	error = goodix_berlin_dev_confirm(cd);
 	if (error)
 		goto err_dev_reset;
 
 	/* Vendor waits 100ms for Firmware to fully boot */
-	msleep(GOODIX_BERLIN_NORMAL_RESET_DELAY_MS);
+	if (!device_is_compatible(cd->dev, "xiaomi,touch-spi"))
+		msleep(GOODIX_BERLIN_NORMAL_RESET_DELAY_MS);
 
 	return 0;
 
@@ -348,6 +398,7 @@ static int goodix_berlin_parse_ic_info(struct goodix_berlin_core *cd,
 #undef ADVANCE_LE16_PARAMS
 
 	misc = (struct goodix_berlin_ic_info_misc *)&data[offset];
+	cd->cmd_addr = le32_to_cpu(misc->cmd_addr);
 	cd->touch_data_addr = le32_to_cpu(misc->touch_data_addr);
 
 	return 0;
@@ -433,6 +484,103 @@ static int goodix_berlin_get_remaining_contacts(struct goodix_berlin_core *cd,
 	return 0;
 }
 
+static int goodix_berlin_send_command(struct goodix_berlin_core *cd,
+				     u8 command, u8 len, u8 arg, u8 arg2)
+{
+	u8 cmd[GOODIX_BERLIN_CMD_SIZE] = { 0, 0, len, command, arg, arg2 };
+	u8 reply[GOODIX_BERLIN_CMD_SIZE];
+	int error, attempt, poll;
+
+	/* Length, opcode and argument are covered by the 16-bit byte sum. */
+	put_unaligned_le16(len + command + arg + arg2, cmd + len);
+
+	for (attempt = 0; attempt < 6; attempt++) {
+		error = regmap_raw_write(cd->regmap, cd->cmd_addr, cmd, sizeof(cmd));
+		if (error)
+			return error;
+
+		for (poll = 0; poll < 6; poll++) {
+			error = regmap_raw_read(cd->regmap, cd->cmd_addr,
+						reply, sizeof(reply));
+			if (error)
+				return error;
+
+			switch (reply[1]) {
+			case GOODIX_BERLIN_CMD_ACK_OK:
+				usleep_range(4000, 4100);
+				return 0;
+			case 0:
+			case 2: /* Busy */
+				usleep_range(1000, 1100);
+				continue;
+			case 3: /* Command buffer overflow */
+				usleep_range(10000, 11000);
+				break;
+			}
+			usleep_range(1000, 1100);
+			break;
+		}
+	}
+
+	dev_err(cd->dev, "report command %#x not acknowledged: %#x\n",
+		command, reply[1]);
+	return -ETIMEDOUT;
+}
+
+static int goodix_berlin_send_report_command(struct goodix_berlin_core *cd,
+					     u8 command, u8 arg)
+{
+	u8 len = (command == GOODIX_BERLIN_CMD_PALM ||
+		  command == GOODIX_BERLIN_CMD_REPORT_RATE) ? 6 : 5;
+
+	return goodix_berlin_send_command(cd, command, len, arg, 0);
+}
+
+static int goodix_berlin_send_game(struct goodix_berlin_core *cd,
+				  bool enable, const u8 data[2])
+{
+	return goodix_berlin_send_command(cd, enable ? GOODIX_BERLIN_CMD_GAME_ON :
+					  GOODIX_BERLIN_CMD_GAME_OFF,
+					  6, data[0], data[1]);
+}
+
+static int goodix_berlin_restore_reporting(struct goodix_berlin_core *cd)
+{
+	int error;
+
+	if (!device_is_compatible(cd->dev, "xiaomi,touch-spi"))
+		return 0;
+
+	/* The board firmware defaults to HTC raw frames; evdev needs contacts. */
+	if (!cd->cmd_addr)
+		return dev_err_probe(cd->dev, -EINVAL, "missing command mailbox\n");
+
+	error = goodix_berlin_send_report_command(cd, GOODIX_BERLIN_CMD_HTC_SCAN, 0);
+	if (error)
+		return error;
+
+	error = goodix_berlin_send_report_command(cd, GOODIX_BERLIN_CMD_REPORT_MODE,
+						  GOODIX_BERLIN_REPORT_DIRECT);
+	if (error)
+		return error;
+
+	if (cd->report_rate_set) {
+		error = goodix_berlin_send_report_command(cd,
+							 GOODIX_BERLIN_CMD_REPORT_RATE,
+							 cd->report_rate);
+		if (error)
+			dev_warn(cd->dev, "failed to restore report rate: %d\n", error);
+	}
+
+	if (cd->game_configured) {
+		error = goodix_berlin_send_game(cd, cd->game.enabled, cd->game_data);
+		if (error)
+			dev_warn(cd->dev, "failed to restore game settings: %d\n", error);
+	}
+
+	return 0;
+}
+
 static void goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
 {
 	struct goodix_berlin_touch *touch_data =
@@ -461,7 +609,8 @@ static void goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
 		input_mt_report_slot_state(cd->input_dev, MT_TOOL_FINGER, true);
 
 		touchscreen_report_pos(cd->input_dev, &cd->props,
-				       __le16_to_cpu(t->x), __le16_to_cpu(t->y),
+				       __le16_to_cpu(t->x) * cd->resolution_factor,
+				       __le16_to_cpu(t->y) * cd->resolution_factor,
 				       true);
 		input_report_abs(cd->input_dev, ABS_MT_TOUCH_MAJOR,
 				 __le16_to_cpu(t->w));
@@ -469,6 +618,167 @@ static void goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
 
 	input_mt_sync_frame(cd->input_dev);
 	input_sync(cd->input_dev);
+}
+
+static int goodix_berlin_read_palm(void *data, u8 *palm)
+{
+	struct goodix_berlin_core *cd = data;
+
+	*palm = READ_ONCE(cd->palm);
+	return 0;
+}
+
+static int goodix_berlin_write_palm(void *data, bool enable)
+{
+	struct goodix_berlin_core *cd = data;
+	int error;
+
+	mutex_lock(&cd->cmd_lock);
+	if (cd->suspended) {
+		error = -EBUSY;
+	} else {
+		error = goodix_berlin_send_report_command(cd, GOODIX_BERLIN_CMD_PALM,
+							 enable);
+		if (!error) {
+			cd->palm_enabled = enable;
+			if (!enable)
+				WRITE_ONCE(cd->palm, 0);
+		}
+	}
+	mutex_unlock(&cd->cmd_lock);
+	return error;
+}
+
+static int goodix_berlin_set_game(struct goodix_berlin_core *cd, u16 mode, s32 value)
+{
+	static const u8 orientation[] = { 0, 0x40, 0, 0x80 };
+	static const u8 expert[][4] = { { 2, 3, 2, 2 }, { 4, 3, 3, 2 }, { 3, 3, 4, 2 } };
+	static const u8 max_value[] = { 1, 0, 4, 4, 4, 4, 3, 3, 3 };
+	struct goodix_berlin_game next = cd->game_configured ? cd->game : goodix_rothko_game_default;
+	struct goodix_berlin_game effective;
+	u8 data[2];
+	int ret;
+
+	if (mode >= ARRAY_SIZE(max_value) || mode == 1)
+		return -EOPNOTSUPP;
+	if (value < 0 || value > max_value[mode] || (mode == 6 && !value))
+		return -EINVAL;
+
+	switch (mode) {
+	case 0:
+		next.enabled = value;
+		break;
+	case 2:
+		next.up = value;
+		break;
+	case 3:
+		next.tolerance = value;
+		break;
+	case 4:
+		next.aim = value;
+		break;
+	case 5:
+		next.tap = value;
+		break;
+	case 6:
+		cd->pending_expert = value;
+		return 0;
+	case 7:
+		next.edge = value;
+		break;
+	case 8:
+		next.orientation = value;
+		break;
+	}
+
+	effective = next;
+	if (cd->pending_expert) {
+		const u8 *preset = expert[cd->pending_expert - 1];
+
+		effective.tolerance = preset[0];
+		effective.up = preset[1];
+		effective.aim = preset[2];
+		effective.tap = preset[3];
+	}
+	data[0] = effective.up | (effective.tolerance << 3) |
+		  orientation[effective.orientation];
+	data[1] = effective.tap | (effective.aim << 3) | (effective.edge << 6);
+	ret = goodix_berlin_send_game(cd, next.enabled, data);
+	if (ret)
+		return ret;
+
+	cd->game = next;
+	cd->game_data[0] = data[0];
+	cd->game_data[1] = data[1];
+	cd->game_configured = true;
+	cd->pending_expert = 0;
+	return 0;
+}
+
+static int goodix_berlin_xiaomi_request(void *data,
+				      struct xiaomi_touch_request *request)
+{
+	struct goodix_berlin_core *cd = data;
+	s32 value = request->values[0];
+	u8 rate;
+	int error;
+
+	if (request->command != GOODIX_XIAOMI_CMD_SET_MODE)
+		return -EOPNOTSUPP;
+	if (request->mode != GOODIX_XIAOMI_MODE_REPORT_RATE && request->length != 1)
+		return -EINVAL;
+	if (value < 0)
+		return -EINVAL;
+
+	rate = !!value;
+	mutex_lock(&cd->cmd_lock);
+	if (cd->suspended) {
+		error = -EBUSY;
+	} else if (request->mode != GOODIX_XIAOMI_MODE_REPORT_RATE) {
+		error = goodix_berlin_set_game(cd, request->mode, value);
+	} else {
+		error = goodix_berlin_send_report_command(cd,
+							 GOODIX_BERLIN_CMD_REPORT_RATE,
+							 rate);
+		if (!error) {
+			cd->report_rate = rate;
+			cd->report_rate_set = true;
+		}
+	}
+	mutex_unlock(&cd->cmd_lock);
+	return error;
+}
+
+static const struct xiaomi_touch_ops goodix_berlin_xiaomi_ops = {
+	.read_palm = goodix_berlin_read_palm,
+	.write_palm = goodix_berlin_write_palm,
+	.request = goodix_berlin_xiaomi_request,
+};
+
+static void goodix_berlin_report_palm(struct goodix_berlin_core *cd)
+{
+	u8 palm = !!(cd->event.hdr.request_type & GOODIX_BERLIN_PALM_STATUS);
+	bool changed = false;
+
+	mutex_lock(&cd->cmd_lock);
+	if (cd->palm_enabled && cd->palm != palm) {
+		WRITE_ONCE(cd->palm, palm);
+		changed = true;
+	}
+	mutex_unlock(&cd->cmd_lock);
+	if (changed && IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO))
+		xiaomi_touch_notify_palm(cd->dev);
+}
+
+static void goodix_berlin_restore_palm(struct goodix_berlin_core *cd)
+{
+	int error;
+
+	if (!cd->palm_enabled)
+		return;
+	error = goodix_berlin_send_report_command(cd, GOODIX_BERLIN_CMD_PALM, 1);
+	if (error)
+		dev_warn(cd->dev, "failed to restore palm reporting: %d\n", error);
 }
 
 static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
@@ -501,17 +811,27 @@ static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
 	}
 
 	goodix_berlin_report_state(cd, touch_num);
+	if (IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO) &&
+	    device_is_compatible(cd->dev, "xiaomi,touch-spi"))
+		goodix_berlin_report_palm(cd);
 }
 
 static int goodix_berlin_request_handle_reset(struct goodix_berlin_core *cd)
 {
+	int error;
+
+	mutex_lock(&cd->cmd_lock);
 	gpiod_set_value_cansleep(cd->reset_gpio, 1);
 	usleep_range(2000, 2100);
 	gpiod_set_value_cansleep(cd->reset_gpio, 0);
 
 	msleep(GOODIX_BERLIN_NORMAL_RESET_DELAY_MS);
 
-	return 0;
+	error = goodix_berlin_restore_reporting(cd);
+	if (!error)
+		goodix_berlin_restore_palm(cd);
+	mutex_unlock(&cd->cmd_lock);
+	return error;
 }
 
 static irqreturn_t goodix_berlin_irq(int irq, void *data)
@@ -583,8 +903,13 @@ static irqreturn_t goodix_berlin_irq(int irq, void *data)
 	if (cd->event.hdr.status & GOODIX_BERLIN_REQUEST_EVENT) {
 		switch (cd->event.hdr.request_type) {
 		case GOODIX_BERLIN_REQUEST_CODE_RESET:
-			if (cd->reset_gpio)
-				goodix_berlin_request_handle_reset(cd);
+			if (cd->reset_gpio) {
+				error = goodix_berlin_request_handle_reset(cd);
+				if (error)
+					dev_warn_ratelimited(cd->dev,
+							     "failed to restore touch reporting: %d\n",
+							     error);
+			}
 			break;
 
 		default:
@@ -616,6 +941,8 @@ static int goodix_berlin_input_dev_config(struct goodix_berlin_core *cd,
 	input_set_drvdata(input_dev, cd);
 
 	input_dev->name = "Goodix Berlin Capacitive TouchScreen";
+	if (device_is_compatible(cd->dev, "xiaomi,touch-spi"))
+		input_dev->name = "xiaomi_tpgoodix_ts";
 	input_dev->phys = "input/ts";
 
 	input_dev->id = *id;
@@ -627,6 +954,20 @@ static int goodix_berlin_input_dev_config(struct goodix_berlin_core *cd,
 	input_set_abs_params(cd->input_dev, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
 
 	touchscreen_parse_properties(cd->input_dev, true, &cd->props);
+	if (device_is_compatible(cd->dev, "xiaomi,touch-spi")) {
+		u32 max_x, max_y;
+
+		error = device_property_read_u32(cd->dev, "goodix,panel-max-x", &max_x);
+		if (error)
+			return error;
+		error = device_property_read_u32(cd->dev, "goodix,panel-max-y", &max_y);
+		if (error)
+			return error;
+		input_set_abs_params(input_dev, ABS_MT_POSITION_X, 0, max_x, 0, 0);
+		input_set_abs_params(input_dev, ABS_MT_POSITION_Y, 0, max_y, 0, 0);
+		cd->props.max_x = max_x;
+		cd->props.max_y = max_y;
+	}
 
 	error = input_mt_init_slots(cd->input_dev, GOODIX_BERLIN_MAX_TOUCH,
 				    INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
@@ -645,7 +986,11 @@ static int goodix_berlin_suspend(struct device *dev)
 	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
 
 	disable_irq(cd->irq);
+	mutex_lock(&cd->cmd_lock);
+	cd->suspended = true;
+	WRITE_ONCE(cd->palm, 0);
 	goodix_berlin_power_off(cd);
+	mutex_unlock(&cd->cmd_lock);
 
 	return 0;
 }
@@ -655,13 +1000,22 @@ static int goodix_berlin_resume(struct device *dev)
 	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
 	int error;
 
+	mutex_lock(&cd->cmd_lock);
 	error = goodix_berlin_power_on(cd);
 	if (error)
-		return error;
+		goto out_unlock;
 
+	error = goodix_berlin_restore_reporting(cd);
+	if (error) {
+		goodix_berlin_power_off(cd);
+		goto out_unlock;
+	}
+	goodix_berlin_restore_palm(cd);
+	cd->suspended = false;
 	enable_irq(cd->irq);
-
-	return 0;
+out_unlock:
+	mutex_unlock(&cd->cmd_lock);
+	return error;
 }
 
 EXPORT_GPL_SIMPLE_DEV_PM_OPS(goodix_berlin_pm_ops,
@@ -722,6 +1076,7 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
 			const struct goodix_berlin_ic_data *ic_data)
 {
 	struct goodix_berlin_core *cd;
+	u32 irq_flags = 0;
 	int error;
 
 	if (irq <= 0) {
@@ -737,18 +1092,46 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
 	cd->regmap = regmap;
 	cd->irq = irq;
 	cd->ic_data = ic_data;
+	cd->resolution_factor = 1;
+	mutex_init(&cd->cmd_lock);
 
-	cd->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	if (device_is_compatible(dev, "xiaomi,touch-spi")) {
+		struct pinctrl *pinctrl;
+		struct pinctrl_state *spi_state;
+
+		pinctrl = devm_pinctrl_get_select(dev, "pmx_ts_active");
+		if (IS_ERR(pinctrl))
+			return PTR_ERR(pinctrl);
+		spi_state = pinctrl_lookup_state(pinctrl, "pmx_gt_spi_mode");
+		if (IS_ERR(spi_state))
+			return PTR_ERR(spi_state);
+		error = pinctrl_select_state(pinctrl, spi_state);
+		if (error)
+			return error;
+		error = device_property_read_u32(dev, "goodix,super-resolution-factor",
+						 &cd->resolution_factor);
+		if (error)
+			return error;
+		error = device_property_read_u32(dev, "goodix,irq-flags", &irq_flags);
+		if (error)
+			return error;
+		cd->reset_gpio = devm_gpiod_get(dev, "goodix,reset", GPIOD_OUT_LOW);
+	} else {
+		cd->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	}
 	if (IS_ERR(cd->reset_gpio))
 		return dev_err_probe(dev, PTR_ERR(cd->reset_gpio),
 				     "Failed to request reset gpio\n");
+	if (device_is_compatible(dev, "xiaomi,touch-spi"))
+		gpiod_toggle_active_low(cd->reset_gpio);
 
 	cd->avdd = devm_regulator_get(dev, "avdd");
 	if (IS_ERR(cd->avdd))
 		return dev_err_probe(dev, PTR_ERR(cd->avdd),
 				     "Failed to request avdd regulator\n");
 
-	cd->vddio = devm_regulator_get(dev, "vddio");
+	cd->vddio = devm_regulator_get(dev,
+		device_is_compatible(dev, "xiaomi,touch-spi") ? "iovdd" : "vddio");
 	if (IS_ERR(cd->vddio))
 		return dev_err_probe(dev, PTR_ERR(cd->vddio),
 				     "Failed to request vddio regulator\n");
@@ -775,6 +1158,12 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
 		return error;
 	}
 
+	error = goodix_berlin_restore_reporting(cd);
+	if (error)
+		return error;
+	if (device_is_compatible(dev, "xiaomi,touch-spi"))
+		dev_info(dev, "direct touch reporting acknowledged\n");
+
 	error = goodix_berlin_input_dev_config(cd, id);
 	if (error) {
 		dev_err(dev, "failed set input device");
@@ -782,13 +1171,22 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
 	}
 
 	error = devm_request_threaded_irq(dev, cd->irq, NULL, goodix_berlin_irq,
-					  IRQF_ONESHOT, "goodix-berlin", cd);
+					  IRQF_ONESHOT | irq_flags, "goodix-berlin", cd);
 	if (error) {
 		dev_err(dev, "request threaded irq failed: %d\n", error);
 		return error;
 	}
 
 	dev_set_drvdata(dev, cd);
+
+	if (IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO) &&
+	    device_is_compatible(dev, "xiaomi,touch-spi")) {
+		error = devm_xiaomi_touch_register(dev, &goodix_berlin_xiaomi_ops,
+						  cd, cd->resolution_factor);
+		if (error)
+			dev_warn(dev, "failed to register Xiaomi touch features: %d\n",
+				 error);
+	}
 
 	dev_dbg(dev, "Goodix Berlin %s Touchscreen Controller",
 		cd->fw_version.patch_pid);

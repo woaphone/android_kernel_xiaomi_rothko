@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/export.h>
 #include <linux/suspend.h>
+#include <linux/rothko_pstore.h>
 #include <linux/syscore_ops.h>
 #include <linux/swait.h>
 #include <linux/ftrace.h>
@@ -32,6 +33,10 @@
 #include <linux/moduleparam.h>
 #include <linux/fs.h>
 #include <linux/wakeup_reason.h>
+#include <linux/sched/debug.h>
+#include <linux/sched/signal.h>
+#include <linux/stacktrace.h>
+#include <linux/workqueue.h>
 #include <trace/hooks/suspend.h>
 
 #include "power.h"
@@ -64,6 +69,153 @@ static DECLARE_SWAIT_QUEUE_HEAD(s2idle_wait_head);
 enum s2idle_states __read_mostly s2idle_state;
 static DEFINE_RAW_SPINLOCK(s2idle_lock);
 
+static unsigned int s2idle_attempt;
+static bool s2idle_recording;
+static unsigned int s2idle_record_round; /* protected by s2idle_lock */
+
+#if defined(CONFIG_DRM_ROTHKO_N12) && defined(CONFIG_PSTORE_CONSOLE) && \
+    defined(CONFIG_PSTORE_RAM)
+unsigned int rothko_s2idle_attempt(void)
+{
+	return READ_ONCE(s2idle_recording) ? READ_ONCE(s2idle_attempt) : 0;
+}
+#endif
+
+static void s2idle_record(const char *stage, int status)
+{
+	if (s2idle_recording)
+		rothko_pstore_suspend_stage(s2idle_attempt, stage, status);
+}
+
+#if defined(CONFIG_DRM_ROTHKO_N12) && defined(CONFIG_PM_SLEEP_DEBUG)
+/* The owner cancels the sample before dropping system_transition_mutex. */
+static struct task_struct *s2idle_resume_owner;
+static const char *s2idle_resume_origin;
+static const char *s2idle_resume_stage;
+static bool s2idle_resume_sampled;
+
+static void s2idle_persist_task(struct task_struct *task, unsigned int attempt)
+{
+#ifdef CONFIG_STACKTRACE
+	unsigned long entries[12];
+	unsigned int count, i;
+	char comm[TASK_COMM_LEN], line[72];
+	pid_t pid = task_pid_nr(task);
+
+	get_task_comm(comm, task);
+	count = task_is_running(task) ? 0 :
+		stack_trace_save_tsk(task, entries, ARRAY_SIZE(entries), 0);
+	scnprintf(line, sizeof(line), "blocked sample pid=%d comm=%s frames=%u",
+		  pid, comm, count);
+	rothko_pstore_suspend_stage(attempt, line, 0);
+	for (i = 0; i < count; i++) {
+		scnprintf(line, sizeof(line), "stack pid=%d %pS", pid, (void *)entries[i]);
+		rothko_pstore_suspend_stage(attempt, line, 0);
+	}
+#endif
+}
+
+static void s2idle_resume_dump(struct work_struct *work)
+{
+	struct task_struct *owner = READ_ONCE(s2idle_resume_owner);
+	struct task_struct *p, *t;
+	unsigned int attempt = READ_ONCE(s2idle_attempt);
+	unsigned int count = 0;
+	char line[72];
+
+	WRITE_ONCE(s2idle_resume_sampled, true);
+	scnprintf(line, sizeof(line), "stalled at %s", READ_ONCE(s2idle_resume_stage));
+	rothko_pstore_suspend_stage(attempt, line, 0);
+	s2idle_persist_task(owner, attempt);
+	pr_warn("s2idle resume stalled: origin=%s stage=%s pid=%d\n",
+		s2idle_resume_origin, READ_ONCE(s2idle_resume_stage),
+		task_pid_nr(owner));
+	sched_show_task(owner);
+
+	rcu_read_lock();
+	for_each_process_thread(p, t) {
+		unsigned int state = READ_ONCE(t->__state);
+
+		if (t == owner || !(READ_ONCE(t->flags) & PF_WQ_WORKER) ||
+		    !(state & TASK_UNINTERRUPTIBLE) || (state & TASK_NOLOAD))
+			continue;
+		s2idle_persist_task(t, attempt);
+		sched_show_task(t);
+		if (++count == 8)
+			goto unlock;
+	}
+unlock:
+	rcu_read_unlock();
+	pr_warn("s2idle resume stack dump complete: workers=%u\n", count);
+}
+
+static DECLARE_DELAYED_WORK(s2idle_resume_work, s2idle_resume_dump);
+
+void rothko_s2idle_vcp_wait(const char *operation, int feature, unsigned long caller)
+{
+	char stage[70];
+
+	if (!READ_ONCE(s2idle_recording))
+		return;
+
+	scnprintf(stage, sizeof(stage), "VCP %s feature=%d pid=%d %ps",
+		  operation, feature, task_pid_nr(current), (void *)caller);
+	rothko_pstore_suspend_stage(READ_ONCE(s2idle_attempt), stage, 0);
+}
+EXPORT_SYMBOL_GPL(rothko_s2idle_vcp_wait);
+
+void rothko_s2idle_resume_stage(const char *stage)
+{
+	s2idle_record(stage, 0);
+	if (READ_ONCE(s2idle_resume_owner) == current &&
+	    READ_ONCE(s2idle_resume_stage))
+		WRITE_ONCE(s2idle_resume_stage, stage);
+}
+
+static void s2idle_resume_arm(const char *origin, const char *stage)
+{
+	if (READ_ONCE(s2idle_resume_owner) != current ||
+	    READ_ONCE(s2idle_resume_sampled) || READ_ONCE(s2idle_resume_stage))
+		return;
+
+	s2idle_resume_origin = origin;
+	WRITE_ONCE(s2idle_resume_stage, stage);
+	queue_delayed_work(system_dfl_wq, &s2idle_resume_work, 10 * HZ);
+}
+
+static void s2idle_sample_before_wait(void)
+{
+	if (READ_ONCE(s2idle_resume_owner) != current ||
+	    !READ_ONCE(s2idle_resume_stage))
+		return;
+
+	cancel_delayed_work_sync(&s2idle_resume_work);
+	WRITE_ONCE(s2idle_resume_stage, NULL);
+}
+
+static void s2idle_resume_track(suspend_state_t state)
+{
+	if (state == PM_SUSPEND_TO_IDLE && READ_ONCE(pm_debug_messages_on) &&
+	    !READ_ONCE(s2idle_resume_sampled))
+		WRITE_ONCE(s2idle_resume_owner, current);
+}
+
+static void s2idle_resume_stop(void)
+{
+	if (READ_ONCE(s2idle_resume_owner) != current)
+		return;
+	s2idle_sample_before_wait();
+	if (READ_ONCE(s2idle_resume_sampled))
+		pr_info("s2idle transition completed after diagnostic sample\n");
+	WRITE_ONCE(s2idle_resume_owner, NULL);
+}
+#else
+static inline void s2idle_resume_arm(const char *origin, const char *stage) { }
+static inline void s2idle_resume_track(suspend_state_t state) { }
+static inline void s2idle_sample_before_wait(void) { }
+static inline void s2idle_resume_stop(void) { }
+#endif
+
 /**
  * pm_suspend_default_s2idle - Check if suspend-to-idle is the default suspend.
  *
@@ -90,8 +242,21 @@ static void s2idle_begin(void)
 	s2idle_state = S2IDLE_STATE_NONE;
 }
 
-static void s2idle_enter(void)
+static void s2idle_wait_record(unsigned int attempt, unsigned int round,
+			       const char *stage, int status)
 {
+	char line[48];
+
+	if (!attempt || !round || round > 3)
+		return;
+	scnprintf(line, sizeof(line), "wait loop=%u %s", round, stage);
+	rothko_pstore_suspend_stage(attempt, line, status);
+}
+
+static void s2idle_enter(unsigned int round)
+{
+	unsigned int attempt = s2idle_recording ? s2idle_attempt : 0;
+	bool entered = false;
 	trace_suspend_resume(TPS("machine_suspend"), PM_SUSPEND_TO_IDLE, true);
 
 	/*
@@ -109,13 +274,17 @@ static void s2idle_enter(void)
 		goto out;
 
 	s2idle_state = S2IDLE_STATE_ENTER;
+	s2idle_record_round = attempt && round <= 3 ? round : 0;
+	entered = true;
 	raw_spin_unlock_irq(&s2idle_lock);
+	s2idle_wait_record(attempt, round, "enter armed", 0);
 
 	/* Push all the CPUs into the idle loop. */
 	wake_up_all_idle_cpus();
 	/* Make the current CPU wait so it can enter the idle loop too. */
 	swait_event_exclusive(s2idle_wait_head,
 		    s2idle_state == S2IDLE_STATE_WAKE);
+	s2idle_wait_record(attempt, round, "wait returned irq", pm_wakeup_irq());
 
 	/*
 	 * Kick all CPUs to ensure that they resume their timers and restore
@@ -127,13 +296,18 @@ static void s2idle_enter(void)
 
  out:
 	s2idle_state = S2IDLE_STATE_NONE;
+	s2idle_record_round = 0;
 	raw_spin_unlock_irq(&s2idle_lock);
+	if (!entered)
+		s2idle_wait_record(attempt, round, "locked pending irq", pm_wakeup_irq());
 
 	trace_suspend_resume(TPS("machine_suspend"), PM_SUSPEND_TO_IDLE, false);
 }
 
 static void s2idle_loop(void)
 {
+	unsigned int round = 0;
+
 	pm_pr_dbg("suspend-to-idle\n");
 
 	/*
@@ -146,10 +320,13 @@ static void s2idle_loop(void)
 	 * to avoid them upfront.
 	 */
 	for (;;) {
+		if (round < 4)
+			round++;
 		if (s2idle_ops && s2idle_ops->wake) {
 			if (s2idle_ops->wake())
 				break;
 		} else if (pm_wakeup_pending()) {
+			s2idle_record("wait loop pending irq", pm_wakeup_irq());
 			break;
 		}
 
@@ -158,7 +335,7 @@ static void s2idle_loop(void)
 		if (s2idle_ops && s2idle_ops->check)
 			s2idle_ops->check();
 
-		s2idle_enter();
+		s2idle_enter(round);
 	}
 
 	pm_pr_dbg("resume from suspend-to-idle\n");
@@ -166,14 +343,21 @@ static void s2idle_loop(void)
 
 void s2idle_wake(void)
 {
+	unsigned int attempt = 0, round = 0, irq = 0;
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&s2idle_lock, flags);
 	if (s2idle_state > S2IDLE_STATE_NONE) {
+		if (s2idle_state == S2IDLE_STATE_ENTER && s2idle_record_round) {
+			attempt = READ_ONCE(s2idle_attempt);
+			round = s2idle_record_round;
+			irq = pm_wakeup_irq();
+		}
 		s2idle_state = S2IDLE_STATE_WAKE;
 		swake_up_one(&s2idle_wait_head);
 	}
 	raw_spin_unlock_irqrestore(&s2idle_lock, flags);
+	s2idle_wait_record(attempt, round, "wake notify irq", irq);
 }
 EXPORT_SYMBOL_GPL(s2idle_wake);
 
@@ -416,32 +600,31 @@ void __weak arch_suspend_enable_irqs(void)
  */
 static int suspend_enter(suspend_state_t state, bool *wakeup)
 {
-	int error, last_dev;
+	int error;
 
 	error = platform_suspend_prepare(state);
 	if (error)
 		goto Platform_finish;
 
+	rothko_s2idle_resume_stage("device suspend late");
 	error = dpm_suspend_late(PMSG_SUSPEND);
+	s2idle_record("devices late done", error);
 	if (error) {
-		last_dev = suspend_stats.last_failed_dev + REC_FAILED_NUM - 1;
-		last_dev %= REC_FAILED_NUM;
-		pr_err("late suspend of devices failed\n");
-		log_suspend_abort_reason("late suspend of %s device failed",
-					 suspend_stats.failed_devs[last_dev]);
+		pr_err("late suspend of devices failed: %d\n", error);
+		s2idle_resume_arm("late suspend abort", "late abort reason");
+		log_suspend_abort_reason("late suspend aborted: %d", error);
 		goto Platform_finish;
 	}
 	error = platform_suspend_prepare_late(state);
 	if (error)
 		goto Devices_early_resume;
 
+	rothko_s2idle_resume_stage("device suspend noirq");
 	error = dpm_suspend_noirq(PMSG_SUSPEND);
+	s2idle_record("devices noirq done", error);
 	if (error) {
-		last_dev = suspend_stats.last_failed_dev + REC_FAILED_NUM - 1;
-		last_dev %= REC_FAILED_NUM;
-		pr_err("noirq suspend of devices failed\n");
-		log_suspend_abort_reason("noirq suspend of %s device failed",
-					 suspend_stats.failed_devs[last_dev]);
+		pr_err("noirq suspend of devices failed: %d\n", error);
+		log_suspend_abort_reason("noirq suspend aborted: %d", error);
 		goto Platform_early_resume;
 	}
 	error = platform_suspend_prepare_noirq(state);
@@ -452,7 +635,11 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 		goto Platform_wake;
 
 	if (state == PM_SUSPEND_TO_IDLE) {
+		s2idle_sample_before_wait();
+		s2idle_record("platform wait start", 0);
 		s2idle_loop();
+		s2idle_record("platform wait done", 0);
+		s2idle_resume_arm("s2idle loop returned", "wakeup irq report");
 		pm_print_wakeup_irq();
 		goto Platform_wake;
 	}
@@ -495,17 +682,25 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 	pm_sleep_enable_secondary_cpus();
 
  Platform_wake:
+	rothko_s2idle_resume_stage("platform resume noirq");
 	platform_resume_noirq(state);
+	rothko_s2idle_resume_stage("device resume noirq");
 	dpm_resume_noirq(PMSG_RESUME);
+	s2idle_record("resume noirq done", 0);
 
  Platform_early_resume:
+	rothko_s2idle_resume_stage("platform resume early");
 	platform_resume_early(state);
 
  Devices_early_resume:
+	rothko_s2idle_resume_stage("device resume early");
 	dpm_resume_early(PMSG_RESUME);
+	s2idle_record("resume early done", 0);
 
  Platform_finish:
+	rothko_s2idle_resume_stage("platform resume finish");
 	platform_resume_finish(state);
+	rothko_s2idle_resume_stage("wakeup irq report");
 	pm_print_wakeup_irq();
 	return error;
 }
@@ -531,9 +726,14 @@ int suspend_devices_and_enter(suspend_state_t state)
 	if (error)
 		goto Close;
 
+	s2idle_resume_arm("s2idle device suspend", "console suspend");
+	s2idle_record("console suspend start", 0);
 	console_suspend_all();
+	s2idle_record("console suspend done", 0);
+	rothko_s2idle_resume_stage("device suspend dispatch");
 	suspend_test_start();
 	error = dpm_suspend_start(PMSG_SUSPEND);
+	s2idle_record("devices suspend done", error);
 	if (error) {
 		pr_err("Some devices failed to suspend, or early wake event detected\n");
 		log_suspend_abort_reason(
@@ -549,17 +749,23 @@ int suspend_devices_and_enter(suspend_state_t state)
 	} while (!error && !wakeup && platform_suspend_again(state));
 
  Resume_devices:
+	rothko_s2idle_resume_stage("resume begin hook");
 	trace_android_vh_resume_begin(NULL);
 	suspend_test_start();
+	rothko_s2idle_resume_stage("device resume dispatch");
 	dpm_resume_end(PMSG_RESUME);
+	s2idle_record("resume devices done", 0);
 	suspend_test_finish("resume devices");
 	trace_suspend_resume(TPS("console_resume_all"), state, true);
+	rothko_s2idle_resume_stage("console resume");
 	console_resume_all();
 	trace_suspend_resume(TPS("console_resume_all"), state, false);
 
  Close:
+	rothko_s2idle_resume_stage("platform resume end");
 	platform_resume_end(state);
 	pm_suspend_target_state = PM_SUSPEND_ON;
+	rothko_s2idle_resume_stage("resume end hook");
 	trace_android_vh_resume_end(NULL);
 	return error;
 
@@ -576,9 +782,14 @@ int suspend_devices_and_enter(suspend_state_t state)
  */
 static void suspend_finish(void)
 {
+	rothko_s2idle_resume_stage("thaw processes");
 	suspend_thaw_processes();
+	s2idle_record("thaw done", 0);
+	rothko_s2idle_resume_stage("thaw filesystems");
 	filesystems_thaw();
-	pm_notifier_call_chain(PM_POST_SUSPEND);
+	rothko_s2idle_resume_stage("post-suspend notifiers");
+	s2idle_record("POST done", pm_notifier_call_chain(PM_POST_SUSPEND));
+	rothko_s2idle_resume_stage("restore console");
 	pm_restore_console();
 }
 
@@ -608,8 +819,11 @@ static int enter_state(suspend_state_t state)
 	if (!mutex_trylock(&system_transition_mutex))
 		return -EBUSY;
 
-	if (state == PM_SUSPEND_TO_IDLE)
+	if (state == PM_SUSPEND_TO_IDLE) {
+		WRITE_ONCE(s2idle_attempt, s2idle_attempt + 1);
+		WRITE_ONCE(s2idle_recording, true);
 		s2idle_begin();
+	}
 
 	if (sync_on_suspend_enabled) {
 		trace_suspend_resume(TPS("sync_filesystems"), 0, true);
@@ -632,13 +846,16 @@ static int enter_state(suspend_state_t state)
 
 	trace_suspend_resume(TPS("suspend_enter"), state, false);
 	pm_pr_dbg("Suspending system (%s)\n", mem_sleep_labels[state]);
+	s2idle_resume_track(state);
 	error = suspend_devices_and_enter(state);
 
  Finish:
 	events_check_enabled = false;
 	pm_pr_dbg("Finishing wakeup.\n");
 	suspend_finish();
+	s2idle_resume_stop();
  Unlock:
+	WRITE_ONCE(s2idle_recording, false);
 	mutex_unlock(&system_transition_mutex);
 	return error;
 }

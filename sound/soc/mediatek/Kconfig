@@ -322,4 +322,6 @@ config SND_SOC_MT8365_MT6357
 	  Select Y if you have such device.
 	  If unsure select "N".
 
+source "sound/soc/mediatek/rothko-mt6989/Kconfig"
+
 endmenu

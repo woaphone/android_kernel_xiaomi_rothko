@@ -6,6 +6,10 @@
  * Author: Matthias Brugger <matthias.bgg@gmail.com>
  */
 #include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/iopoll.h>
+#include <linux/math64.h>
+#include <linux/mutex.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of_irq.h>
@@ -22,6 +26,10 @@
 
 #include "8250.h"
 
+#if IS_ENABLED(CONFIG_MTK_UARTHUB)
+#include "../../../net/wireless/mediatek/rothko-conninfra/uarthub/common/uarthub_drv_export.h"
+#endif
+
 #define MTK_UART_HIGHS		0x09	/* Highspeed register */
 #define MTK_UART_SAMPLE_COUNT	0x0a	/* Sample count register */
 #define MTK_UART_SAMPLE_POINT	0x0b	/* Sample point register */
@@ -37,6 +45,14 @@
 #define MTK_UART_IER_RTSI	0x40	/* Enable RTS Modem status interrupt */
 #define MTK_UART_IER_CTSI	0x80	/* Enable CTS Modem status interrupt */
 
+#define MTK_UART_RXTRI_AD	0x14
+#define MTK_UART_FCR_RD		0x17
+#define MTK_UART_DLL		0x24
+#define MTK_UART_DLH		0x25
+#define MTK_UART_FEATURE_SEL	0x27
+#define MTK_UART_HUB_BAUD	12000000
+#define MTK_UART_HUB_RXTRIG	0x19
+
 #define MTK_UART_EFR		38	/* I/O: Extended Features Register */
 #define MTK_UART_EFR_EN		0x10	/* Enable enhancement feature */
 #define MTK_UART_EFR_RTS	0x40	/* Enable hardware rx flow control */
@@ -50,12 +66,15 @@
 #define MTK_UART_DMA_EN_RX	0x5
 
 #define MTK_UART_ESCAPE_CHAR	0x77	/* Escape char added under sw fc */
+#define MTK_UART_HUB_ESCAPE_CHAR	0xdb
 #define MTK_UART_RX_SIZE	0x8000
 #define MTK_UART_TX_TRIGGER	1
 #define MTK_UART_RX_TRIGGER	MTK_UART_RX_SIZE
 
 #define MTK_UART_XON1		40	/* I/O: Xon character 1 */
+#define MTK_UART_XON2		41	/* I/O: Xon character 2 */
 #define MTK_UART_XOFF1		42	/* I/O: Xoff character 1 */
+#define MTK_UART_XOFF2		43	/* I/O: Xoff character 2 */
 
 #ifdef CONFIG_SERIAL_8250_DMA
 enum dma_rx_status {
@@ -76,6 +95,14 @@ struct mtk8250_data {
 	enum dma_rx_status	rx_status;
 #endif
 	int			rx_wakeup_irq;
+#if IS_ENABLED(CONFIG_MTK_UARTHUB)
+	u32			hub_baud;
+	void __iomem		*hub_clk_reg;
+	u32			hub_clk_mask;
+	u32			hub_clk_value;
+	void __iomem		*hub_reset_reg;
+	u32			hub_reset_bit;
+#endif
 };
 
 /* flow control mode */
@@ -88,7 +115,7 @@ enum {
 #ifdef CONFIG_SERIAL_8250_DMA
 static void mtk8250_rx_dma(struct uart_8250_port *up);
 
-static void mtk8250_dma_rx_complete(void *param)
+static void mtk8250_dma_rx_complete(void *param, const struct dmaengine_result *result)
 {
 	struct uart_8250_port *up = param;
 	struct uart_8250_dma *dma = up->dma;
@@ -99,12 +126,27 @@ static void mtk8250_dma_rx_complete(void *param)
 	unsigned char *ptr;
 	unsigned long flags;
 
-	if (data->rx_status == DMA_RX_SHUTDOWN)
-		return;
-
 	uart_port_lock_irqsave(&up->port, &flags);
+	if (data->rx_status == DMA_RX_SHUTDOWN) {
+		uart_port_unlock_irqrestore(&up->port, flags);
+		return;
+	}
 
-	dmaengine_tx_status(dma->rxchan, dma->rx_cookie, &state);
+	if ((result && result->result != DMA_TRANS_NOERROR) ||
+	    dmaengine_tx_status(dma->rxchan, dma->rx_cookie, &state) == DMA_ERROR ||
+	    state.residue > dma->rx_size) {
+		struct tty_struct *tty = tty_port->tty;
+
+		data->rx_status = DMA_RX_SHUTDOWN;
+		dev_err_ratelimited(up->port.dev, "UART RX DMA failed; reopen required\n");
+		if (tty) {
+			set_bit(TTY_IO_ERROR, &tty->flags);
+			wake_up_interruptible(&tty->read_wait);
+		}
+		uart_write_wakeup(&up->port);
+		uart_port_unlock_irqrestore(&up->port, flags);
+		return;
+	}
 	total = dma->rx_size - state.residue;
 	cnt = total;
 
@@ -144,7 +186,7 @@ static void mtk8250_rx_dma(struct uart_8250_port *up)
 		return;
 	}
 
-	desc->callback = mtk8250_dma_rx_complete;
+	desc->callback_result = mtk8250_dma_rx_complete;
 	desc->callback_param = up;
 
 	dma->rx_cookie = dmaengine_submit(desc);
@@ -187,11 +229,152 @@ static void mtk8250_dma_enable(struct uart_8250_port *up)
 }
 #endif
 
+#if IS_ENABLED(CONFIG_MTK_UARTHUB)
+int mtk8250_uart_hub_reset_flow_ctrl(void)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_reset_flow_control();
+}
+
+int mtk8250_uart_hub_enable_bypass_mode(int bypass)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_bypass_mode_ctrl(bypass);
+}
+
+int mtk8250_uart_hub_is_ready(void)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_dev0_is_uarthub_ready();
+}
+
+int mtk8250_uart_hub_fifo_ctrl(int ctrl)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_md_adsp_fifo_ctrl(ctrl);
+}
+
+int mtk8250_uart_hub_dump_with_tag(const char *tag)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_dump_debug_info_with_tag(tag);
+}
+
+int mtk8250_uart_hub_reset(void)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_sw_reset();
+}
+
+int mtk8250_uart_hub_register_cb(UARTHUB_IRQ_CB irq_callback)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_irq_register_cb(irq_callback);
+}
+
+int mtk8250_uart_hub_assert_bit_ctrl(int ctrl)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_assert_state_ctrl(ctrl);
+}
+
+int mtk8250_uart_hub_dev0_set_rx_request(void)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_dev0_set_rx_request();
+}
+
+int mtk8250_uart_hub_dev0_clear_tx_request(void)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_dev0_clear_tx_request();
+}
+
+int mtk8250_uart_hub_get_host_wakeup_status(void)
+{
+	if (!UARTHUB_provider_ready())
+		return -ENODEV;
+
+	return UARTHUB_get_host_wakeup_status();
+}
+
+static struct uart_port *mtk8250_hub_port(struct tty_struct *tty)
+{
+	struct uart_state *state = tty->driver_data;
+	struct uart_port *port;
+	struct mtk8250_data *data;
+
+	if (!state || !UARTHUB_provider_ready())
+		return NULL;
+	port = state->uart_port;
+	if (!port || !port->dev ||
+	    !of_device_is_compatible(port->dev->of_node, "mediatek,mt6985-uart"))
+		return NULL;
+	data = port->private_data;
+	return data->hub_baud ? port : NULL;
+}
+
+int mtk8250_uart_hub_dev0_set_tx_request(struct tty_struct *tty)
+{
+	if (!mtk8250_hub_port(tty))
+		return -ENODEV;
+
+	return UARTHUB_dev0_set_tx_request();
+}
+
+int mtk8250_uart_hub_dev0_clear_rx_request(struct tty_struct *tty)
+{
+	struct uart_port *port = mtk8250_hub_port(tty);
+	unsigned int empty;
+	int ret;
+
+	if (!port)
+		return -ENODEV;
+	ret = read_poll_timeout(port->ops->tx_empty, empty, empty & TIOCSER_TEMT,
+				10, 10000, false, port);
+	if (ret)
+		return ret;
+
+	return UARTHUB_dev0_clear_rx_request();
+}
+#endif
+
 static int mtk8250_startup(struct uart_port *port)
 {
+#if IS_ENABLED(CONFIG_MTK_UARTHUB) || defined(CONFIG_SERIAL_8250_DMA)
+	struct mtk8250_data *data = port->private_data;
+#endif
+	int ret;
 #ifdef CONFIG_SERIAL_8250_DMA
 	struct uart_8250_port *up = up_to_u8250p(port);
-	struct mtk8250_data *data = port->private_data;
+
+	if (READ_ONCE(port->tx_dma_fault)) {
+		if (!up->dma)
+			return -EIO;
+		serial8250_release_dma(up);
+		if (READ_ONCE(port->tx_dma_fault))
+			return -EIO;
+	}
 
 	/* disable DMA for console */
 	if (uart_console(port))
@@ -204,7 +387,48 @@ static int mtk8250_startup(struct uart_port *port)
 #endif
 	memset(&port->icount, 0, sizeof(port->icount));
 
-	return serial8250_do_startup(port);
+#if IS_ENABLED(CONFIG_MTK_UARTHUB)
+	if (data->hub_baud) {
+		u32 value;
+
+		if (!UARTHUB_provider_ready())
+			return -EAGAIN;
+		value = readl(data->hub_clk_reg);
+		writel((value & ~data->hub_clk_mask) | data->hub_clk_value,
+		       data->hub_clk_reg);
+		if (data->hub_reset_reg) {
+			serial_port_out(port, UART_FCR, UART_FCR_ENABLE_FIFO |
+					UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT);
+			udelay(2);
+			/* PERI reset has write-one set and clear aliases. */
+			writel(data->hub_reset_bit, data->hub_reset_reg + 4);
+			readl(data->hub_reset_reg);
+			writel(data->hub_reset_bit, data->hub_reset_reg + 8);
+			readl(data->hub_reset_reg);
+		}
+		ret = UARTHUB_open();
+		if (ret)
+			return ret;
+		port->uartclk = clk_get_rate(data->uart_clk);
+	}
+#endif
+	ret = serial8250_do_startup(port);
+	if (!ret) {
+		guard(uart_port_lock_irqsave)(port);
+
+		port->tx_dma_shutdown = false;
+	}
+#if IS_ENABLED(CONFIG_MTK_UARTHUB)
+	if (ret && data->hub_baud)
+		UARTHUB_close();
+#ifdef CONFIG_SERIAL_8250_DMA
+	if (!ret && data->hub_baud && up->dma) {
+		/* APDMA owns RX; do not enable the generic 8250 RX IRQs. */
+		up->ier &= ~(UART_IER_RDI | UART_IER_RLSI);
+	}
+#endif
+#endif
+	return ret;
 }
 
 static void mtk8250_shutdown(struct uart_port *port)
@@ -214,11 +438,21 @@ static void mtk8250_shutdown(struct uart_port *port)
 	int irq = data->rx_wakeup_irq;
 
 #ifdef CONFIG_SERIAL_8250_DMA
-	if (up->dma)
+	if (up->dma) {
+		unsigned long flags;
+
+		/* Prevent the callback from rearming RX during DMA teardown. */
+		uart_port_lock_irqsave(port, &flags);
 		data->rx_status = DMA_RX_SHUTDOWN;
+		uart_port_unlock_irqrestore(port, flags);
+	}
 #endif
 
 	serial8250_do_shutdown(port);
+#if IS_ENABLED(CONFIG_MTK_UARTHUB)
+	if (data->hub_baud)
+		UARTHUB_close();
+#endif
 
 	if (irq >= 0)
 		serial8250_do_set_mctrl(&up->port, TIOCM_RTS);
@@ -238,6 +472,62 @@ static void mtk8250_enable_intrs(struct uart_8250_port *up, int mask)
 	lockdep_assert_held_once(&up->port.lock);
 
 	serial_out(up, UART_IER, serial_in(up, UART_IER) | mask);
+}
+
+static void mtk8250_hub_set_flow_ctrl(struct uart_8250_port *up, int mode,
+				      const struct ktermios *termios)
+{
+	unsigned int efr;
+	unsigned int xon1 = 0, xoff1 = 0, xon2 = 0, xoff2 = 0;
+
+	lockdep_assert_held_once(&up->port.lock);
+
+	serial_out(up, MTK_UART_ESCAPE_DAT, MTK_UART_HUB_ESCAPE_CHAR);
+	serial_out(up, MTK_UART_ESCAPE_EN, mode == MTK_UART_FC_SW);
+	if (mode == MTK_UART_FC_HW)
+		serial_out(up, UART_MCR, UART_MCR_RTS);
+
+	/* The MT6989 hub UART exposes these registers through FEATURE_SEL. */
+	serial_out(up, MTK_UART_FEATURE_SEL, 1);
+	efr = serial_in(up, MTK_UART_EFR);
+	efr &= ~(MTK_UART_EFR_HW_FC | MTK_UART_EFR_SW_FC_MASK);
+	efr |= UART_EFR_ECB;
+	if (mode == MTK_UART_FC_HW)
+		efr |= MTK_UART_EFR_HW_FC;
+	else if (mode == MTK_UART_FC_SW)
+		efr |= MTK_UART_EFR_XON1_XOFF1;
+	serial_out(up, MTK_UART_EFR, efr);
+	if (mode == MTK_UART_FC_SW) {
+		serial_out(up, MTK_UART_XON1, termios->c_cc[VSTART]);
+		serial_out(up, MTK_UART_XOFF1, termios->c_cc[VSTOP]);
+		serial_out(up, MTK_UART_XON2, termios->c_cc[VSTART]);
+		serial_out(up, MTK_UART_XOFF2, termios->c_cc[VSTOP]);
+		efr = serial_in(up, MTK_UART_EFR);
+		xon1 = serial_in(up, MTK_UART_XON1);
+		xoff1 = serial_in(up, MTK_UART_XOFF1);
+		xon2 = serial_in(up, MTK_UART_XON2);
+		xoff2 = serial_in(up, MTK_UART_XOFF2);
+	}
+	serial_out(up, MTK_UART_FEATURE_SEL, 0);
+
+	switch (mode) {
+	case MTK_UART_FC_HW:
+		mtk8250_disable_intrs(up, MTK_UART_IER_XOFFI);
+		mtk8250_enable_intrs(up, MTK_UART_IER_CTSI | MTK_UART_IER_RTSI);
+		break;
+	case MTK_UART_FC_SW:
+		mtk8250_disable_intrs(up, MTK_UART_IER_CTSI | MTK_UART_IER_RTSI);
+		mtk8250_enable_intrs(up, MTK_UART_IER_XOFFI);
+		dev_info_ratelimited(up->port.dev,
+			"UART hub SW flow: EFR=%#x escape=%#x enable=%#x XON/XOFF=%#x/%#x,%#x/%#x\n",
+			efr, serial_in(up, MTK_UART_ESCAPE_DAT),
+			serial_in(up, MTK_UART_ESCAPE_EN), xon1, xoff1, xon2, xoff2);
+		break;
+	default:
+		mtk8250_disable_intrs(up, MTK_UART_IER_XOFFI |
+			MTK_UART_IER_RTSI | MTK_UART_IER_CTSI);
+		break;
+	}
 }
 
 static void mtk8250_set_flow_ctrl(struct uart_8250_port *up, int mode)
@@ -302,6 +592,15 @@ static void mtk8250_set_flow_ctrl(struct uart_8250_port *up, int mode)
 	}
 }
 
+static void mtk8250_hub_set_divisor(struct uart_port *port, unsigned int baud,
+				   unsigned int quot, unsigned int quot_frac)
+{
+	serial_port_out(port, MTK_UART_FEATURE_SEL, 1);
+	serial_port_out(port, MTK_UART_DLL, quot & 0xff);
+	serial_port_out(port, MTK_UART_DLH, (quot >> 8) & 0xff);
+	serial_port_out(port, MTK_UART_FEATURE_SEL, 0);
+}
+
 static void
 mtk8250_set_termios(struct uart_port *port, struct ktermios *termios,
 		    const struct ktermios *old)
@@ -313,6 +612,7 @@ mtk8250_set_termios(struct uart_port *port, struct ktermios *termios,
 		0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 3
 	};
 	struct uart_8250_port *up = up_to_u8250p(port);
+	bool hub_port = port->set_divisor == mtk8250_hub_set_divisor;
 	unsigned int baud, quot, fraction;
 	unsigned long flags;
 	int mode;
@@ -360,6 +660,23 @@ mtk8250_set_termios(struct uart_port *port, struct ktermios *termios,
 				  port->uartclk / 16 / UART_DIV_MAX,
 				  port->uartclk);
 
+#if IS_ENABLED(CONFIG_MTK_UARTHUB)
+	{
+		struct mtk8250_data *data = port->private_data;
+
+		if (data->hub_baud && UARTHUB_provider_ready() && !UARTHUB_is_bypass_mode()) {
+			int ret;
+
+			ret = UARTHUB_config_internal_baud_rate(0, data->hub_baud);
+			if (!ret)
+				ret = UARTHUB_config_external_baud_rate(data->hub_baud);
+			if (ret)
+				dev_err(port->dev, "failed to set UART HUB baud: %d\n", ret);
+			else
+				baud = data->hub_baud;
+		}
+	}
+#endif
 	if (baud < 115200) {
 		serial_port_out(port, MTK_UART_HIGHS, 0x0);
 		quot = uart_get_divisor(port, baud);
@@ -379,14 +696,32 @@ mtk8250_set_termios(struct uart_port *port, struct ktermios *termios,
 	 */
 	uart_update_timeout(port, termios->c_cflag, baud);
 
-	/* set DLAB we have cval saved in up->lcr from the call to the core */
-	serial_port_out(port, UART_LCR, up->lcr | UART_LCR_DLAB);
-	serial_dl_write(up, quot);
+	if (hub_port) {
+		unsigned int fcr = serial_in(up, MTK_UART_FCR_RD);
+		unsigned int efr;
 
-	/* reset DLAB */
-	serial_port_out(port, UART_LCR, up->lcr);
+		/* Program the hub port RX trigger after the generic 8250 setup. */
+		serial_out(up, MTK_UART_RXTRI_AD, MTK_UART_HUB_RXTRIG);
+		serial_out(up, MTK_UART_FEATURE_SEL, 1);
+		efr = serial_in(up, MTK_UART_EFR);
+		serial_out(up, MTK_UART_EFR, efr | UART_EFR_ECB);
+		serial_out(up, UART_FCR, fcr | UART_FCR_R_TRIG_11 | UART_FCR_ENABLE_FIFO);
+		serial_out(up, MTK_UART_EFR, efr);
+		serial_out(up, MTK_UART_FEATURE_SEL, 0);
 
-	if (baud >= 115200) {
+		mtk8250_hub_set_divisor(port, baud, quot, 0);
+	} else {
+		serial_port_out(port, UART_LCR, up->lcr | UART_LCR_DLAB);
+		serial_dl_write(up, quot);
+		serial_port_out(port, UART_LCR, up->lcr);
+	}
+
+	if (hub_port && baud == MTK_UART_HUB_BAUD) {
+		serial_port_out(port, MTK_UART_SAMPLE_COUNT, 7);
+		serial_port_out(port, MTK_UART_SAMPLE_POINT, 3);
+		serial_port_out(port, MTK_UART_FRACDIV_L, 0xdb);
+		serial_port_out(port, MTK_UART_FRACDIV_M, 0x1);
+	} else if (baud >= 115200) {
 		unsigned int tmp;
 
 		tmp = (port->uartclk / (baud *  quot)) - 1;
@@ -394,8 +729,8 @@ mtk8250_set_termios(struct uart_port *port, struct ktermios *termios,
 		serial_port_out(port, MTK_UART_SAMPLE_POINT,
 					(tmp >> 1) - 1);
 
-		/*count fraction to set fractoin register */
-		fraction = ((port->uartclk  * 100) / baud / quot) % 100;
+		/* Keep the scaled clock from overflowing at high UART clock rates. */
+		fraction = div_u64((u64)port->uartclk * 100, baud * quot) % 100;
 		fraction = DIV_ROUND_CLOSEST(fraction, 10);
 		serial_port_out(port, MTK_UART_FRACDIV_L,
 						fraction_L_mapping[fraction]);
@@ -415,7 +750,10 @@ mtk8250_set_termios(struct uart_port *port, struct ktermios *termios,
 	else
 		mode = MTK_UART_FC_NONE;
 
-	mtk8250_set_flow_ctrl(up, mode);
+	if (hub_port)
+		mtk8250_hub_set_flow_ctrl(up, mode, termios);
+	else
+		mtk8250_set_flow_ctrl(up, mode);
 
 	if (uart_console(port))
 		up->port.cons->cflag = termios->c_cflag;
@@ -470,6 +808,34 @@ static bool mtk8250_dma_filter(struct dma_chan *chan, void *param)
 }
 #endif
 
+#if IS_ENABLED(CONFIG_MTK_UARTHUB)
+static int mtk8250_probe_hub_reset(struct device *dev, struct mtk8250_data *data)
+{
+	struct device_node *np = dev->of_node;
+	u32 base, set[3], clear[3];
+
+	if (!of_property_present(np, "peri-reset"))
+		return 0;
+
+	if (of_property_read_u32(np, "peri-reset", &base) ||
+	    of_property_read_u32_array(np, "peri-reset-set", set, ARRAY_SIZE(set)) ||
+	    of_property_read_u32_array(np, "peri-reset-clr", clear, ARRAY_SIZE(clear)))
+		return -EINVAL;
+
+	if (set[0] != (u64)base + 4 || clear[0] != (u64)base + 8 ||
+	    !is_power_of_2(set[1]) || set[1] != set[2] ||
+	    set[1] != clear[1] || set[1] != clear[2])
+		return -EINVAL;
+
+	data->hub_reset_reg = devm_ioremap(dev, base, 3 * sizeof(u32));
+	if (!data->hub_reset_reg)
+		return -ENOMEM;
+
+	data->hub_reset_bit = set[1];
+	return 0;
+}
+#endif
+
 static int mtk8250_probe_of(struct platform_device *pdev, struct uart_port *p,
 			   struct mtk8250_data *data)
 {
@@ -496,6 +862,30 @@ static int mtk8250_probe_of(struct platform_device *pdev, struct uart_port *p,
 	if (IS_ERR(data->bus_clk))
 		return PTR_ERR(data->bus_clk);
 
+#if IS_ENABLED(CONFIG_MTK_UARTHUB)
+	if (of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6985-uart") &&
+	    !of_property_read_u32(pdev->dev.of_node, "hub-baud", &data->hub_baud)) {
+		u32 clock_cfg[3];
+		int ret;
+
+		ret = of_property_read_u32_array(pdev->dev.of_node, "peri-clock-con",
+						 clock_cfg, ARRAY_SIZE(clock_cfg));
+		if (ret)
+			return ret;
+		data->hub_clk_reg = devm_ioremap(&pdev->dev, clock_cfg[0], sizeof(u32));
+		if (!data->hub_clk_reg)
+			return -ENOMEM;
+		data->hub_clk_mask = clock_cfg[1];
+		data->hub_clk_value = clock_cfg[2] & clock_cfg[1];
+		if (data->hub_baud) {
+			ret = mtk8250_probe_hub_reset(&pdev->dev, data);
+			if (ret)
+				return dev_err_probe(&pdev->dev, ret, "invalid UART HUB PERI reset\n");
+			p->set_divisor = mtk8250_hub_set_divisor;
+		}
+	}
+#endif
+
 	data->dma = NULL;
 #ifdef CONFIG_SERIAL_8250_DMA
 	dmacnt = of_property_count_strings(pdev->dev.of_node, "dma-names");
@@ -507,6 +897,7 @@ static int mtk8250_probe_of(struct platform_device *pdev, struct uart_port *p,
 
 		data->dma->fn = mtk8250_dma_filter;
 		data->dma->rx_size = MTK_UART_RX_SIZE;
+		data->dma->tx_check_cookie = true;
 		data->dma->rxconf.src_maxburst = MTK_UART_RX_TRIGGER;
 		data->dma->txconf.dst_maxburst = MTK_UART_TX_TRIGGER;
 	}
@@ -557,6 +948,7 @@ static int mtk8250_probe(struct platform_device *pdev)
 	uart.port.type = PORT_16550;
 	uart.port.flags = UPF_BOOT_AUTOCONF | UPF_FIXED_PORT;
 	uart.port.dev = &pdev->dev;
+	of_property_read_u32(pdev->dev.of_node, "uart-line", &uart.port.line);
 	uart.port.iotype = UPIO_MEM32;
 	uart.port.regshift = 2;
 	uart.port.private_data = data;
@@ -645,6 +1037,7 @@ static const struct dev_pm_ops mtk8250_pm_ops = {
 
 static const struct of_device_id mtk8250_of_match[] = {
 	{ .compatible = "mediatek,mt6577-uart" },
+	{ .compatible = "mediatek,mt6985-uart" },
 	{ /* Sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, mtk8250_of_match);

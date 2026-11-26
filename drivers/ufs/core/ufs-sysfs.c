@@ -2,6 +2,7 @@
 // Copyright (C) 2018 Western Digital Corporation
 
 #include <linux/err.h>
+#include <linux/device.h>
 #include <linux/string.h>
 #include <linux/bitfield.h>
 #include <linux/unaligned.h>
@@ -2141,6 +2142,85 @@ const struct attribute_group ufs_sysfs_lun_attributes_group = {
 	.attrs = ufs_sysfs_lun_attributes,
 };
 
+#ifdef CONFIG_SCSI_UFS_ROTHKO
+static struct class *rothko_memory_class;
+static struct device *rothko_memory_device;
+
+static ssize_t dump_health_desc_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	static const char * const names[] = {
+		"bLength", "bDescriptorType", "bPreEOLInfo",
+		"bDeviceLifeTimeEstA", "bDeviceLifeTimeEstB",
+	};
+	struct ufs_hba *hba = dev_get_drvdata(dev);
+	u8 descriptor[ARRAY_SIZE(names)];
+	unsigned int index;
+	ssize_t count = 0;
+	int ret;
+
+	down(&hba->host_sem);
+	if (!ufshcd_is_user_access_allowed(hba)) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	ufshcd_rpm_get_sync(hba);
+	ret = ufshcd_read_desc_param(hba, QUERY_DESC_IDN_HEALTH, 0, 0,
+				     descriptor, sizeof(descriptor));
+	ufshcd_rpm_put_sync(hba);
+	if (ret)
+		goto out;
+
+	for (index = 0; index < ARRAY_SIZE(names); index++)
+		count += sysfs_emit_at(buf, count,
+			"Device Descriptor[Byte offset 0x%x]: %s = 0x%x\n",
+			index, names[index], descriptor[index]);
+	ret = count;
+out:
+	up(&hba->host_sem);
+	return ret;
+}
+static DEVICE_ATTR_RO(dump_health_desc);
+
+static struct attribute *rothko_ufs_health_attrs[] = {
+	&dev_attr_dump_health_desc.attr,
+	NULL,
+};
+
+static const struct attribute_group rothko_ufs_health_group = {
+	.name = "ufshcd0",
+	.attrs = rothko_ufs_health_attrs,
+};
+
+static const struct attribute_group *rothko_ufs_health_groups[] = {
+	&rothko_ufs_health_group,
+	NULL,
+};
+
+static int rothko_ufs_sysfs_add_nodes(struct device *dev)
+{
+	struct class *memory_class;
+	struct device *memory_device;
+
+	memory_class = class_create("mi_memory");
+	if (IS_ERR(memory_class))
+		return PTR_ERR(memory_class);
+
+	memory_device = device_create_with_groups(memory_class, dev, 0,
+			dev_get_drvdata(dev), rothko_ufs_health_groups,
+			"mi_memory_device");
+	if (IS_ERR(memory_device)) {
+		class_destroy(memory_class);
+		return PTR_ERR(memory_device);
+	}
+
+	rothko_memory_class = memory_class;
+	rothko_memory_device = memory_device;
+	return 0;
+}
+#endif
+
 void ufs_sysfs_add_nodes(struct device *dev)
 {
 	int ret;
@@ -2150,9 +2230,22 @@ void ufs_sysfs_add_nodes(struct device *dev)
 		dev_err(dev,
 			"%s: sysfs groups creation failed (err = %d)\n",
 			__func__, ret);
+#ifdef CONFIG_SCSI_UFS_ROTHKO
+	ret = rothko_ufs_sysfs_add_nodes(dev);
+	if (ret)
+		dev_err(dev, "UFS health sysfs creation failed (err = %d)\n", ret);
+#endif
 }
 
 void ufs_sysfs_remove_nodes(struct device *dev)
 {
+#ifdef CONFIG_SCSI_UFS_ROTHKO
+	if (rothko_memory_device) {
+		device_unregister(rothko_memory_device);
+		class_destroy(rothko_memory_class);
+		rothko_memory_device = NULL;
+		rothko_memory_class = NULL;
+	}
+#endif
 	sysfs_remove_groups(&dev->kobj, ufs_sysfs_groups);
 }

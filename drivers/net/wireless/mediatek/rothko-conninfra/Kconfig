@@ -1,0 +1,51 @@
+source "drivers/net/wireless/mediatek/rothko-conninfra/vendor/drivers/misc/mediatek/clkbuf/Kconfig"
+
+config MTK_ROTHKO_CONNINFRA
+	bool "MT6989 connection infrastructure"
+	depends on ARCH_MEDIATEK && OF && NET
+	select MTK_CLKBUF_CTRL
+	select MTK_COMBO_CHIP_CONSYS_6989
+
+config MTK_COMBO_CHIP_CONSYS_6989
+	bool
+
+config MTK_ROTHKO_CONNFEM
+	bool "MT6989 connection front-end module"
+	depends on MTK_ROTHKO_CONNINFRA
+
+config MTK_ROTHKO_BT
+	bool "MT6639 native Android Bluetooth UART driver"
+	depends on MTK_ROTHKO_CONNINFRA && TTY && BT
+	select MTK_ROTHKO_CONNFEM
+
+config MTK_ROTHKO_WLAN
+	bool "MT6639 PCIe WLAN for MT6989"
+	depends on MTK_ROTHKO_CONNINFRA && PCI && CFG80211=y
+	depends on PCIE_MEDIATEK_GEN3=y
+	select MTK_ROTHKO_CONNFEM
+	help
+	  Build the MT6639 gen4m WLAN driver and its Android /dev/wmtWifi
+	  control device. The driver also provides connv3 WLAN pre-calibration.
+
+source "drivers/net/wireless/mediatek/rothko-conninfra/uarthub/Kconfig"
+
+config MTK_ROTHKO_GPS_SCP
+	bool "MT6989 GNSS to SCP transport"
+	depends on MTK_ROTHKO_CONNINFRA && MTK_CONN_SCP
+
+config MTK_ROTHKO_GPS_DATA_LINK
+	bool "MT6989 GNSS CCIF/EMI data link"
+	depends on ARM64 && MTK_ROTHKO_CONNINFRA
+	default n
+	help
+	  Build the v061 MediaTek GNSS data link, including the MCU/CCIF
+	  transport, GNSS storage channels and the separate ICAP device.
+
+config MTK_ROTHKO_GPS_DATA_LINK_FW_LOADER
+	bool "Allow the MT6989 GNSS driver to request firmware"
+	depends on MTK_ROTHKO_GPS_DATA_LINK && FW_LOADER
+	default n
+	help
+	  Enable the donor's explicit debug opt-in for loading GNSS firmware
+	  files into the dedicated EMI slots. Leave this disabled unless the
+	  board's firmware names and loading policy have been verified.

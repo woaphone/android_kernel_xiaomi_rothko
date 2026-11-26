@@ -1,0 +1,24 @@
+config MTK_ENABLE_GENIEZONE
+	tristate "MediaTek GenieZone Trusty transport"
+	depends on ARCH_MEDIATEK && ARM64
+	select TRUSTY_INTERRUPT_FIQ_ONLY
+
+config TRUSTY_INTERRUPT_FIQ_ONLY
+	bool
+
+config MTK_GZ_IRQ
+	tristate "MediaTek GenieZone Trusty interrupt forwarding"
+	depends on MTK_ENABLE_GENIEZONE
+
+config MTK_GZ_VIRTIO
+	tristate "MediaTek GenieZone Trusty VirtIO transport"
+	depends on MTK_ENABLE_GENIEZONE
+	select VIRTIO
+
+config MTK_GZ_VIRTIO_IPC
+	tristate "MediaTek GenieZone Trusty VirtIO IPC"
+	depends on MTK_GZ_VIRTIO
+
+config MTK_GZ_TZ_SYSTEM
+	tristate "MediaTek GenieZone Trusty session services"
+	depends on MTK_GZ_VIRTIO_IPC && MTK_GZ_IRQ

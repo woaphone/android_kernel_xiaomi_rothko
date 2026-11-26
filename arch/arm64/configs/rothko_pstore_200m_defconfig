@@ -1,0 +1,2 @@
+# Experimental log producer; requires a compatible high-RAM recovery reader.
+CONFIG_ROTHKO_PSTORE_HIGHMEM=y

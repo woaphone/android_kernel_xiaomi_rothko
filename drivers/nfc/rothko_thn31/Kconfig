@@ -1,0 +1,6 @@
+config ROTHKO_THN31_NFC
+	tristate "Rothko THN31 NFC and eSE transports"
+	depends on I2C && SPI && GPIOLIB && OF && PINCTRL && PM
+	help
+	  Expose the THN31 I2C NFC and SPI eSE interfaces to the stock
+	  Android HALs.

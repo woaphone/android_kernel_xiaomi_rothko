@@ -172,3 +172,20 @@ obj-$(CONFIG_COMMON_CLK_MT8365_VDEC) += clk-mt8365-vdec.o
 obj-$(CONFIG_COMMON_CLK_MT8365_VENC) += clk-mt8365-venc.o
 obj-$(CONFIG_COMMON_CLK_MT8516) += clk-mt8516-apmixedsys.o clk-mt8516.o
 obj-$(CONFIG_COMMON_CLK_MT8516_AUDSYS) += clk-mt8516-aud.o
+
+# MT6989 uses its vendor HW voter mux, gate and PLL register protocols.
+obj-$(CONFIG_COMMON_CLK_MT6989) += clk-mt6989-core.o clk-mt6989.o
+clk-mt6989-core-y := clk-mt6989-mtk.o clk-mt6989-mux.o clk-mt6989-gate.o clk-mt6989-pll.o
+obj-$(CONFIG_COMMON_CLK_MT6989_ADSP) += clk-mt6989-adsp.o
+obj-$(CONFIG_COMMON_CLK_MT6989_BUS) += clk-mt6989-bus.o
+obj-$(CONFIG_COMMON_CLK_MT6989_CAM) += clk-mt6989-cam.o
+obj-$(CONFIG_COMMON_CLK_MT6989_IMG) += clk-mt6989-img.o
+obj-$(CONFIG_COMMON_CLK_MT6989_MDPSYS) += clk-mt6989-mdpsys.o
+obj-$(CONFIG_COMMON_CLK_MT6989_MFGCFG) += clk-mt6989-mfgcfg.o
+obj-$(CONFIG_COMMON_CLK_MT6989_MMSYS) += clk-mt6989-mmsys.o
+obj-$(CONFIG_COMMON_CLK_MT6989_PERI) += clk-mt6989-peri.o
+obj-$(CONFIG_COMMON_CLK_MT6989_VCODEC) += clk-mt6989-vcodec.o
+obj-$(CONFIG_COMMON_CLK_MT6989_VLP) += clk-mt6989-vlp.o
+obj-$(CONFIG_COMMON_CLK_MT6685_335) += mt6685-335clk.o
+
+obj-$(CONFIG_COMMON_CLK_MT6989) += mt6989-fmeter/

@@ -18,6 +18,7 @@
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/percpu.h>
+#include <linux/preempt.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/syscore_ops.h>
@@ -586,6 +587,35 @@ static int gic_irq_get_irqchip_state(struct irq_data *d,
 
 	return 0;
 }
+
+void mt_irq_dump_status(int irq)
+{
+	struct irq_data *data = irq_get_irq_data(irq);
+	bool pending, active, masked;
+	int pending_err, active_err, masked_err;
+
+	if (!data) {
+		pr_err("invalid irq:%d\n", irq);
+		return;
+	}
+
+	/* Keep per-CPU redistributor reads on the same CPU. */
+	preempt_disable();
+	pending_err = irq_get_irqchip_state(irq, IRQCHIP_STATE_PENDING, &pending);
+	active_err = irq_get_irqchip_state(irq, IRQCHIP_STATE_ACTIVE, &active);
+	masked_err = irq_get_irqchip_state(irq, IRQCHIP_STATE_MASKED, &masked);
+	preempt_enable();
+	if (pending_err || active_err || masked_err) {
+		pr_err("irq:%d state read failed pending:%d active:%d masked:%d\n",
+		       irq, pending_err, active_err, masked_err);
+		return;
+	}
+
+	pr_info("irq:%d hwirq:%lu type:%u enabled:%d pending:%d active:%d affinity:%*pbl\n",
+		irq, data->hwirq, irq_get_trigger_type(irq), !masked, pending,
+		active, cpumask_pr_args(irq_get_affinity_mask(irq)));
+}
+EXPORT_SYMBOL_GPL(mt_irq_dump_status);
 
 static void gic_irq_set_prio(struct irq_data *d, u8 prio)
 {

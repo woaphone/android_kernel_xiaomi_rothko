@@ -2,15 +2,21 @@
 config VIDEO_MEDIATEK_JPEG
 	tristate "Mediatek JPEG Codec driver"
 	depends on V4L_MEM2MEM_DRIVERS
-	depends on MTK_IOMMU_V1 || MTK_IOMMU || COMPILE_TEST
+	depends on ((MTK_IOMMU_V1 || MTK_IOMMU) && MTK_SMI) || \
+		   (COMPILE_TEST && MTK_SMI=n) || \
+		   (DEVICE_MODULES_ARM_SMMU_V3 && DEVICE_MODULES_MTK_SMI && \
+		    MTK_MT6989_SMMU_SHARE_GROUP && MTK_MMDVFS && \
+		    INTERCONNECT_MTK_EXTENSION)
+	depends on MTK_MMDVFS || !MTK_MMDVFS
+	depends on INTERCONNECT_MTK_EXTENSION || !INTERCONNECT_MTK_EXTENSION
 	depends on VIDEO_DEV
 	depends on ARCH_MEDIATEK || COMPILE_TEST
-	depends on MTK_SMI || (COMPILE_TEST && MTK_SMI=n)
 	select VIDEOBUF2_DMA_CONTIG
 	select V4L2_MEM2MEM_DEV
+	select PM_OPP if MTK_MMDVFS
 	help
-	  Mediatek jpeg codec driver provides HW capability to decode
-	  JPEG format
+	  MediaTek hardware JPEG encoding and decoding. MT6989 encoding uses
+	  the vendor SMMU, SMI, MMDVFS and interconnect providers.
 
-	  To compile this driver as a module, choose M here: the
-	  module will be called mtk-jpeg
+	  As modules, this builds mtk_jpeg, mtk-jpeg-enc-hw and
+	  mtk-jpeg-dec-hw.

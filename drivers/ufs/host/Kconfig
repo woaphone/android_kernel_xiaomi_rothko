@@ -86,6 +86,15 @@ config SCSI_UFS_MEDIATEK
 
 	  If unsure, say N.
 
+config SCSI_UFS_ROTHKO
+	bool "Redmi K70 Ultra LK UFS initialization compatibility"
+	depends on SCSI_UFSHCD=y && SCSI_UFS_MEDIATEK
+	help
+	  The stock rothko LK appends initcall_blacklist=ufshcd_core_init
+	  to replace the Android 14 built-in core with a vendor module.
+	  Use a separate built-in initcall for the native UFS core so the
+	  6.18 storage driver registers its SCSI well-known LUN driver.
+
 config SCSI_UFS_HISI
 	tristate "Hisilicon specific hooks to UFS controller platform driver"
 	depends on (ARCH_HISI || COMPILE_TEST) && SCSI_UFSHCD_PLATFORM

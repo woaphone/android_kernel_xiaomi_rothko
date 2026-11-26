@@ -31,8 +31,20 @@ enum nf_ct_ext_id {
 #if IS_ENABLED(CONFIG_NET_ACT_CT)
 	NF_CT_EXT_ACT_CT,
 #endif
+#if IS_ENABLED(CONFIG_ROTHKO_MINET)
+	NF_CT_EXT_MINET,
+#endif
 	NF_CT_EXT_NUM,
 };
+
+#if IS_ENABLED(CONFIG_ROTHKO_MINET)
+struct nf_conn_minet {
+	/* Zero until LOCAL_OUT provides the socket UID. */
+	u32 uid_plus_one;
+};
+
+extern bool nf_ct_minet_active;
+#endif
 
 /* Extensions: optional stuff which isn't permanently in struct. */
 struct nf_ct_ext {

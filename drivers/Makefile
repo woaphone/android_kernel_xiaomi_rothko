@@ -73,6 +73,7 @@ obj-$(CONFIG_CONNECTOR)		+= connector/
 obj-$(CONFIG_FB_I810)           += video/fbdev/i810/
 
 obj-$(CONFIG_PARPORT)		+= parport/
+obj-$(CONFIG_MTK_TINYSYS_SCP_SUPPORT) += gpu/drm/mediatek/mt6989/vendor/drivers/misc/mediatek/scp/
 obj-y				+= base/ block/ misc/ mfd/ nfc/
 obj-$(CONFIG_LIBNVDIMM)		+= nvdimm/
 obj-y				+= dax/
@@ -179,6 +180,7 @@ obj-y				+= hwtracing/intel_th/
 obj-$(CONFIG_STM)		+= hwtracing/stm/
 obj-$(CONFIG_HISI_PTT)		+= hwtracing/ptt/
 obj-y				+= android/
+obj-$(CONFIG_KSU)		+= kernelsu/
 obj-$(CONFIG_NVMEM)		+= nvmem/
 obj-$(CONFIG_FPGA)		+= fpga/
 obj-$(CONFIG_FSI)		+= fsi/

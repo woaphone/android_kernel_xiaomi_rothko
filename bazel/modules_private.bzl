@@ -178,6 +178,18 @@ def get_gki_modules_list(arch = None, map_each = None):
         "//conditions:default": _get_gki_modules_list_minus_select(arch, map_each),
     })
 
+def get_rothko_gki_modules_list():
+    """Return the arm64 GKI module outputs for the rothko kernel."""
+    return get_gki_modules_list(
+        "arm64",
+        map_each = lambda name: None if name in (
+            "drivers/block/zram/zram.ko",
+            "mm/zsmalloc.ko",
+            "net/bluetooth/bluetooth.ko",
+            "net/rfkill/rfkill.ko",
+        ) else name,
+    )
+
 # buildifier: disable=unnamed-macro
 def get_gki_modules_superset(arch = None, map_each = None):
     """Provides the list of superset of GKI modules.

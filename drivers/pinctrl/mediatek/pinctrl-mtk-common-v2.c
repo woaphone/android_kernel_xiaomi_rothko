@@ -210,6 +210,9 @@ int mtk_hw_set_value(struct mtk_pinctrl *hw, const struct mtk_pin_desc *desc,
 	else
 		mtk_hw_write_cross_field(hw, &pf, value);
 
+	if (field == PINCTRL_PIN_REG_MODE && hw->soc->set_pinmux)
+		return hw->soc->set_pinmux(hw, desc, value);
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mtk_hw_set_value);
@@ -369,7 +372,8 @@ static const struct mtk_eint_xt mtk_eint_xt = {
 int mtk_build_eint(struct mtk_pinctrl *hw, struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
-	int ret, i, j, count_reg_names;
+	struct device_node *eint_np;
+	int ret, i, j, count_reg_names, first_eint;
 
 	if (!IS_ENABLED(CONFIG_EINT_MTK))
 		return 0;
@@ -381,13 +385,22 @@ int mtk_build_eint(struct mtk_pinctrl *hw, struct platform_device *pdev)
 	if (!hw->eint)
 		return -ENOMEM;
 
-	count_reg_names = of_property_count_strings(np, "reg-names");
-	if (count_reg_names < 0)
-		return -EINVAL;
+	/* MT6989 firmware keeps the EINT resources in a separate node. */
+	eint_np = of_parse_phandle(np, "mediatek,eint", 0);
+	if (eint_np) {
+		count_reg_names = of_property_count_strings(eint_np, "reg-name");
+		first_eint = 0;
+	} else {
+		eint_np = of_node_get(np);
+		count_reg_names = of_property_count_strings(np, "reg-names");
+		first_eint = hw->soc->nbase_names;
+	}
 
-	hw->eint->nbase = count_reg_names - (int)hw->soc->nbase_names;
-	if (hw->eint->nbase <= 0)
-		return -EINVAL;
+	hw->eint->nbase = count_reg_names - first_eint;
+	if (hw->eint->nbase <= 0) {
+		ret = -EINVAL;
+		goto err_free_base;
+	}
 
 	hw->eint->base = devm_kmalloc_array(&pdev->dev, hw->eint->nbase,
 					    sizeof(*hw->eint->base), GFP_KERNEL | __GFP_ZERO);
@@ -396,15 +409,15 @@ int mtk_build_eint(struct mtk_pinctrl *hw, struct platform_device *pdev)
 		goto err_free_base;
 	}
 
-	for (i = hw->soc->nbase_names, j = 0; i < count_reg_names; i++, j++) {
-		hw->eint->base[j] = of_iomap(np, i);
-		if (IS_ERR(hw->eint->base[j])) {
-			ret = PTR_ERR(hw->eint->base[j]);
+	for (i = first_eint, j = 0; i < count_reg_names; i++, j++) {
+		hw->eint->base[j] = of_iomap(eint_np, i);
+		if (!hw->eint->base[j]) {
+			ret = -ENOMEM;
 			goto err_free_eint;
 		}
 	}
 
-	hw->eint->irq = irq_of_parse_and_map(np, 0);
+	hw->eint->irq = irq_of_parse_and_map(eint_np, 0);
 	if (!hw->eint->irq) {
 		ret = -EINVAL;
 		goto err_free_eint;
@@ -424,6 +437,7 @@ int mtk_build_eint(struct mtk_pinctrl *hw, struct platform_device *pdev)
 	if (ret)
 		goto err_free_eint;
 
+	of_node_put(eint_np);
 	return 0;
 
 err_free_eint:
@@ -433,6 +447,7 @@ err_free_eint:
 	}
 	devm_kfree(hw->dev, hw->eint->base);
 err_free_base:
+	of_node_put(eint_np);
 	devm_kfree(hw->dev, hw->eint);
 	hw->eint = NULL;
 	return ret;

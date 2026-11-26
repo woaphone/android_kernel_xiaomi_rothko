@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0
+rothko-audio-root := $(srctree)/sound/soc/mediatek/rothko-mt6989
+rothko-audio-provider := $(rothko-audio-root)/provider
+rothko-scp-provider := $(srctree)/drivers/gpu/drm/mediatek/mt6989/vendor/drivers/misc/mediatek/scp
+subdir-ccflags-y += -I$(rothko-audio-root)/common
+subdir-ccflags-y += -I$(rothko-audio-root)/audio_dsp
+subdir-ccflags-y += -I$(rothko-audio-root)/ultrasound/ultra_common
+subdir-ccflags-y += -I$(rothko-audio-provider)/audio_ipi/include
+subdir-ccflags-y += -I$(rothko-audio-provider)/adsp
+subdir-ccflags-y += -I$(rothko-audio-provider)/adsp/include
+subdir-ccflags-y += -I$(rothko-audio-provider)/include
+subdir-ccflags-y += -I$(rothko-audio-provider)/include/mt-plat
+subdir-ccflags-y += -I$(rothko-audio-provider)/vow
+subdir-ccflags-y += -I$(rothko-audio-provider)/vow/ver02
+subdir-ccflags-y += -I$(rothko-audio-root)/audio_scp
+subdir-ccflags-y += -I$(srctree)/drivers/clk/mediatek/mt6989-fmeter
+subdir-ccflags-y += -I$(rothko-scp-provider)/include
+subdir-ccflags-y += -I$(rothko-scp-provider)/rv
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/rothko_modem/include
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/rothko_modem/include/mt-plat
+obj-$(CONFIG_SND_SOC_ROTHKO_MT6989) += provider/
+obj-$(CONFIG_SND_SOC_ROTHKO_MT6989) += common/ mt6989/ codecs/ audio_dsp/ audio_scp/
+obj-$(CONFIG_MTK_ULTRASND_PROXIMITY) += ultrasound/
+obj-$(CONFIG_MTK_VOW_SUPPORT) += vow/

@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_MDPM
+	bool "MediaTek MT6989 modem power meter"
+	depends on MTK_ECCCI_DRIVER = y && PROC_FS
+	default n
+	help
+	  Estimate modem power from the gen6298 CCCI DBM shared memory.
+	  Reports the scenario and transmit power through /proc/mdpm/mdpm_power.

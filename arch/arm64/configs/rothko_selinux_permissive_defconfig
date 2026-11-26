@@ -1,0 +1,7 @@
+# Diagnostic only: preserve SELinux policy/audit, permit kernel log reads.
+CONFIG_SECURITY_SELINUX=y
+CONFIG_SECURITY_SELINUX_DEVELOP=y
+CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC=y
+# CONFIG_SECURITY_DMESG_RESTRICT is not set
+# Keep the image small; printk expands the ring through memblock at boot.
+CONFIG_LOG_BUF_SHIFT=17

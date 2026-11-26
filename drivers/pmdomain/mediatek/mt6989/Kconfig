@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MTK_SCPSYS_MT6989
+	tristate "MediaTek MT6989 SCPSYS power domains"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	depends on OF && PM_GENERIC_DOMAINS && COMMON_CLK && REGULATOR
+	select MFD_SYSCON
+	help
+	  Support the MT6989 SPM and hardware-voter power domains, including
+	  their bus protection, clocks, SRAM, retention and subdomain topology.

@@ -36,3 +36,5 @@ config DRM_MEDIATEK_HDMI
 	select SND_SOC_HDMI_CODEC if SND_SOC
 	help
 	  DRM/KMS HDMI driver for Mediatek SoCs
+
+source "drivers/gpu/drm/mediatek/mt6989/Kconfig"

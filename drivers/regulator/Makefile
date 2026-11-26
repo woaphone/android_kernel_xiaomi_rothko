@@ -212,3 +212,9 @@ obj-$(CONFIG_REGULATOR_WM8400) += wm8400-regulator.o
 obj-$(CONFIG_REGULATOR_WM8994) += wm8994-regulator.o
 
 ccflags-$(CONFIG_REGULATOR_DEBUG) += -DDEBUG
+obj-$(CONFIG_REGULATOR_MT6316) += mt6316-regulator.o
+obj-$(CONFIG_REGULATOR_MT6363) += mt6363-regulator.o
+obj-$(CONFIG_REGULATOR_MT6373) += mt6373-regulator.o
+obj-$(CONFIG_REGULATOR_MT6681) += mt6681-regulator.o
+
+obj-$(CONFIG_REGULATOR_ROTHKO_WL2868C) += rothko-wl2868c.o

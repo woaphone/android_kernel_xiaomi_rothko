@@ -2368,7 +2368,8 @@ static ssize_t n_tty_write(struct tty_struct *tty, struct file *file,
 			retval = -ERESTARTSYS;
 			break;
 		}
-		if (tty_hung_up_p(file) || (tty->link && !tty->link->count)) {
+		if (tty_io_error(tty) || tty_hung_up_p(file) ||
+		    (tty->link && !tty->link->count)) {
 			retval = -EIO;
 			break;
 		}

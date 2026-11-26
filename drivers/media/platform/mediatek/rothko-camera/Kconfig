@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_ROTHKO_CAMERA
+	bool "Redmi K70 Ultra MT6989 camera ISP7SP"
+	depends on VIDEO_DEV && MEDIA_CONTROLLER && I2C && REMOTEPROC && RPMSG
+	depends on MTK_MMDVFS && MTK_SLBC && MTK_IOMMU_MISC_SECURE
+	select VIDEO_V4L2_SUBDEV_API
+	select V4L2_FWNODE
+	select V4L2_ASYNC
+	select VIDEOBUF2_DMA_CONTIG
+	select RPMSG_MTK_CCD
+	select MTK_CCD_REMOTEPROC
+	select MTK_CCU_RPROC
+	select VIDEO_MTK_ISP_CAMSYS
+	select MTK_V4L2_IMGSENSOR
+	help
+	  Original MT6989 RAW/YUV/MRAW, seninf CSI, CCD and CCU camera drivers.
+	  Xiaomi board sensor drivers are selected with CUSTOM_KERNEL_IMGSENSOR.
+
+config RPMSG_MTK_CCD
+	bool
+
+config MTK_CCD_REMOTEPROC
+	bool
+
+config MTK_CCU_RPROC
+	bool
+
+config VIDEO_MTK_ISP_CAMSYS
+	bool
+
+config MTK_V4L2_IMGSENSOR
+	bool
+
+config CUSTOM_KERNEL_IMGSENSOR
+	string "Xiaomi board sensor driver list"
+	depends on VIDEO_ROTHKO_CAMERA
+	default ""
+
+config VIDEO_ROTHKO_CAMERA_AF
+	tristate "rothko autofocus media device and lens actuators"
+	depends on VIDEO_ROTHKO_CAMERA && OF && REGULATOR
+	help
+	  Enable the board's autofocus media graph and the two I2C voice
+	  coil actuators controlled through the MediaTek lens V4L2 ABI.
+
+config VIDEO_ROTHKO_CAMERA_PDA
+	tristate "rothko MT6989 phase-detection autofocus accelerator"
+	depends on VIDEO_ROTHKO_CAMERA && OF && PM && DMA_SHARED_BUFFER
+	depends on DEVICE_MODULES_ARM_SMMU_V3 && MTK_MT6989_SMMU_SHARE_GROUP
+	depends on DEVICE_MODULES_MTK_SMI && INTERCONNECT_MTK_EXTENSION
+	help
+	  Enable the paired ISP7SP PDA engines and their MediaTek userspace ABI.
+
+config VIDEO_ROTHKO_CAMERA_DPE
+	tristate "rothko MT6989 ISP7SP depth processing engine"
+	depends on VIDEO_ROTHKO_CAMERA && OF && PM && DMA_SHARED_BUFFER
+	depends on DEVICE_MODULES_ARM_SMMU_V3 && MTK_MT6989_SMMU_SHARE_GROUP
+	depends on DEVICE_MODULES_MTK_SMI && MTK_CMDQ_MBOX_EXT
+	help
+	  Enable the DVS, DVP and DVGF blocks and their MediaTek userspace ABI.
+
+config VIDEO_ROTHKO_CAMERA_EEPROM
+	tristate "Rothko camera EEPROM calibration"
+	depends on VIDEO_ROTHKO_CAMERA && OF && I2C
+	help
+	  Expose the stock camera_eeprom device nodes and read-only
+	  calibration interface for the Rothko camera modules.
+
+config VIDEO_ROTHKO_CAMERA_TORCH
+	bool "Rothko OCP81373/SGM37ET1 camera torch"
+	depends on VIDEO_ROTHKO_CAMERA && I2C=y && OF && THERMAL=y
+	depends on MTK_PEAK_POWER_BUDGET=y
+	select REGMAP_I2C
+	help
+	  Expose continuous torch operation through the stock MediaTek
+	  flashlight character device and V4L2 flash media graph.
+
+config VIDEO_ROTHKO_CAMERA_COMPOSITE
+	tristate
+	default y if VIDEO_ROTHKO_CAMERA_TORCH
+	default VIDEO_ROTHKO_CAMERA_AF

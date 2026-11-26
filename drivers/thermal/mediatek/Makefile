@@ -1,2 +1,9 @@
 obj-$(CONFIG_MTK_SOC_THERMAL)	+= auxadc_thermal.o
 obj-$(CONFIG_MTK_LVTS_THERMAL)	+= lvts_thermal.o
+obj-$(CONFIG_MTK_LVTS_MT6989)	+= lvts_mt6989.o
+obj-$(CONFIG_MTK_BOARD_THERMAL)	+= board_temp.o
+obj-$(CONFIG_XIAOMI_THERMAL_MESSAGE)	+= mi_thermal_interface.o
+obj-$(CONFIG_MTK_PMIC_TEMP)		+= pmic_temp.o
+obj-$(CONFIG_MTK_CHARGER_COOLING)	+= charger_cooling.o
+obj-$(CONFIG_MTK_BACKLIGHT_COOLING)	+= backlight_cooling.o
+CFLAGS_backlight_cooling.o		+= -I$(srctree)/drivers/gpu/drm/mediatek/mt6989/include

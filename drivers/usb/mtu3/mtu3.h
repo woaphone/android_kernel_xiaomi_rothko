@@ -127,6 +127,13 @@ enum mtu3_g_ep0_state {
  *		IDPIN signal.
  * MTU3_DR_FORCE_DEVICE: force to enter peripheral mode.
  */
+enum mtu3_power_state {
+	MTU3_STATE_POWER_OFF,
+	MTU3_STATE_POWER_ON,
+	MTU3_STATE_RESUME,
+	MTU3_STATE_SUSPEND,
+};
+
 enum mtu3_dr_force_mode {
 	MTU3_DR_FORCE_NONE = 0,
 	MTU3_DR_FORCE_HOST,
@@ -265,6 +272,10 @@ struct ssusb_mtk {
 	struct regmap *uwk;
 	u32 uwk_reg_base;
 	u32 uwk_vers;
+	bool mt6989;
+	bool clk_mgr;
+	bool force_vbus;
+	u32 hwrscs_vers;
 };
 
 /**
@@ -415,6 +426,9 @@ static inline void mtu3_clrbits(void __iomem *base, u32 offset, u32 bits)
 }
 
 int ssusb_check_clocks(struct ssusb_mtk *ssusb, u32 ex_clks);
+int ssusb_set_power_state(struct ssusb_mtk *ssusb, enum mtu3_power_state state);
+void ssusb_set_force_vbus(struct ssusb_mtk *ssusb, bool on);
+int ssusb_phy_set_mode(struct ssusb_mtk *ssusb, enum phy_mode mode);
 struct usb_request *mtu3_alloc_request(struct usb_ep *ep, gfp_t gfp_flags);
 void mtu3_free_request(struct usb_ep *ep, struct usb_request *req);
 void mtu3_req_complete(struct mtu3_ep *mep,

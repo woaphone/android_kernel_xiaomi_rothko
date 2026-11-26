@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0
+export MTK_PLATFORM := mt6989
+export MTK_PLATFORM_VERSION := mt6989
+export DEVICE_MODULES_PATH := $(srctree)
+subdir-ccflags-y += -I$(srctree)/drivers/gpu/arm/mt6989/mediatek/mt-plat
+subdir-ccflags-y += -I$(srctree)/drivers/gpu/arm/mt6989/mediatek/gpufreq
+subdir-ccflags-y += -I$(srctree)/drivers/gpu/arm/mt6989/mediatek/gpufreq/v2/include
+subdir-ccflags-y += -I$(srctree)/drivers/gpu/arm/mt6989/mediatek/gpueb/include
+subdir-ccflags-y += -I$(srctree)/drivers/gpu/arm/mt6989/mediatek/ged/include
+subdir-ccflags-y += -I$(srctree)/drivers/gpu/arm/mt6989/include
+subdir-ccflags-y += -I$(srctree)/drivers/gpu/arm/mt6989/mediatek
+subdir-ccflags-y += -I$(srctree)/drivers/dma-buf/heaps/mt6989
+subdir-ccflags-y += -I$(srctree)/drivers/gpu/drm/mediatek/mt6989/mediatek_v2
+subdir-ccflags-y += -I$(srctree)/drivers/iommu/mt6989
+obj-y += mediatek/hal/ mediatek/gpueb/ mediatek/gpufreq/ mediatek/ged/ mediatek/gpu_iommu/
+obj-$(CONFIG_MTK_GPU_SUPPORT) += mediatek/gpu_bm/
+obj-$(CONFIG_MALI_MEMORY_GROUP_MANAGER) += mali-r44p1/drivers/base/arm/memory_group_manager/
+obj-$(CONFIG_MALI_PROTECTED_MEMORY_ALLOCATOR) += mali-r44p1/drivers/base/arm/protected_memory_allocator/
+obj-$(CONFIG_DMA_SHARED_BUFFER_TEST_EXPORTER) += mali-r44p1/drivers/base/arm/dma_buf_test_exporter/
+obj-$(CONFIG_MALI_MIDGARD) += mali-r44p1/drivers/gpu/arm/midgard/

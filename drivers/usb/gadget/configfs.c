@@ -298,7 +298,8 @@ static ssize_t gadget_dev_desc_UDC_store(struct config_item *item,
 		kfree(name);
 	} else {
 		if (gi->composite.gadget_driver.udc_name) {
-			ret = -EBUSY;
+			ret = strcmp(name, gi->composite.gadget_driver.udc_name) ?
+				-EBUSY : len;
 			goto err;
 		}
 		gi->composite.gadget_driver.udc_name = name;

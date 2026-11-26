@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_PERFORMANCE_MODULE
+	bool "MediaTek performance ioctl transport"
+	depends on PROC_FS && CPU_FREQ
+	help
+	  Expose the MediaTek perfmgr, ADPF and MAGT frame notification ABIs.
+
+config MTK_FPSGO_V3
+	bool "MediaTek FPSGO v3 frame governor"
+	depends on MTK_PERFORMANCE_MODULE && ARM64 && CPU_FREQ && SMP
+	depends on UCLAMP_TASK && TRACEPOINTS
+	help
+	  Enable the MediaTek frame composer, frame stabilizer, dependency
+	  tracker and frame-based CPU tuner for MT6989.
+
+config MTK_FPSGO_NATIVE_XGF
+	bool "Native 6.18 XGF runtime estimator"
+	depends on MTK_FPSGO_V3
+	help
+	  Estimate CPU runtime and dependency lists for the FPSGO frame
+	  pipeline from scheduler events captured by the 6.18 kernel.
+
+config MTK_FPSGO_DDR_RESCUE_DEFAULT
+	bool "Enable DDR bandwidth votes for eligible frame rescue by default"
+	depends on MTK_FPSGO_V3 && INTERCONNECT
+	help
+	  Enable first-stage frame rescue and its DDR vote by default. FBT requests peak
+	  memory bandwidth during an eligible frame rescue and releases it
+	  when the rescue ends. Userspace can change the flag in sysfs.

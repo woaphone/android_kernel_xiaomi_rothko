@@ -14,4 +14,9 @@ struct mtk_chip_config {
 	u32 sample_sel;
 	u32 tick_delay;
 };
+
+struct spi_device;
+
+void mt_spi_enable_master_clk(struct spi_device *spi);
+void mt_spi_disable_master_clk(struct spi_device *spi);
 #endif

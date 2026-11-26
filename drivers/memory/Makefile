@@ -40,3 +40,5 @@ $(obj)/ti-emif-asm-offsets.h: $(obj)/emif-asm-offsets.s FORCE
 
 targets += emif-asm-offsets.s
 clean-files += ti-emif-asm-offsets.h
+
+obj-$(CONFIG_MTK_DRAMC) += mt6989/

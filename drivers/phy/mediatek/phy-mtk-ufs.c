@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 
 #include "phy-mtk-io.h"
 
@@ -39,6 +40,7 @@
 struct ufs_mtk_phy {
 	struct device *dev;
 	void __iomem *mmio;
+	u32 ver;
 	struct clk_bulk_data clks[UFSPHY_CLKS_CNT];
 };
 
@@ -121,6 +123,10 @@ static int ufs_mtk_phy_power_on(struct phy *generic_phy)
 	struct ufs_mtk_phy *phy = get_ufs_mtk_phy(generic_phy);
 	int ret;
 
+	/* MPHY v1 and later are power-managed by the UFS host and firmware. */
+	if (phy->ver)
+		return 0;
+
 	ret = clk_bulk_prepare_enable(UFSPHY_CLKS_CNT, phy->clks);
 	if (ret)
 		return ret;
@@ -133,6 +139,9 @@ static int ufs_mtk_phy_power_on(struct phy *generic_phy)
 static int ufs_mtk_phy_power_off(struct phy *generic_phy)
 {
 	struct ufs_mtk_phy *phy = get_ufs_mtk_phy(generic_phy);
+
+	if (phy->ver)
+		return 0;
 
 	ufs_mtk_phy_set_deep_hibern(phy);
 
@@ -165,9 +174,12 @@ static int ufs_mtk_phy_probe(struct platform_device *pdev)
 
 	phy->dev = dev;
 
-	ret = ufs_mtk_phy_clk_init(phy);
-	if (ret)
-		return ret;
+	device_property_read_u32(dev, "mphy-ver", &phy->ver);
+	if (!phy->ver) {
+		ret = ufs_mtk_phy_clk_init(phy);
+		if (ret)
+			return ret;
+	}
 
 	generic_phy = devm_phy_create(dev, NULL, &ufs_mtk_phy_ops);
 	if (IS_ERR(generic_phy))

@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_ROTHKO_IRTX_PWM
+	tristate "MediaTek MT6989 infrared PWM transmitter"
+	depends on ARCH_MEDIATEK && OF && HAS_IOMEM && COMMON_CLK
+	depends on PINCTRL && REGULATOR
+	select MFD_SYSCON
+	help
+	  Support the original /dev/irtx interface and MT6989 PWM DMA engine.

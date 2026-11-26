@@ -43,6 +43,15 @@ config ARM_PSCI_CPUIDLE_DOMAIN
 	  which is needed to support the hierarchical DT based layout of the
 	  idle states.
 
+config MTK_ROTHKO_LPM
+	bool "MT6989 CPU low-power firmware initialization"
+	depends on ARM64 && ARCH_MEDIATEK && ARM_PSCI_CPUIDLE && SMP
+	depends on CPU_PM && OF
+	help
+	  Initialize the MT6989 firmware IRQ-retention table and CPU PM shared
+	  state before enabling runtime PSCI power-down.  This complements the
+	  PSCI driver without changing its state parameters or governor.
+
 config ARM_BIG_LITTLE_CPUIDLE
 	bool "Support for ARM big.LITTLE processors"
 	depends on ARCH_VEXPRESS_TC2_PM || ARCH_EXYNOS || COMPILE_TEST

@@ -9,3 +9,5 @@ ifeq ($(CONFIG_THUMB2_KERNEL)$(CONFIG_CC_IS_CLANG),yy)
 # hooks are inserted via the -pg switch.
 CFLAGS_REMOVE_airoha-cpu-pmdomain.o += $(CC_FLAGS_FTRACE)
 endif
+
+obj-$(CONFIG_MTK_SCPSYS_MT6989) += mt6989/

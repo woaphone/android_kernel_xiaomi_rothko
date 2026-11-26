@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0
+CONFIG_WLAN_DRV_BUILD_IN := y
+CONFIG_MTK_PLATFORM := mt6989
+CONFIG_MTK_WIFI_CONNV3_PATH := $(src)/../conninfra
+include $(src)/Kbuild.6989_6639
+
+# Keep donor prototype diagnostics visible under CONFIG_WERROR.
+ccflags-y += -Wno-error=missing-prototypes
+
+# Native 6.18 providers used by the MT6989 platform profile.
+ccflags-y += -I$(srctree)/drivers/power/supply/rothko-power-throttling
+ccflags-y += -I$(srctree)/drivers/gpu/drm/mediatek/mt6989/mediatek_v2
+ccflags-y += -I$(srctree)/drivers/gpu/drm/mediatek/mt6989/include/mt-plat

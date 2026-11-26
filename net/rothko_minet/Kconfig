@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config ROTHKO_MINET
+	tristate "Rothko per-UID traffic accounting (minet)"
+	depends on INET && IPV6 && NF_CONNTRACK
+	help
+	  Provide the minet Generic Netlink interface used by the Rothko
+	  vendor daemon for per-UID TCP and UDP traffic accounting.
+	  Accounting starts when the daemon adds a UID to monitor.
+	  If built as a module, it will be called minet.

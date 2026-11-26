@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config ROTHKO_MIWILL
+	tristate "Rothko MiWiLL Ethernet redundancy"
+	depends on INET
+	help
+	  Provide a MiWiLL virtual link for a configured pair of Wi-Fi ports
+	  and a MiWiLL gateway in the initial network namespace.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called miwill. If unsure, say N.

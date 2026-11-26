@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: GPL-2.0-only
+source "sound/soc/mediatek/rothko-mt6989/provider/adsp/Kconfig"
+source "sound/soc/mediatek/rothko-mt6989/provider/audio_ipi/Kconfig"
+source "sound/soc/mediatek/rothko-mt6989/provider/vow/Kconfig"
+
+config SND_SOC_ROTHKO_MT6989
+	bool "Xiaomi rothko MT6989 vendor audio"
+	depends on ARCH_MEDIATEK && SND_SOC && I2C
+	depends on MFD_MT6681
+	select MTK_AUDIODSP_SUPPORT
+	select MTK_ADSP_V2
+	select MTK_AUDIO_IPI
+	select MTK_VOW_SUPPORT
+	select SND_SOC_COMPRESS
+	select DEVICE_MODULES_SND_SOC_MEDIATEK
+	select SND_SOC_MTK_SMART_PHONE
+	select SND_SOC_MTK_SRAM
+	select SND_SOC_MT6989
+	select SND_SOC_MT6989_MT6681
+	select SND_SOC_MT6681
+	select SND_SOC_MT6681_ACCDET
+	select SND_SOC_ROTHKO_AW882XX
+	select SND_SOC_MTK_AUDIO_DSP
+	select SND_SOC_MTK_OFFLOAD
+	select MTK_ULTRASND_PROXIMITY
+	help
+	  Real MT6989 AFE, MT6681 codec, ADSP PCM/offload and SCP ultrasound
+	  drivers for the stock rothko device tree and Android audio HAL.
+	  The ADSP transport and MT6681 MFD providers must also be enabled.
+
+config DEVICE_MODULES_SND_SOC_MEDIATEK
+	bool
+
+config SND_SOC_MTK_SMART_PHONE
+	bool
+
+config SND_SOC_MTK_SRAM
+	bool
+
+config SND_SOC_MT6989
+	bool
+
+config SND_SOC_MT6989_MT6681
+	bool
+
+config SND_SOC_MT6681
+	bool
+
+config SND_SOC_MT6681_ACCDET
+	bool
+
+config SND_SOC_MTK_AUDIO_DSP
+	bool
+
+config SND_SOC_MTK_OFFLOAD
+	bool
+
+config MTK_ULTRASND_PROXIMITY
+	bool
+
+config DEVICE_MODULES_SND_SOC_MTK_BTCVSD
+	tristate "MT6989 vendor Bluetooth CVSD PCM"
+	depends on SND_SOC_ROTHKO_MT6989
+
+config MTK_SCP_AUDIO
+	bool
+
+config SND_SOC_ROTHKO_AW882XX
+	bool

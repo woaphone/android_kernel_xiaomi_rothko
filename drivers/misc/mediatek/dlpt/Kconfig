@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+config MTK_ROTHKO_DLPT
+	tristate "MediaTek rothko dynamic loading current budget"
+	depends on OF && IIO && MFD_MTK_SPMI_PMIC && MEDIATEK_MT6375_AUXADC
+	default n
+	help
+	  Read the battery current budget on demand using the MT6363 charger
+	  status and MT6375 AUXADC samples. The budget_ma platform device
+	  attribute reports milliamps and is readable by root. This driver
+	  does not apply limits or run periodic sampling.

@@ -1,0 +1,14 @@
+config TOUCHSCREEN_FT3683_ROTHKO
+	tristate "Redmi K70 Ultra Focaltech FT3683 SPI touchscreen"
+	depends on SPI && GPIOLIB && REGULATOR && PINCTRL
+	select XIAOMI_TOUCH_COMMON_ROTHKO
+	help
+	  Focaltech FT3683 found in Redmi K70 Ultra touch panel variants.
+	  Supports the original Xiaomi SPI node, chip identification and
+	  the original normal and super resolution multi-touch reports.
+
+config XIAOMI_TOUCH_COMMON_ROTHKO
+	tristate "Xiaomi touch v3 transport"
+	help
+	  Controller-backed Xiaomi touch status and v3 request dispatch.
+	  Operations without a controller implementation return EOPNOTSUPP.

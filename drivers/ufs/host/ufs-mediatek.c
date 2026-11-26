@@ -10,6 +10,7 @@
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -2298,6 +2299,10 @@ static int ufs_mtk_probe(struct platform_device *pdev)
 	}
 	/* supplier is not probed */
 	if (link->status == DL_STATE_DORMANT) {
+		if (IS_ENABLED(CONFIG_SECURITY_SELINUX_ROTHKO_DIAGNOSTIC) &&
+		    system_state < SYSTEM_RUNNING)
+			dev_info(dev, "rothko UFS: reset supplier %pOF not ready\n",
+				 reset_node);
 		err = -EPROBE_DEFER;
 		goto out;
 	}
