@@ -30,6 +30,7 @@
  * @rndis_interf_group: ConfigFS group for RNDIS interface.
  * @rndis_os_desc: USB OS descriptor for RNDIS.
  * @rndis_ext_compat_id: Extended compatibility ID.
+ * @mtk_rndis: Use MediaTek Android network naming and descriptors.
  * @class: USB class.
  * @subclass: USB subclass.
  * @protocol: USB protocol.
@@ -49,6 +50,7 @@ struct f_rndis_opts {
 	struct usb_os_desc		rndis_os_desc;
 	char				rndis_ext_compat_id[16];
 
+	bool				mtk_rndis;
 	u8				class;
 	u8				subclass;
 	u8				protocol;

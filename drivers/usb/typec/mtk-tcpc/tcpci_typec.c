@@ -229,7 +229,7 @@ static const char *const typec_attach_names[] = {
 };
 #endif /* TYPEC_INFO_ENABLE || TYPEC_DBG_ENABLE */
 
-static int typec_alert_attach_state_change(struct tcpc_device *tcpc)
+static int typec_report_attach_change(struct tcpc_device *tcpc, bool vbus_invalid)
 {
 	int ret = 0;
 
@@ -243,10 +243,15 @@ static int typec_alert_attach_state_change(struct tcpc_device *tcpc)
 		   typec_attach_names[tcpc->typec_attach_new]);
 
 	/* Report function */
-	ret = tcpci_report_usb_port_changed(tcpc);
+	ret = tcpci_report_usb_port_changed(tcpc, vbus_invalid);
 
 	tcpc->typec_attach_old = tcpc->typec_attach_new;
 	return ret;
+}
+
+static int typec_alert_attach_state_change(struct tcpc_device *tcpc)
+{
+	return typec_report_attach_change(tcpc, false);
 }
 
 static inline void typec_enable_low_power_mode(struct tcpc_device *tcpc)
@@ -1576,7 +1581,7 @@ int tcpc_typec_handle_timeout(struct tcpc_device *tcpc, uint32_t timer_id)
 #if CONFIG_WATER_DETECTION
 	case TYPEC_RT_TIMER_WD_IN_KPOC:
 		if (tcpc->wd_in_kpoc) {
-			tcpci_report_usb_port_detached(tcpc);
+			tcpci_report_usb_port_detached(tcpc, false);
 			ret = tcpci_set_water_protection(tcpc, true);
 		}
 		break;
@@ -1621,6 +1626,8 @@ static inline int typec_handle_vbus_present(struct tcpc_device *tcpc)
 
 static inline int typec_attached_snk_vbus_absent(struct tcpc_device *tcpc)
 {
+	bool vbus_invalid;
+
 #if IS_ENABLED(CONFIG_USB_POWER_DELIVERY)
 #if CONFIG_USB_PD_DIRECT_CHARGE
 #if IS_ENABLED(CONFIG_OPLUS_CANCEL_USB_SWITCH)
@@ -1650,8 +1657,14 @@ static inline int typec_attached_snk_vbus_absent(struct tcpc_device *tcpc)
 		return 0;
 	}
 #endif /* CONFIG_USB_POWER_DELIVERY */
+
+	/* The cause is reported separately; this still detaches normally. */
+	vbus_invalid = tcpc->typec_state == typec_attached_snk &&
+		       tcpc->vbus_level == TCPC_VBUS_INVALID &&
+		       typec_get_cc_res() >= TYPEC_CC_VOLT_SNK_DFT &&
+		       typec_get_cc_res() <= TYPEC_CC_VOLT_SNK_3_0;
 	typec_unattach_wait_pe_idle_entry(tcpc);
-	typec_alert_attach_state_change(tcpc);
+	typec_report_attach_change(tcpc, vbus_invalid);
 
 	return 0;
 }

@@ -1586,12 +1586,21 @@ void ffa_device_match_uuid(struct ffa_device *ffa_dev, const uuid_t *uuid)
 	struct ffa_partition_info *pbuf, *tpbuf;
 
 	count = ffa_partition_probe(uuid, &pbuf);
-	if (count <= 0)
+	if (count <= 0) {
+		if (IS_ENABLED(CONFIG_ROTHKO_NOGZ_HCRX_TEST))
+			pr_info_ratelimited("NoGZ UUID %pUb discovery returned %d\n",
+					    uuid, count);
 		return;
+	}
 
-	for (idx = 0, tpbuf = pbuf; idx < count; idx++, tpbuf++)
-		if (tpbuf->id == ffa_dev->vm_id)
+	for (idx = 0, tpbuf = pbuf; idx < count; idx++, tpbuf++) {
+		if (tpbuf->id == ffa_dev->vm_id) {
 			uuid_copy(&ffa_dev->uuid, uuid);
+			if (IS_ENABLED(CONFIG_ROTHKO_NOGZ_HCRX_TEST))
+				pr_info("NoGZ UUID %pUb matched partition %#x\n",
+					uuid, ffa_dev->vm_id);
+		}
+	}
 	kfree(pbuf);
 }
 
@@ -2115,8 +2124,13 @@ static int __init ffa_init(void)
 	ffa_notifications_setup();
 
 	ret = ffa_setup_partitions();
-	if (!ret)
-		return ret;
+	if (!ret) {
+		if (IS_ENABLED(CONFIG_ROTHKO_NOGZ_HCRX_TEST))
+			pr_info("NoGZ FF-A %u.%u: RX/TX mapped and partitions discovered\n",
+				FFA_MAJOR_VERSION(drv_info->version),
+				FFA_MINOR_VERSION(drv_info->version));
+		return 0;
+	}
 
 	pr_err("failed to setup partitions\n");
 	ffa_notifications_cleanup();
@@ -2129,7 +2143,12 @@ free_drv_info:
 	kfree(drv_info);
 	return ret;
 }
+#ifdef CONFIG_ROTHKO_NOGZ_HCRX_TEST
+/* Built-in KVM installs the EL2 FF-A proxy before device discovery. */
+device_initcall(ffa_init);
+#else
 rootfs_initcall(ffa_init);
+#endif
 
 static void __exit ffa_exit(void)
 {

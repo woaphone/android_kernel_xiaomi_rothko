@@ -498,6 +498,20 @@ int pd_dpm_update_tcp_request(struct pd_port *pd_port,
 
 	memset(&req_info, 0, sizeof(struct dpm_rdo_info_t));
 
+	if (READ_ONCE(pd_port->board_pps_owned) != pd_req->scoped_pps)
+		return TCP_DPM_RET_DENIED_INVALID_REQUEST;
+
+	if (pd_req->scoped_pps) {
+#if CONFIG_USB_PD_REV30_PPS_SINK
+		if (pd_port->attach_gen != pd_req->attach_gen ||
+		    !pd_port->pe_data.explicit_contract)
+			return TCP_DPM_RET_DENIED_INVALID_REQUEST;
+		policy = DPM_CHARGING_POLICY_PPS;
+#else
+		return TCP_DPM_RET_DENIED_INVALID_REQUEST;
+#endif
+	}
+
 	DPM_INFO("Policy=0x%X\n", policy);
 
 #if CONFIG_USB_PD_REV30_PPS_SINK
@@ -525,12 +539,41 @@ int pd_dpm_update_tcp_request(struct pd_port *pd_port,
 
 #if CONFIG_USB_PD_REV30_PPS_SINK
 	if ((policy & DPM_CHARGING_POLICY_MASK) >= DPM_CHARGING_POLICY_PPS) {
+		if (pd_req->scoped_pps)
+			pd_port->dpm_charging_policy = policy;
 		pd_port->request_v_apdo = sink.vmin;
 		pd_port->request_i_apdo = sink.ma;
 	}
 #endif	/* CONFIG_USB_PD_REV30_PPS_SINK */
 
 	dpm_update_request(pd_port, &req_info);
+	return TCP_DPM_RET_SUCCESS;
+}
+
+/* Build a single fixed 5 V request, not a reevaluation of default policy. */
+int pd_dpm_exit_pps(struct pd_port *pd_port, u32 attach_gen, int ma)
+{
+	struct pd_port_power_caps *caps = &pd_port->pe_data.remote_src_cap;
+	struct dpm_rdo_info_t req = { };
+	struct dpm_pdo_info_t src;
+
+	if (pd_port->attach_gen != attach_gen || !pd_port->pe_data.explicit_contract ||
+	    !caps->nr)
+		return TCP_DPM_RET_DENIED_INVALID_REQUEST;
+
+	/* A PD source's first PDO must be fixed vSafe5V. */
+	dpm_extract_pdo_info(caps->pdos[0], &src);
+	if (src.type != DPM_PDO_TYPE_FIXED || src.vmin != TCPC_VBUS_SINK_5V ||
+	    src.vmax != TCPC_VBUS_SINK_5V || src.ma < 10 || ma < 10)
+		return TCP_DPM_RET_DENIED_INVALID_REQUEST;
+
+	req.pos = 1;
+	req.type = DPM_PDO_TYPE_FIXED;
+	req.vmin = req.vmax = TCPC_VBUS_SINK_5V;
+	req.max_ma = req.oper_ma = min(ma, src.ma) / 10 * 10;
+	/* Keep automatic reevaluation at 5 V until the next policy change. */
+	pd_port->dpm_charging_policy = DPM_CHARGING_POLICY_VSAFE5V;
+	dpm_update_request(pd_port, &req);
 	return TCP_DPM_RET_SUCCESS;
 }
 
@@ -542,7 +585,7 @@ int pd_dpm_update_tcp_request_ex(struct pd_port *pd_port,
 	struct pd_port_power_caps *src_cap = &pd_port->pe_data.remote_src_cap;
 	struct tcpc_device __maybe_unused *tcpc = pd_port->tcpc;
 
-	if (pd_req->pos > src_cap->nr)
+	if (READ_ONCE(pd_port->board_pps_owned) || pd_req->pos > src_cap->nr)
 		return TCP_DPM_RET_DENIED_INVALID_REQUEST;
 
 	dpm_extract_pdo_info(src_cap->pdos[pd_req->pos-1], &source);
@@ -675,13 +718,13 @@ void pd_dpm_snk_standby_power(struct pd_port *pd_port)
 	} else if (pd_port->request_i == -1 ||
 		   pd_port->request_i_new < pd_port->request_i) {
 		/* Case6 Decreasing the Current, t1 i = new */
-		ma = standby_curr;
+		ma = pd_port->request_i_new;
 		type = TCP_VBUS_CTRL_STANDBY;
 	}
 
 	if (ma >= 0) {
 		tcpci_sink_vbus(
-			pd_port->tcpc, type, pd_port->request_v_new, 0);
+			pd_port->tcpc, type, pd_port->request_v_new, ma);
 	}
 #else
 #if CONFIG_USB_PD_SNK_GOTOMIN
@@ -696,6 +739,10 @@ void pd_dpm_snk_transition_power(struct pd_port *pd_port)
 	tcpci_sink_vbus(pd_port->tcpc, TCP_VBUS_CTRL_REQUEST,
 		pd_port->request_v_new, pd_port->request_i_new);
 
+	if (pd_port->pending_snk_cap) {
+		pd_port->pe_data.selected_cap = pd_port->pending_snk_cap;
+		pd_port->pending_snk_cap = 0;
+	}
 	pd_port->request_v = pd_port->request_v_new;
 	pd_port->request_i = pd_port->request_i_new;
 

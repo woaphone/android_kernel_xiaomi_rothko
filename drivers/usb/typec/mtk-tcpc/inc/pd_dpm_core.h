@@ -36,6 +36,7 @@ int pd_dpm_update_tcp_request_ex(struct pd_port *pd_port,
 	struct tcp_dpm_pd_request_ex *pd_req);
 
 int pd_dpm_update_tcp_request_again(struct pd_port *pd_port);
+int pd_dpm_exit_pps(struct pd_port *pd_port, u32 attach_gen, int ma);
 
 void pd_dpm_snk_evaluate_caps(struct pd_port *pd_port);
 void pd_dpm_snk_standby_power(struct pd_port *pd_port);

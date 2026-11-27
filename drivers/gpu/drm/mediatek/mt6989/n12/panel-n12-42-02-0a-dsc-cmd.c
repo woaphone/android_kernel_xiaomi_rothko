@@ -12,6 +12,7 @@
 #include <video/mipi_display.h>
 #include "../mediatek_v2/mtk_panel_ext.h"
 #include "../mediatek_v2/mtk_dsi.h"
+#include "../mediatek_v2/rothko_fod.h"
 #include "n12_42-stock-core.h"
 #include "n12_42-stock-dsc.h"
 #include "vis_display.h"
@@ -19,6 +20,10 @@
 static char build_id[16];
 module_param_string(build_id, build_id, sizeof(build_id), 0600);
 MODULE_PARM_DESC(build_id, "Panel revision supplied by LK, hexadecimal");
+
+/* N12-42 LK supplies 21 four-hex-digit calibration fields. */
+static char oled_lhbm[90];
+module_param_string(oled_lhbm, oled_lhbm, sizeof(oled_lhbm), 0);
 
 /* This driver is built in. Keep the separate 0b LK parameter namespace. */
 static char n12_36_build_id[16] = "03";
@@ -55,57 +60,57 @@ ATTRIBUTE_GROUPS(n12_42_info);
 
 static int n12_42_register_panel_info(struct n12_42 *ctx)
 {
-	struct class *display_class;
 	struct device *parent, *panel_dev;
-	int ret;
 
-	display_class = class_create("mi_display");
-	if (IS_ERR(display_class))
-		return PTR_ERR(display_class);
-
-	/* Match the stock sysfs hierarchy used by DisplayFeature HAL. */
-	parent = device_create(display_class, NULL, 0, NULL, "disp_feature");
-	if (IS_ERR(parent)) {
-		ret = PTR_ERR(parent);
-		goto destroy_class;
-	}
-	panel_dev = device_create_with_groups(display_class, parent, 0, ctx,
+	/* The real character device also parents the stock panel_info node. */
+	parent = rothko_fod_device_create();
+	if (IS_ERR(parent))
+		return PTR_ERR(parent);
+	panel_dev = device_create_with_groups(parent->class, parent, 0, ctx,
 					      n12_42_info_groups, "disp-DSI-0");
 	if (IS_ERR(panel_dev)) {
-		ret = PTR_ERR(panel_dev);
-		goto unregister_parent;
+		rothko_fod_device_destroy(parent);
+		return PTR_ERR(panel_dev);
 	}
 	ctx->panel_info_dev = panel_dev;
 	return 0;
-
-unregister_parent:
-	device_unregister(parent);
-destroy_class:
-	class_destroy(display_class);
-	return ret;
 }
 
 static void n12_42_unregister_panel_info(struct n12_42 *ctx)
 {
 	struct device *parent = ctx->panel_info_dev->parent;
-	const struct class *display_class = parent->class;
 
 	device_unregister(ctx->panel_info_dev);
-	device_unregister(parent);
-	class_destroy(display_class);
+	rothko_fod_device_destroy(parent);
 }
+
+#ifdef CONFIG_DRM_ROTHKO_N12_HIGH_REFRESH_TEST
+/* Same porches as the stock 144 Hz mode; DRM pixel clock is in kHz. */
+#define N12_HIGH_REFRESH_MODE(fps) { \
+	.clock = (1386 * 2786 * (fps) + 500) / 1000, \
+	.hdisplay = 1220, .hsync_start = 1380, .hsync_end = 1382, \
+	.htotal = 1386, \
+	.vdisplay = 2712, .vsync_start = 2766, .vsync_end = 2776, \
+	.vtotal = 2786, \
+}
+static const struct drm_display_mode n12_mode_165 = N12_HIGH_REFRESH_MODE(165);
+static const struct drm_display_mode n12_mode_185 = N12_HIGH_REFRESH_MODE(185);
+#endif
 
 static const struct drm_display_mode * const n12_42_modes[] = {
 	&n12_42_default_mode, &n12_42_middle_mode,
 	&n12_42_performence_mode, &n12_42_performence_mode_144,
+#ifdef CONFIG_DRM_ROTHKO_N12_HIGH_REFRESH_TEST
+	&n12_mode_165, &n12_mode_185,
+#endif
 };
 
 /* Stock consumer: ESD +0xa48, colour +0xa94, dimensions +0xad8/adc,
  * output +0xcc8, DBI +0xee92, TE +0x102fc, brightness delay +0x10304.
  * Pointer-bearing DSC PPS is rebuilt for the current consumer, not copied raw.
  */
-#define N12_42_PARAMS(te_us, bl_delay_us) { \
-	.pll_clk = 560, .data_rate = 1120, \
+#define N12_42_PARAMS(te_us, bl_delay_us, pll_mhz) { \
+	.pll_clk = (pll_mhz), .data_rate = 2 * (pll_mhz), \
 	.lcm_esd_check_table = { { .cmd = 0x0a, .count = 1, .para_list = { 0x1c } } }, \
 	.lcm_color_mode = 9, \
 	.physical_width_um = 69540, .physical_height_um = 154584, \
@@ -114,8 +119,12 @@ static const struct drm_display_mode * const n12_42_modes[] = {
 	.SilkyBrightnessDelay = (bl_delay_us), \
 }
 static struct mtk_panel_params n12_42_params[] = {
-	N12_42_PARAMS(16666, 3000), N12_42_PARAMS(11111, 0),
-	N12_42_PARAMS(8333, 0), N12_42_PARAMS(6944, 0),
+	N12_42_PARAMS(16666, 3000, 560), N12_42_PARAMS(11111, 0, 560),
+	N12_42_PARAMS(8333, 0, 560), N12_42_PARAMS(6944, 0, 560),
+#ifdef CONFIG_DRM_ROTHKO_N12_HIGH_REFRESH_TEST
+	/* Scale the stock link rate by fps, rounding PLL MHz up. */
+	N12_42_PARAMS(6061, 0, 642), N12_42_PARAMS(5405, 0, 720),
+#endif
 };
 
 static struct n12_42 *n12_42_from_panel(struct drm_panel *panel)
@@ -144,6 +153,10 @@ static int n12_42_param_index(struct drm_display_mode *mode)
 	case 90: return 1;
 	case 120: return 2;
 	case 144: return 3;
+#ifdef CONFIG_DRM_ROTHKO_N12_HIGH_REFRESH_TEST
+	case 165: return 4;
+	case 185: return 5;
+#endif
 	default: return -EINVAL;
 	}
 }
@@ -173,6 +186,42 @@ static int n12_42_ext_param_set(struct drm_panel *panel,
 	return 0;
 }
 
+static bool n12_42_vis_test_fps(unsigned int fps)
+{
+	return n12_ddic_refresh(fps) != fps;
+}
+
+static void n12_42_vis_sync_mode(struct n12_42 *ctx, unsigned int fps,
+				const struct mtk_panel_params *params)
+{
+	struct mtk_dsi *dsi = container_of(ctx->dsi->host, struct mtk_dsi, host);
+
+	/* ext_param_set selects the destination before the host changes rate. */
+	if (ctx->prepared && !ctx->error && dsi->data_rate == params->data_rate)
+		n12_vis_mode_notify(fps, dsi->data_rate * 1000000U);
+}
+
+static void n12_42_vis_restore(struct n12_42 *ctx, bool preparing)
+{
+	const struct mtk_panel_params *params;
+	unsigned int fps;
+
+	if (!is_mi_dev_support_nova())
+		return;
+
+	params = find_panel_ext(&ctx->panel)->params;
+	if (IS_ENABLED(CONFIG_DRM_ROTHKO_N12_HIGH_REFRESH_TEST)) {
+		/* The mode and parameter arrays use the same refresh order. */
+		fps = drm_mode_vrefresh(n12_42_modes[params - n12_42_params]);
+		if (n12_42_vis_test_fps(fps) || n12_42_vis_test_fps(ctx->refresh_rate)) {
+			n12_42_vis_sync_mode(ctx, fps, params);
+			return;
+		}
+	}
+	if (preparing)
+		vis_dsi_rate_notify(params->data_rate * 1000000U);
+}
+
 static int n12_42_unprepare(struct drm_panel *panel)
 {
 	struct n12_42 *ctx = n12_42_from_panel(panel);
@@ -182,6 +231,7 @@ static int n12_42_unprepare(struct drm_panel *panel)
 	n12_42_sleep_in(ctx);
 	ctx->doze_active = false;
 	ctx->doze_suspended = false;
+	ctx->doze_backlight_blocked = false;
 	ctx->peak_hdr = false;
 	return 0;
 }
@@ -225,8 +275,7 @@ static int n12_42_prepare(struct drm_panel *panel)
 	ctx->gir_status = 1;
 	ctx->peak_hdr = false;
 	mtk_panel_tch_rst(panel);
-	if (is_mi_dev_support_nova())
-		vis_dsi_rate_notify(find_panel_ext(panel)->params->data_rate * 1000000U);
+	n12_42_vis_restore(ctx, true);
 	return ret;
 }
 
@@ -313,6 +362,7 @@ static int n12_42_mode_switch(struct drm_panel *panel,
 {
 	struct n12_42 *ctx = n12_42_from_panel(panel);
 	struct drm_display_mode *dst;
+	unsigned int old_fps = ctx->refresh_rate;
 	unsigned int fps;
 	int i;
 
@@ -328,8 +378,20 @@ static int n12_42_mode_switch(struct drm_panel *panel,
 		n12_42_set_refresh(ctx, fps);
 		ctx->refresh_rate = fps;
 	}
-	if (is_mi_dev_support_nova())
-		vis_fps_notify(fps);
+	if (!is_mi_dev_support_nova())
+		return ctx->error;
+
+	if (IS_ENABLED(CONFIG_DRM_ROTHKO_N12_HIGH_REFRESH_TEST)) {
+		struct drm_display_mode *src = n12_42_mode_by_id(connector, cur_mode);
+
+		if (n12_42_vis_test_fps(fps) || n12_42_vis_test_fps(old_fps) ||
+		    (src && n12_42_vis_test_fps(drm_mode_vrefresh(src)))) {
+			if (stage == AFTER_DSI_POWERON)
+				n12_42_vis_sync_mode(ctx, fps, &n12_42_params[i]);
+			return ctx->error;
+		}
+	}
+	vis_fps_notify(fps);
 	return ctx->error;
 }
 
@@ -412,7 +474,7 @@ static int n12_42_set_backlight(void *dsi_drv, dcs_write_gce cb,
 	ctx = n12_42_from_panel(dsi->panel);
 	if (level)
 		ctx->last_backlight = level;
-	if (ctx->doze_active)
+	if (ctx->doze_backlight_blocked)
 		return 0;
 	/* Stock peak HDR enters at 15604..16383 and exits at <=15603. */
 	peak_hdr = ctx->peak_hdr;
@@ -428,11 +490,108 @@ static int n12_42_set_backlight(void *dsi_drv, dcs_write_gce cb,
 	return 0;
 }
 
+/* MI Display uses level 0 to release the normal DBV gate, not to exit AOD. */
+enum n12_doze_brightness {
+	N12_DOZE_NORMAL,
+	N12_DOZE_HBM,
+	N12_DOZE_LBM,
+};
+
+/* The 0A and 0B stock modules have different 6-byte AOD DBV payloads. */
+static const struct mi_ddic_cmd n12_doze_brightness_table[2][2] = {
+	{
+		{ 0x51, 6, { 0x04, 0x00, 0x04, 0x00, 0x3f, 0xff } },
+		{ 0x51, 6, { 0x00, 0x3d, 0x00, 0x3d, 0x05, 0x55 } },
+	}, {
+		{ 0x51, 6, { 0x04, 0x00, 0x04, 0x00, 0x0f, 0xff } },
+		{ 0x51, 6, { 0x00, 0x3d, 0x00, 0x3d, 0x07, 0xfc } },
+	},
+};
+
+static const struct mi_ddic_cmd *n12_doze_dbv(struct n12_42 *ctx, unsigned int level)
+{
+	return &n12_doze_brightness_table[ctx->variant_36][level != N12_DOZE_HBM];
+}
+
+static void n12_doze_write_dbv(struct n12_42 *ctx, void *dsi_drv,
+			       dcs_write_gce cb, void *handle)
+{
+	const struct mi_ddic_cmd *entry = n12_doze_dbv(ctx, ctx->doze_brightness);
+	u8 command[7] = { 0x51 };
+
+	memcpy(command + 1, entry->para_list, entry->count);
+	cb(dsi_drv, handle, command, sizeof(command));
+}
+
+static int n12_set_doze_brightness(struct drm_panel *panel, unsigned int level)
+{
+	struct n12_42 *ctx = n12_42_from_panel(panel);
+	struct mtk_dsi *dsi = container_of(ctx->dsi->host, struct mtk_dsi, host);
+	int ret;
+
+	if (level > N12_DOZE_LBM)
+		return -EINVAL;
+	if (level == N12_DOZE_NORMAL) {
+		ctx->doze_backlight_blocked = false;
+	} else if (ctx->doze_active && level != ctx->doze_brightness) {
+		if (!dsi->output_en)
+			return -EAGAIN;
+		ret = mi_disp_panel_ddic_send_cmd(n12_doze_dbv(ctx, level), 1,
+						 MI_DDIC_BLOCKING | MI_DDIC_SKIP_LOCK);
+		if (ret)
+			return ret;
+	}
+	/* Before DOZE_ACTIVE, keep the requested mode for the entry callback. */
+	ctx->doze_brightness = level;
+	return 0;
+}
+
+static int n12_get_doze_brightness(struct drm_panel *panel, unsigned int *level)
+{
+	*level = n12_42_from_panel(panel)->doze_brightness;
+	return 0;
+}
+
 static int n12_doze_enable(struct drm_panel *panel, void *dsi_drv,
 			   dcs_write_gce cb, void *handle)
 {
-	n12_42_from_panel(panel)->doze_active = true;
+	struct n12_42 *ctx = n12_42_from_panel(panel);
+
+	if (!cb)
+		return -EINVAL;
+	/* Use the caller's command path; do not flush a second CMDQ packet. */
+	if (ctx->lhbm_active) {
+		u8 restore[] = { 0x51, ctx->last_backlight >> 8, ctx->last_backlight };
+		static const u8 alpha_off[] = { 0x87, 0x24 };
+		static const u8 spot_off[] = { 0x8b, 0x00 };
+
+		cb(dsi_drv, handle, restore, sizeof(restore));
+		cb(dsi_drv, handle, alpha_off, sizeof(alpha_off));
+		cb(dsi_drv, handle, spot_off, sizeof(spot_off));
+		/* Keep the state until a synchronous OFF or full panel reset. */
+	}
+	ctx->doze_active = true;
+	ctx->doze_backlight_blocked = true;
+	if (ctx->doze_brightness != N12_DOZE_NORMAL)
+		n12_doze_write_dbv(ctx, dsi_drv, cb, handle);
 	return 0;
+}
+
+/* The display transition owns the packet; never start another here. */
+static void n12_doze_stop_lhbm(struct n12_42 *ctx, void *dsi_drv,
+			      dcs_write_gce cb, void *handle)
+{
+	unsigned int dbv = ctx->last_backlight;
+	u8 restore[] = { 0x51, dbv >> 8, dbv };
+	static const u8 alpha_off[] = { 0x87, 0x24 };
+	static const u8 spot_off[] = { 0x8b, 0x00 };
+
+	if (!ctx->lhbm_active || !ctx->doze_active)
+		return;
+	cb(dsi_drv, handle, restore, sizeof(restore));
+	cb(dsi_drv, handle, alpha_off, sizeof(alpha_off));
+	cb(dsi_drv, handle, spot_off, sizeof(spot_off));
+	ctx->lhbm_active = false;
 }
 
 static int n12_doze_disable(struct drm_panel *panel, void *dsi_drv,
@@ -444,8 +603,9 @@ static int n12_doze_disable(struct drm_panel *panel, void *dsi_drv,
 	static const u8 te[] = { 0x6d, 0x00 };
 	u8 rate[] = { 0x2f, 0x00 };
 
+	n12_doze_stop_lhbm(ctx, dsi_drv, cb, handle);
 	cb(dsi_drv, handle, normal, sizeof(normal));
-	switch (ctx->refresh_rate) {
+	switch (n12_ddic_refresh(ctx->refresh_rate)) {
 	case 60:
 		rate[1] = 0x30;
 		if (!ctx->variant_36)
@@ -466,10 +626,13 @@ static int n12_doze_disable(struct drm_panel *panel, void *dsi_drv,
 	cb(dsi_drv, handle, rate, sizeof(rate));
 	if (ctx->refresh_rate == 60 && !ctx->variant_36)
 		cb(dsi_drv, handle, te, sizeof(te));
+	if (IS_ENABLED(CONFIG_DRM_ROTHKO_N12_HIGH_REFRESH_TEST))
+		n12_42_vis_restore(ctx, false);
 
 reset_doze:
 	ctx->doze_suspended = false;
 	ctx->doze_active = false;
+	ctx->doze_backlight_blocked = false;
 	return 0;
 }
 
@@ -480,20 +643,19 @@ static int n12_doze_suspend(struct drm_panel *panel, void *dsi_drv,
 	static const u8 idle[] = { 0x39, 0x00 };
 	static const u8 rate_42[] = { 0x2f, 0x00 };
 	static const u8 rate_36[] = { 0x2f, 0x01 };
-	static const u8 brightness_42[] = { 0x51, 0x00, 0x3d, 0x00, 0x3d, 0x05, 0x55 };
-	static const u8 brightness_36[] = { 0x51, 0x00, 0x3d, 0x00, 0x3d, 0x07, 0xfc };
 
 	if (ctx->doze_suspended)
 		return 0;
 
+	n12_doze_stop_lhbm(ctx, dsi_drv, cb, handle);
 	if (ctx->variant_36) {
 		cb(dsi_drv, handle, rate_36, sizeof(rate_36));
-		cb(dsi_drv, handle, brightness_36, sizeof(brightness_36));
+		n12_doze_write_dbv(ctx, dsi_drv, cb, handle);
 		cb(dsi_drv, handle, idle, sizeof(idle));
 	} else {
 		cb(dsi_drv, handle, rate_42, sizeof(rate_42));
 		cb(dsi_drv, handle, idle, sizeof(idle));
-		cb(dsi_drv, handle, brightness_42, sizeof(brightness_42));
+		n12_doze_write_dbv(ctx, dsi_drv, cb, handle);
 	}
 	ctx->doze_suspended = true;
 	return 0;
@@ -504,6 +666,172 @@ static const struct drm_panel_funcs n12_42_panel_funcs = {
 	.enable = n12_42_enable, .disable = n12_42_disable,
 	.get_modes = n12_42_get_modes,
 };
+/* The stock N12-42 white-point transform uses these LK field indices. */
+static int n12_42_lhbm_white(unsigned int dbv, bool low_white, u8 *rgb)
+{
+	static const u16 middle_end[] = {
+		3101, 3610, 4119, 4628, 5646, 6155, 7173, 8190, 9828, 11467,
+	};
+	static const u16 normal_gain[][3] = {
+		{ 4000, 4072, 4020 }, { 3984, 4060, 4020 },
+		{ 3980, 4048, 4012 }, { 3972, 4040, 4000 },
+		{ 3960, 4024, 3992 }, { 3960, 4012, 3992 },
+		{ 3960, 4000, 3980 }, { 3952, 3992, 3968 },
+		{ 3940, 3992, 3960 }, { 3940, 3984, 3960 },
+	};
+	static const u16 white_gain[][3] = {
+		{ 3920, 3920, 3920 }, { 3924, 3940, 3928 },
+		{ 4128, 4120, 4132 },
+	};
+	static const u16 normal_low_gain[] = { 4000, 4100, 4040 };
+	static const u16 normal_high_gain[] = { 4124, 4120, 4168 };
+	const u16 *gain;
+	u8 calibration[42];
+	unsigned int band, first, i;
+
+	if (strlen(oled_lhbm) != 2 * sizeof(calibration) ||
+	    hex2bin(calibration, oled_lhbm, sizeof(calibration)))
+		return -ENODATA;
+
+	if (dbv < 1309) {
+		first = low_white ? 3 : 12;
+		gain = low_white ? white_gain[1] : normal_low_gain;
+	} else if (dbv <= 11467) {
+		for (band = 0; dbv > middle_end[band]; band++)
+			continue;
+		first = low_white ? 0 : 9;
+		gain = low_white ? white_gain[0] : normal_gain[band];
+	} else {
+		first = low_white ? 6 : 15;
+		gain = low_white ? white_gain[2] : normal_high_gain;
+	}
+
+	for (i = 0; i < 3; i++) {
+		u16 value = get_unaligned_be16(calibration + 2 * (first + i));
+
+		put_unaligned_be16(value * gain[i] / 1000, rgb + 2 * i);
+	}
+	return 0;
+}
+
+/* Primary CRTC lock is held by the caller; wait for the DDIC batch. */
+static int n12_42_send_lhbm(const struct mi_ddic_cmd *table, unsigned int count)
+{
+	return mi_disp_panel_ddic_send_cmd(table, count, MI_DDIC_BLOCKING |
+					  MI_DDIC_USE_LPM | MI_DDIC_SKIP_LOCK);
+}
+
+static int n12_42_lhbm_off_locked(struct n12_42 *ctx, unsigned int dbv)
+{
+	struct mi_ddic_cmd table[ARRAY_SIZE(n12_42_lhbm_off)];
+	int ret;
+
+	memcpy(table, n12_42_lhbm_off, sizeof(table));
+	put_unaligned_be16(dbv, table[0].para_list);
+	ret = n12_42_send_lhbm(table, ARRAY_SIZE(table));
+	if (!ret)
+		ctx->lhbm_active = false;
+	return ret;
+}
+
+static int n12_42_set_local_hbm(struct drm_panel *panel, unsigned int mode)
+{
+	struct n12_42 *ctx = n12_42_from_panel(panel);
+	const struct mi_ddic_cmd *template;
+	struct mi_ddic_cmd *table;
+	unsigned int count, dbv, i;
+	u16 alpha = 0;
+	u8 rgb[6];
+	bool hlpm = mode == 6 || mode == 7;
+	int ret;
+
+	if (ctx->variant_36 || ctx->build_id != 0x5b || get_hw_country_version())
+		return -EOPNOTSUPP;
+	if (!ctx->prepared || !ctx->enabled)
+		return -EHOSTDOWN;
+
+	switch (mode) {
+	case 0: /* OFF_TO_NORMAL */
+		if (ctx->doze_active)
+			return -EOPNOTSUPP;
+		if (!ctx->last_backlight)
+			return -EAGAIN;
+		return n12_42_lhbm_off_locked(ctx, ctx->last_backlight);
+	case 10: /* OFF_TO_NORMAL_BACKLIGHT */
+	case 11: /* OFF_TO_NORMAL_BACKLIGHT_RESTORE */
+		if (!ctx->doze_active)
+			return -EINVAL;
+		if (!ctx->lhbm_active)
+			return 0;
+		dbv = ctx->last_backlight;
+		if (mode == 10 && !dbv)
+			dbv = ctx->doze_brightness == N12_DOZE_HBM ? 1024 : 61;
+		return n12_42_lhbm_off_locked(ctx, dbv);
+	case 1: /* NORMAL_WHITE */
+	case 4: /* NORMAL_LOW_WHITE */
+	case 6: /* HLPM_WHITE */
+	case 7: /* HLPM_LOW_WHITE */
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	if (hlpm != ctx->doze_active || ctx->peak_hdr)
+		return -EOPNOTSUPP;
+	if (hlpm) {
+		if (ctx->doze_brightness != N12_DOZE_HBM &&
+		    ctx->doze_brightness != N12_DOZE_LBM)
+			return -EAGAIN;
+		dbv = ctx->doze_brightness == N12_DOZE_HBM ? 1024 : 61;
+	} else {
+		/* Every normal ON table starts with the 120 Hz DDIC setting. */
+		if (ctx->refresh_rate != 120)
+			return -EOPNOTSUPP;
+		if (!ctx->last_backlight)
+			return -EAGAIN;
+		dbv = clamp(ctx->last_backlight, 15U, 15603U);
+	}
+	/* At AOD DBV <=1024, HLPM white uses fields 3..5 and low white 12..14. */
+	ret = n12_42_lhbm_white(dbv, mode == 4 || mode == 6, rgb);
+	if (ret)
+		return ret;
+
+	if (hlpm) {
+		template = n12_42_lhbm_hlpm_80nit_2nit;
+		count = ARRAY_SIZE(n12_42_lhbm_hlpm_80nit_2nit);
+		alpha = n12_42_lhbm_alpha_low[dbv - 1];
+	} else if (dbv < 1309) {
+		template = n12_42_lhbm_normal_80nit_2nit;
+		count = ARRAY_SIZE(n12_42_lhbm_normal_80nit_2nit);
+		alpha = n12_42_lhbm_alpha_low[dbv - 1];
+	} else if (dbv <= 11467) {
+		template = n12_42_lhbm_normal_700nit_80nit;
+		count = ARRAY_SIZE(n12_42_lhbm_normal_700nit_80nit);
+	} else {
+		template = n12_42_lhbm_normal_1600nit_700nit;
+		count = ARRAY_SIZE(n12_42_lhbm_normal_1600nit_700nit);
+		alpha = n12_42_lhbm_alpha_high[dbv - 11468];
+	}
+
+	table = kmemdup_array(template, count, sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return -ENOMEM;
+	for (i = 0; i < count; i++) {
+		if (table[i].command == 0xd1)
+			memcpy(table[i].para_list, rgb, sizeof(rgb));
+		else if (table[i].command == 0x87 && alpha)
+			put_unaligned_be16(alpha, table[i].para_list + 1);
+	}
+	ctx->lhbm_active = true;
+	ret = n12_42_send_lhbm(table, count);
+	kfree(table);
+	if (hlpm)
+		ctx->doze_suspended = false;
+	if (ret)
+		n12_42_lhbm_off_locked(ctx, hlpm ? dbv : ctx->last_backlight);
+	return ret;
+}
+
 static struct mtk_panel_funcs n12_42_ext_funcs = {
 	.reset = n12_42_ext_reset,
 	.panel_poweron = n12_42_panel_poweron,
@@ -512,6 +840,9 @@ static struct mtk_panel_funcs n12_42_ext_funcs = {
 	.ext_param_get = n12_42_ext_param_get,
 	.mode_switch = n12_42_mode_switch,
 	.set_backlight_cmdq = n12_42_set_backlight,
+	.set_local_hbm = n12_42_set_local_hbm,
+	.set_doze_brightness = n12_set_doze_brightness,
+	.get_doze_brightness = n12_get_doze_brightness,
 	.doze_enable = n12_doze_enable,
 	.doze_disable = n12_doze_disable,
 	.doze_suspend = n12_doze_suspend,

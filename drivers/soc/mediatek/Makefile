@@ -14,3 +14,4 @@ obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
 obj-$(CONFIG_MTK_ROTHKO_SOCINFO) += mtk-rothko-socinfo.o
 obj-$(CONFIG_MTK_MBOX) += mtk-mbox.o
 obj-$(CONFIG_MTK_IPI) += mtk_tinysys_ipi.o
+obj-$(CONFIG_MTK_ROTHKO_MCUPM) += mtk-rothko-mcupm.o

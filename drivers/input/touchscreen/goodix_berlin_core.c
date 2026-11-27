@@ -31,6 +31,7 @@
 #include <linux/input/touchscreen.h>
 #include <linux/mutex.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/pm_wakeup.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
@@ -46,6 +47,8 @@
 
 #define GOODIX_BERLIN_TOUCH_EVENT		BIT(7)
 #define GOODIX_BERLIN_REQUEST_EVENT		BIT(6)
+#define GOODIX_BERLIN_GESTURE_EVENT		BIT(5)
+#define GOODIX_BERLIN_FOD_STATUS		BIT(3)
 #define GOODIX_BERLIN_TOUCH_COUNT_MASK		GENMASK(3, 0)
 #define GOODIX_BERLIN_PALM_STATUS		BIT(4)
 
@@ -68,11 +71,18 @@
 #define GOODIX_BERLIN_CMD_PALM			0x70
 #define GOODIX_BERLIN_CMD_HTC_SCAN		0x90
 #define GOODIX_BERLIN_CMD_REPORT_MODE		0x91
+#define GOODIX_BERLIN_CMD_GESTURE		0xa6
 #define GOODIX_BERLIN_CMD_REPORT_RATE		0xc1
 #define GOODIX_BERLIN_REPORT_DIRECT		0x81
 
 #define GOODIX_XIAOMI_CMD_SET_MODE		0
+#define GOODIX_XIAOMI_MODE_FOD_ENABLE		10
+#define GOODIX_XIAOMI_MODE_NONUI		17
+#define GOODIX_XIAOMI_NONUI_NO_GESTURE		2
 #define GOODIX_XIAOMI_MODE_REPORT_RATE		202
+#define GOODIX_XIAOMI_FOD_KEY			0x152
+#define GOODIX_BERLIN_GESTURE_FOD_DOWN		0x46
+#define GOODIX_BERLIN_GESTURE_FOD_UP		0x55
 #define GOODIX_BERLIN_CMD_GAME_ON		0x17
 #define GOODIX_BERLIN_CMD_GAME_OFF		0x18
 
@@ -177,6 +187,20 @@ struct goodix_berlin_event {
 		GOODIX_BERLIN_CHECKSUM_SIZE];
 };
 
+/* Rothko's gesture mailbox has an independent 8-byte checksummed header. */
+struct goodix_berlin_gesture {
+	u8 status;
+	u8 reserved1[3];
+	u8 type;
+	u8 reserved2;
+	__le16 checksum;
+	__le16 x;
+	__le16 y;
+	u8 area;
+	u8 reserved3[4];
+	u8 slot;
+} __packed;
+
 struct goodix_berlin_game {
 	u8 enabled;
 	u8 up;
@@ -207,8 +231,17 @@ struct goodix_berlin_core {
 	int irq;
 	u32 resolution_factor;
 	struct mutex cmd_lock;
-	bool suspended;
+	bool system_suspended;
+	bool powered_off;
+	bool panel_blank;
+	s32 nonui_mode;
+	bool gesture_armed;
+	bool gesture_irq_pending;
+	bool gesture_slot_active;
+	u8 gesture_slot;
 	bool palm_enabled;
+	bool fod_enabled;
+	bool fod_pressed;
 	bool report_rate_set;
 	u8 report_rate;
 	bool game_configured;
@@ -581,11 +614,12 @@ static int goodix_berlin_restore_reporting(struct goodix_berlin_core *cd)
 	return 0;
 }
 
-static void goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
+static bool goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
 {
 	struct goodix_berlin_touch *touch_data =
 			(struct goodix_berlin_touch *)cd->event.data;
 	struct goodix_berlin_touch *t;
+	bool has_contact = false;
 	int i;
 	u8 type, id;
 
@@ -614,11 +648,35 @@ static void goodix_berlin_report_state(struct goodix_berlin_core *cd, int n)
 				       true);
 		input_report_abs(cd->input_dev, ABS_MT_TOUCH_MAJOR,
 				 __le16_to_cpu(t->w));
+		has_contact = true;
 	}
 
 	input_mt_sync_frame(cd->input_dev);
-	input_sync(cd->input_dev);
+	return has_contact;
 }
+
+/* Serialize physical FOD edges, mode changes and power-down with cmd_lock. */
+static void goodix_berlin_set_fod_pressed(struct goodix_berlin_core *cd, bool pressed)
+{
+	if (cd->fod_pressed == pressed)
+		return;
+
+	cd->fod_pressed = pressed;
+	input_report_key(cd->input_dev, GOODIX_XIAOMI_FOD_KEY, pressed);
+	input_sync(cd->input_dev);
+	if (IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO))
+		xiaomi_touch_report_fod(cd->dev, pressed);
+}
+
+static bool goodix_berlin_wants_fod_gesture(struct goodix_berlin_core *cd)
+{
+	/* Stock maps Touch_Fod_Enable to Berlin bit 2, except in NonUI 2. */
+	return cd->panel_blank && cd->fod_enabled &&
+	       cd->nonui_mode != GOODIX_XIAOMI_NONUI_NO_GESTURE;
+}
+
+static int goodix_berlin_update_gesture(struct goodix_berlin_core *cd);
+static int goodix_berlin_panel_blank(void *data, bool blank);
 
 static int goodix_berlin_read_palm(void *data, u8 *palm)
 {
@@ -634,7 +692,7 @@ static int goodix_berlin_write_palm(void *data, bool enable)
 	int error;
 
 	mutex_lock(&cd->cmd_lock);
-	if (cd->suspended) {
+	if (cd->system_suspended || cd->powered_off || cd->gesture_armed) {
 		error = -EBUSY;
 	} else {
 		error = goodix_berlin_send_report_command(cd, GOODIX_BERLIN_CMD_PALM,
@@ -732,7 +790,20 @@ static int goodix_berlin_xiaomi_request(void *data,
 
 	rate = !!value;
 	mutex_lock(&cd->cmd_lock);
-	if (cd->suspended) {
+	if (request->mode == GOODIX_XIAOMI_MODE_FOD_ENABLE) {
+		if (value > 3) {
+			error = -EINVAL;
+		} else {
+			/* Stock accepts mode 3 for real FOD packets after resume. */
+			cd->fod_enabled = value != 0;
+			if (!cd->fod_enabled && !cd->gesture_slot_active)
+				goodix_berlin_set_fod_pressed(cd, false);
+			error = goodix_berlin_update_gesture(cd);
+		}
+	} else if (request->mode == GOODIX_XIAOMI_MODE_NONUI) {
+		cd->nonui_mode = value;
+		error = goodix_berlin_update_gesture(cd);
+	} else if (cd->system_suspended || cd->powered_off || cd->gesture_armed) {
 		error = -EBUSY;
 	} else if (request->mode != GOODIX_XIAOMI_MODE_REPORT_RATE) {
 		error = goodix_berlin_set_game(cd, request->mode, value);
@@ -753,21 +824,19 @@ static const struct xiaomi_touch_ops goodix_berlin_xiaomi_ops = {
 	.read_palm = goodix_berlin_read_palm,
 	.write_palm = goodix_berlin_write_palm,
 	.request = goodix_berlin_xiaomi_request,
+	.panel_blank = goodix_berlin_panel_blank,
+	.reports_fod = true,
 };
 
-static void goodix_berlin_report_palm(struct goodix_berlin_core *cd)
+static bool goodix_berlin_report_palm(struct goodix_berlin_core *cd)
 {
 	u8 palm = !!(cd->event.hdr.request_type & GOODIX_BERLIN_PALM_STATUS);
-	bool changed = false;
 
-	mutex_lock(&cd->cmd_lock);
-	if (cd->palm_enabled && cd->palm != palm) {
-		WRITE_ONCE(cd->palm, palm);
-		changed = true;
-	}
-	mutex_unlock(&cd->cmd_lock);
-	if (changed && IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO))
-		xiaomi_touch_notify_palm(cd->dev);
+	if (!cd->palm_enabled || cd->palm == palm)
+		return false;
+
+	WRITE_ONCE(cd->palm, palm);
+	return true;
 }
 
 static void goodix_berlin_restore_palm(struct goodix_berlin_core *cd)
@@ -781,8 +850,9 @@ static void goodix_berlin_restore_palm(struct goodix_berlin_core *cd)
 		dev_warn(cd->dev, "failed to restore palm reporting: %d\n", error);
 }
 
-static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
+static bool goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
 {
+	bool pressed, has_contact;
 	u8 touch_num;
 	int error;
 
@@ -790,14 +860,14 @@ static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
 			      cd->event.hdr.request_type);
 	if (touch_num > GOODIX_BERLIN_MAX_TOUCH) {
 		dev_warn(cd->dev, "invalid touch num %d\n", touch_num);
-		return;
+		return false;
 	}
 
 	if (touch_num > 2) {
 		/* read additional contact data if more than 2 touch events */
 		error = goodix_berlin_get_remaining_contacts(cd, touch_num);
 		if (error)
-			return;
+			return false;
 	}
 
 	if (touch_num) {
@@ -806,21 +876,31 @@ static void goodix_berlin_touch_handler(struct goodix_berlin_core *cd)
 		if (!goodix_berlin_checksum_valid(cd->event.data, len)) {
 			dev_err(cd->dev, "touch data checksum error: %*ph\n",
 				len, cd->event.data);
-			return;
+			return false;
 		}
 	}
 
-	goodix_berlin_report_state(cd, touch_num);
-	if (IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO) &&
-	    device_is_compatible(cd->dev, "xiaomi,touch-spi"))
-		goodix_berlin_report_palm(cd);
+	if (!device_is_compatible(cd->dev, "xiaomi,touch-spi")) {
+		goodix_berlin_report_state(cd, touch_num);
+		input_sync(cd->input_dev);
+		return false;
+	}
+
+	has_contact = goodix_berlin_report_state(cd, touch_num);
+	pressed = cd->fod_enabled && has_contact &&
+		  (cd->event.hdr.status & GOODIX_BERLIN_FOD_STATUS);
+	if (pressed != cd->fod_pressed)
+		goodix_berlin_set_fod_pressed(cd, pressed);
+	else
+		input_sync(cd->input_dev);
+	return goodix_berlin_report_palm(cd);
 }
 
 static int goodix_berlin_request_handle_reset(struct goodix_berlin_core *cd)
 {
 	int error;
 
-	mutex_lock(&cd->cmd_lock);
+	goodix_berlin_set_fod_pressed(cd, false);
 	gpiod_set_value_cansleep(cd->reset_gpio, 1);
 	usleep_range(2000, 2100);
 	gpiod_set_value_cansleep(cd->reset_gpio, 0);
@@ -830,14 +910,177 @@ static int goodix_berlin_request_handle_reset(struct goodix_berlin_core *cd)
 	error = goodix_berlin_restore_reporting(cd);
 	if (!error)
 		goodix_berlin_restore_palm(cd);
+	return error;
+}
+
+static void goodix_berlin_release_gesture_slot(struct goodix_berlin_core *cd)
+{
+	struct input_dev *input = cd->input_dev;
+
+	if (!cd->gesture_slot_active)
+		return;
+
+	cd->gesture_slot_active = false;
+	cd->fod_pressed = false;
+	input_report_key(input, GOODIX_XIAOMI_FOD_KEY, 0);
+	input_report_abs(input, ABS_MT_WIDTH_MAJOR, 0);
+	input_report_abs(input, ABS_MT_WIDTH_MINOR, 0);
+	input_sync(input);
+	input_mt_slot(input, cd->gesture_slot);
+	input_mt_report_slot_state(input, MT_TOOL_FINGER, false);
+	input_report_key(input, BTN_TOUCH, 0);
+	input_report_key(input, BTN_TOOL_FINGER, 0);
+	input_sync(input);
+	if (IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO))
+		xiaomi_touch_report_fod(cd->dev, false);
+}
+
+static int goodix_berlin_arm_fod(struct goodix_berlin_core *cd)
+{
+	/* Stock brl_gesture(gesture_type = BIT(2)), with other gestures off. */
+	return goodix_berlin_send_command(cd, GOODIX_BERLIN_CMD_GESTURE,
+					  6, 0xff, 0xdf);
+}
+
+static int goodix_berlin_update_gesture(struct goodix_berlin_core *cd)
+{
+	bool arm = goodix_berlin_wants_fod_gesture(cd);
+	int error;
+
+	if (cd->system_suspended || cd->powered_off || arm == cd->gesture_armed)
+		return 0;
+
+	if (arm) {
+		error = enable_irq_wake(cd->irq);
+		if (error)
+			return error;
+
+		error = goodix_berlin_arm_fod(cd);
+		if (error) {
+			disable_irq_wake(cd->irq);
+			/* The IC may have accepted the command without an ACK. */
+			goodix_berlin_request_handle_reset(cd);
+			return error;
+		}
+		input_mt_sync_frame(cd->input_dev);
+		if (cd->fod_pressed)
+			goodix_berlin_set_fod_pressed(cd, false);
+		else
+			input_sync(cd->input_dev);
+		WRITE_ONCE(cd->palm, 0);
+		cd->gesture_armed = true;
+		return 0;
+	}
+	/* Like stock, allow a real up to finish an outstanding blank press. */
+	if (cd->panel_blank && cd->gesture_slot_active)
+		return 0;
+
+	goodix_berlin_release_gesture_slot(cd);
+	disable_irq_wake(cd->irq);
+	cd->gesture_armed = false;
+	return goodix_berlin_request_handle_reset(cd);
+}
+
+static int goodix_berlin_panel_blank(void *data, bool blank)
+{
+	struct goodix_berlin_core *cd = data;
+	int error;
+
+	mutex_lock(&cd->cmd_lock);
+	cd->panel_blank = blank;
+	error = goodix_berlin_update_gesture(cd);
 	mutex_unlock(&cd->cmd_lock);
 	return error;
+}
+
+static void goodix_berlin_gesture_irq(struct goodix_berlin_core *cd)
+{
+	struct input_dev *input = cd->input_dev;
+	struct goodix_berlin_gesture event;
+	bool valid_header;
+	u32 x, y;
+	int error;
+
+	error = regmap_raw_read(cd->regmap, cd->touch_data_addr, &event, sizeof(event));
+	if (error)
+		goto rearm;
+
+	valid_header = goodix_berlin_checksum_valid((const u8 *)&event,
+						   GOODIX_BERLIN_HEADER_SIZE);
+	/* Stock also accepts status 0/type 0x55 with a bad sum, only for up. */
+	if (event.type == GOODIX_BERLIN_GESTURE_FOD_UP &&
+	    (valid_header ? event.status & GOODIX_BERLIN_GESTURE_EVENT : !event.status)) {
+		/* End only the reported contact, never an arbitrary firmware slot. */
+		if (cd->gesture_slot_active) {
+			goodix_berlin_release_gesture_slot(cd);
+			error = goodix_berlin_update_gesture(cd);
+			if (error)
+				dev_warn_ratelimited(cd->dev, "failed to leave FOD gesture: %d\n", error);
+		}
+		return;
+	}
+	if (!valid_header || !(event.status & GOODIX_BERLIN_GESTURE_EVENT) ||
+	    event.type != GOODIX_BERLIN_GESTURE_FOD_DOWN)
+		goto rearm;
+	if (!goodix_berlin_wants_fod_gesture(cd) || cd->gesture_slot_active)
+		return;
+
+	x = le16_to_cpu(event.x) * cd->resolution_factor;
+	y = le16_to_cpu(event.y) * cd->resolution_factor;
+	if (event.slot >= GOODIX_BERLIN_MAX_TOUCH ||
+	    x > cd->props.max_x || y > cd->props.max_y)
+		goto rearm;
+
+	/* Stock sends key/SYN, then the MT contact from the same packet. */
+	cd->gesture_slot_active = true;
+	cd->gesture_slot = event.slot;
+	cd->fod_pressed = true;
+	input_report_key(input, GOODIX_XIAOMI_FOD_KEY, 1);
+	input_sync(input);
+	input_mt_slot(input, event.slot);
+	input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
+	input_report_key(input, BTN_TOUCH, 1);
+	input_report_key(input, BTN_TOOL_FINGER, 1);
+	touchscreen_report_pos(input, &cd->props, x, y, true);
+	input_report_abs(input, ABS_MT_WIDTH_MAJOR, event.area);
+	input_report_abs(input, ABS_MT_WIDTH_MINOR, event.area);
+	input_sync(input);
+	if (IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO))
+		xiaomi_touch_report_fod(cd->dev, true);
+	return;
+
+rearm:
+	/* OEM Rothko direct-report mode rearms on rejected events, not valid edges. */
+	if (goodix_berlin_wants_fod_gesture(cd)) {
+		error = goodix_berlin_arm_fod(cd);
+		if (error)
+			dev_warn_ratelimited(cd->dev, "failed to rearm FOD gesture: %d\n", error);
+	}
 }
 
 static irqreturn_t goodix_berlin_irq(int irq, void *data)
 {
 	struct goodix_berlin_core *cd = data;
+	bool palm_changed = false;
 	int error;
+
+	mutex_lock(&cd->cmd_lock);
+	if (cd->powered_off)
+		goto out;
+	if (cd->system_suspended) {
+		/* System PM can deliver a wake IRQ before SPI is available. */
+		if (cd->gesture_armed) {
+			cd->gesture_irq_pending = true;
+			pm_wakeup_event(cd->dev, 0);
+		}
+		goto out;
+	}
+	if (cd->gesture_armed) {
+		pm_stay_awake(cd->dev);
+		goodix_berlin_gesture_irq(cd);
+		pm_relax(cd->dev);
+		goto out;
+	}
 
 	/*
 	 * First, read buffer with space for 2 touch events:
@@ -898,7 +1141,7 @@ static irqreturn_t goodix_berlin_irq(int irq, void *data)
 	}
 
 	if (cd->event.hdr.status & GOODIX_BERLIN_TOUCH_EVENT)
-		goodix_berlin_touch_handler(cd);
+		palm_changed = goodix_berlin_touch_handler(cd);
 
 	if (cd->event.hdr.status & GOODIX_BERLIN_REQUEST_EVENT) {
 		switch (cd->event.hdr.request_type) {
@@ -924,6 +1167,9 @@ out_clear:
 	regmap_write(cd->regmap, cd->touch_data_addr, 0);
 
 out:
+	mutex_unlock(&cd->cmd_lock);
+	if (palm_changed && IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO))
+		xiaomi_touch_notify_palm(cd->dev);
 	return IRQ_HANDLED;
 }
 
@@ -941,8 +1187,6 @@ static int goodix_berlin_input_dev_config(struct goodix_berlin_core *cd,
 	input_set_drvdata(input_dev, cd);
 
 	input_dev->name = "Goodix Berlin Capacitive TouchScreen";
-	if (device_is_compatible(cd->dev, "xiaomi,touch-spi"))
-		input_dev->name = "xiaomi_tpgoodix_ts";
 	input_dev->phys = "input/ts";
 
 	input_dev->id = *id;
@@ -957,6 +1201,12 @@ static int goodix_berlin_input_dev_config(struct goodix_berlin_core *cd,
 	if (device_is_compatible(cd->dev, "xiaomi,touch-spi")) {
 		u32 max_x, max_y;
 
+		/* The vendor FOD monitor looks up the stock evdev name. */
+		input_dev->name = "goodix_ts";
+		input_set_capability(input_dev, EV_KEY, GOODIX_XIAOMI_FOD_KEY);
+		input_set_capability(input_dev, EV_KEY, BTN_TOOL_FINGER);
+		input_set_abs_params(input_dev, ABS_MT_WIDTH_MAJOR, 0, 255, 0, 0);
+		input_set_abs_params(input_dev, ABS_MT_WIDTH_MINOR, 0, 255, 0, 0);
 		error = device_property_read_u32(cd->dev, "goodix,panel-max-x", &max_x);
 		if (error)
 			return error;
@@ -985,11 +1235,16 @@ static int goodix_berlin_suspend(struct device *dev)
 {
 	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
 
-	disable_irq(cd->irq);
 	mutex_lock(&cd->cmd_lock);
-	cd->suspended = true;
-	WRITE_ONCE(cd->palm, 0);
-	goodix_berlin_power_off(cd);
+	cd->system_suspended = true;
+	if (!cd->gesture_armed && !cd->powered_off) {
+		/* The threaded handler takes cmd_lock and checks powered_off. */
+		disable_irq_nosync(cd->irq);
+		WRITE_ONCE(cd->palm, 0);
+		goodix_berlin_set_fod_pressed(cd, false);
+		goodix_berlin_power_off(cd);
+		cd->powered_off = true;
+	}
 	mutex_unlock(&cd->cmd_lock);
 
 	return 0;
@@ -998,21 +1253,30 @@ static int goodix_berlin_suspend(struct device *dev)
 static int goodix_berlin_resume(struct device *dev)
 {
 	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
-	int error;
+	int error = 0;
 
 	mutex_lock(&cd->cmd_lock);
-	error = goodix_berlin_power_on(cd);
-	if (error)
-		goto out_unlock;
+	cd->system_suspended = false;
+	if (cd->powered_off) {
+		error = goodix_berlin_power_on(cd);
+		if (error)
+			goto out_unlock;
 
-	error = goodix_berlin_restore_reporting(cd);
-	if (error) {
-		goodix_berlin_power_off(cd);
-		goto out_unlock;
+		error = goodix_berlin_restore_reporting(cd);
+		if (error) {
+			goodix_berlin_power_off(cd);
+			goto out_unlock;
+		}
+		goodix_berlin_restore_palm(cd);
+		cd->powered_off = false;
+		enable_irq(cd->irq);
 	}
-	goodix_berlin_restore_palm(cd);
-	cd->suspended = false;
-	enable_irq(cd->irq);
+	if (cd->gesture_irq_pending) {
+		cd->gesture_irq_pending = false;
+		if (cd->gesture_armed && cd->panel_blank)
+			goodix_berlin_gesture_irq(cd);
+	}
+	error = goodix_berlin_update_gesture(cd);
 out_unlock:
 	mutex_unlock(&cd->cmd_lock);
 	return error;
@@ -1025,7 +1289,20 @@ static void goodix_berlin_power_off_act(void *data)
 {
 	struct goodix_berlin_core *cd = data;
 
-	goodix_berlin_power_off(cd);
+	if (!cd->powered_off)
+		goodix_berlin_power_off(cd);
+}
+
+static void goodix_berlin_release_wake(void *data)
+{
+	struct goodix_berlin_core *cd = data;
+
+	mutex_lock(&cd->cmd_lock);
+	if (cd->gesture_armed) {
+		disable_irq_wake(cd->irq);
+		cd->gesture_armed = false;
+	}
+	mutex_unlock(&cd->cmd_lock);
 }
 
 static ssize_t registers_read(struct file *filp, struct kobject *kobj,
@@ -1181,6 +1458,12 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
 
 	if (IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO) &&
 	    device_is_compatible(dev, "xiaomi,touch-spi")) {
+		error = devm_device_init_wakeup(dev);
+		if (error)
+			return error;
+		error = devm_add_action_or_reset(dev, goodix_berlin_release_wake, cd);
+		if (error)
+			return error;
 		error = devm_xiaomi_touch_register(dev, &goodix_berlin_xiaomi_ops,
 						  cd, cd->resolution_factor);
 		if (error)

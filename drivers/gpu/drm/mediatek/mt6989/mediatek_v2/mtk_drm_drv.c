@@ -52,6 +52,7 @@
 #include "mtk_drm_assert.h"
 #include "mtk_drm_graphics_base.h"
 #include "mtk_panel_ext.h"
+#include "rothko_fod.h"
 #include <linux/clk.h>
 #include "mtk_disp_pmqos.h"
 #include "mtk_disp_recovery.h"
@@ -8710,6 +8711,9 @@ static int mtk_drm_bind(struct device *dev)
 #else
 	mtk_drm_assert_init(drm);
 #endif
+	ret = rothko_fod_register(drm);
+	if (ret)
+		dev_warn(dev, "failed to register Rothko FOD: %d\n", ret);
 	DDPINFO("%s-\n", __func__);
 
 	return 0;
@@ -8725,6 +8729,7 @@ static void mtk_drm_unbind(struct device *dev)
 {
 	struct mtk_drm_private *private = dev_get_drvdata(dev);
 
+	rothko_fod_unregister(private->drm);
 	drm_dev_unregister(private->drm);
 	drm_dev_put(private->drm);
 	private->drm = NULL;
@@ -10083,6 +10088,7 @@ static void mtk_drm_remove(struct platform_device *pdev)
 	struct drm_device *drm = private->drm;
 	int i;
 
+	rothko_fod_unregister(drm);
 	drm_dev_unregister(drm);
 	mtk_drm_kms_deinit(drm);
 	drm_dev_put(drm);

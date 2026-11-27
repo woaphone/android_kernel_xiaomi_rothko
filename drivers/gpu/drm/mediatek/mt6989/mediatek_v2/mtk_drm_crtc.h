@@ -1230,6 +1230,8 @@ struct mtk_cmdq_cb_data {
 	struct drm_crtc_state		*state;
 	struct cmdq_pkt			*cmdq_handle;
 	struct drm_crtc			*crtc;
+	unsigned int fod_dbv;
+	bool fod_dbv_valid;
 	unsigned int misc;
 	unsigned int mmclk_req_idx;
 	unsigned int msync2_enable;

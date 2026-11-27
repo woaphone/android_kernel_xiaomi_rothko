@@ -57,6 +57,9 @@
 #if IS_ENABLED(CONFIG_DRM_ROTHKO_N12)
 #include "../n12/vis_display.h"
 #endif
+#if IS_ENABLED(CONFIG_DRM_ROTHKO_N12) && IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO)
+#include "../../../../../input/touchscreen/rothko/ft3683/xiaomi_touch_common.h"
+#endif
 
 #ifdef OPLUS_FEATURE_DISPLAY
 #include "../../oplus/oplus_display_common.h"
@@ -3636,6 +3639,22 @@ static void mipi_dsi_dcs_write_gce2(struct mtk_dsi *dsi, struct cmdq_pkt *dummy,
 static void mtk_dsi_cmdq_pack_gce(struct mtk_dsi *dsi, struct cmdq_pkt *handle,
 					struct mtk_ddic_dsi_cmd *para_table);
 
+static void mtk_dsi_rothko_touch_blank(struct mtk_dsi *dsi, bool blank)
+{
+#if IS_ENABLED(CONFIG_DRM_ROTHKO_N12) && IS_REACHABLE(CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO)
+	int ret;
+
+	if (dsi->ddp_comp.id != DDP_COMPONENT_DSI0 || !dsi->panel ||
+	    !of_device_is_compatible(dsi->panel->dev->of_node,
+				     "n12_42_02_0a_dsc_cmd,lcm"))
+		return;
+	ret = xiaomi_touch_panel_blank(blank);
+	if (ret && ret != -ENODEV)
+		dev_warn_ratelimited(dsi->dev, "FOD touch %s failed: %d\n",
+				     blank ? "blank" : "unblank", ret);
+#endif
+}
+
 static void mtk_output_en_doze_switch(struct mtk_dsi *dsi)
 {
 	bool doze_enabled = mtk_dsi_doze_state(dsi);
@@ -3784,6 +3803,7 @@ static void mtk_output_en_doze_switch(struct mtk_dsi *dsi)
 			dsi, mipi_dsi_dcs_write_gce2, NULL);
 
 	dsi->doze_enabled = doze_enabled;
+	mtk_dsi_rothko_touch_blank(dsi, doze_enabled);
 }
 
 static int mtk_preconfig_dsi_enable(struct mtk_dsi *dsi)
@@ -4308,6 +4328,7 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi,
 	dsi->pending_switch = false;
 	dsi->output_en = true;
 	dsi->doze_enabled = new_doze_state;
+	mtk_dsi_rothko_touch_blank(dsi, new_doze_state);
 
 	CRTC_MMP_EVENT_END(crtc_idx, dsi_enable,
 		(unsigned long)dsi->output_en, 0);
@@ -4497,6 +4518,8 @@ SKIP_WAIT_FRAME_DONE:
 	}
 	dsi->output_en = false;
 	dsi->doze_enabled = new_doze_state;
+	if (!force_lcm_update)
+		mtk_dsi_rothko_touch_blank(dsi, true);
 #if IS_ENABLED(CONFIG_DRM_ROTHKO_N12)
 	if (is_mi_dev_support_nova())
 		n12_vis_panel_power(false);

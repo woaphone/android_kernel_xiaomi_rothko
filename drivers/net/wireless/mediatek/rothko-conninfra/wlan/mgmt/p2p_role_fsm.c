@@ -5241,6 +5241,10 @@ void p2pRoleFsmRunEventAcs(struct ADAPTER *prAdapter,
 		return;
 
 	prMsgAcsRequest = (struct MSG_P2P_ACS_REQUEST *) prMsgHdr;
+	if (!prMsgAcsRequest->u4NumChannel ||
+	    prMsgAcsRequest->u4NumChannel > MAX_CHN_NUM)
+		goto exit;
+
 	prP2pRoleFsmInfo = P2P_ROLE_INDEX_2_ROLE_FSM_INFO(prAdapter,
 			prMsgAcsRequest->ucRoleIdx);
 
@@ -5351,14 +5355,13 @@ void p2pRoleFsmRunEventAcs(struct ADAPTER *prAdapter,
 
 	initAcsChnlMask(prAdapter, prMsgAcsRequest, prAcsReqInfo);
 
-	u4MsgSize = sizeof(struct MSG_P2P_SCAN_REQUEST) + (
-			prMsgAcsRequest->u4NumChannel *
-				sizeof(struct RF_CHANNEL_INFO));
+	u4MsgSize = struct_size(prP2pScanReqMsg, arChannelListInfo,
+				prMsgAcsRequest->u4NumChannel);
 
 	prP2pScanReqMsg = cnmMemAlloc(prAdapter, RAM_TYPE_MSG, u4MsgSize);
 	if (prP2pScanReqMsg == NULL) {
 		DBGLOG(P2P, ERROR, "alloc scan req. fail\n");
-		return;
+		goto exit;
 	}
 	kalMemSet(prP2pScanReqMsg, 0, u4MsgSize);
 	prP2pScanReqMsg->eScanType = SCAN_TYPE_ACTIVE_SCAN;

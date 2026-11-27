@@ -414,6 +414,13 @@ void __init init_feature_override(u64 boot_status, const void *fdt,
 
 	parse_cmdline(fdt, chosen);
 
+	/* Keep KVM from accessing HCRX after skipping EL2 initialisation. */
+	if (IS_ENABLED(CONFIG_ROTHKO_NOGZ_HCRX_TEST) &&
+	    lower_32_bits(boot_status) == BOOT_CPU_MODE_EL2) {
+		id_aa64mmfr1_override.val &= ~ID_AA64MMFR1_EL1_HCX_MASK;
+		id_aa64mmfr1_override.mask |= ID_AA64MMFR1_EL1_HCX_MASK;
+	}
+
 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
 		reg = prel64_pointer(regs[i].reg);
 		override = prel64_pointer(reg->override);

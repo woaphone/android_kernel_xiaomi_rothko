@@ -141,5 +141,7 @@ mtk_charger_framework-y := mtk_charger.o mtk_charger_intf.o \
 mtk_pd_charging-y := mtk_pd.o mtk_pd_hal.o
 obj-$(CONFIG_MTK_CHARGER_TYPE_DETECT) += mtk_chg_type_det.o
 obj-$(CONFIG_CHARGER_MT6375) += mt6375-charger.o
+obj-$(CONFIG_ROTHKO_SC858X) += sc858x_charger.o
+mtk_charger_framework-$(CONFIG_ROTHKO_SC858X) += rothko_pd_cp.o
 obj-$(CONFIG_MTK_PEAK_POWER_BUDGET) += rothko-ppb/
 obj-$(CONFIG_MTK_POWER_THROTTLING_COMMON) += rothko-power-throttling/

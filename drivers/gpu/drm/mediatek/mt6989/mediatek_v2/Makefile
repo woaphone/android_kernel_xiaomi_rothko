@@ -6,6 +6,7 @@ CFLAGS_mtk_layering_rule_base.o := -I$(MT6989_DISPLAY_PATH)/mediatek_v2
 CFLAGS_mtk_drm_ddp.o += -I$(srctree)/sound/soc/mediatek/rothko-mt6989/common
 
 mediatek-drm-y := mtk_drm_drv.o \
+			  rothko_fod.o \
 		  mtk_disp_tdshp.o \
 		  mtk_disp_color.o \
 		  mtk_disp_ccorr.o \

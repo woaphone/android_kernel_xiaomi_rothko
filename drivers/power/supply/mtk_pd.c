@@ -34,6 +34,7 @@
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/types.h>
@@ -57,11 +58,15 @@
 #include <linux/of_address.h>
 #include <linux/reboot.h>
 
+#include "adapter_class.h"
 #include "mtk_pd.h"
 #include "mtk_charger_algorithm_class.h"
 
 static int pd_dbg_level = PD_DEBUG_LEVEL;
 #define PD_VBUS_IR_DROP_THRESHOLD 1200
+#define PD_FIXED_UP_STANDBY_UA ((2500000 / 9000) * 1000)
+#define PD_FIXED_FALLBACK_UA 1500000
+#define PD_FIXED_RECONNECT_MS 10000
 
 static bool algo_waiver_test;
 module_param(algo_waiver_test, bool, 0644);
@@ -207,9 +212,10 @@ static void __mtk_pdc_init_table(struct chg_alg_device *alg)
 	pd->cap.nr = 0;
 	pd->cap.selected_cap_idx = -1;
 
-	if (pd_hal_is_adapter_ready(alg) == ALG_READY)
-		pd_hal_get_adapter_cap(alg, &pd->cap);
-	else
+	if (pd_hal_is_adapter_ready(alg) == ALG_READY) {
+		if (pd_hal_get_adapter_cap(alg, &pd->cap) != MTK_ADAPTER_OK)
+			pd->cap.nr = 0;
+	} else
 		pd_err("mtk_is_pdc_ready is fail\n");
 
 	pd_dbg("[%s] nr:%d default:%d\n", __func__, pd->cap.nr,
@@ -353,6 +359,33 @@ static int __mtk_pdc_get_idx(struct chg_alg_device *alg, int selected_idx,
 	return 0;
 }
 
+static bool mtk_pd_same_source(const struct pd_power_cap *a,
+			       const struct pd_power_cap *b)
+{
+	int i;
+
+	if (a->source_port != b->source_port || a->nr != b->nr)
+		return false;
+	/* A failed optional Extended query is not evidence of a different source. */
+	if (a->source_id_valid && b->source_id_valid &&
+	    (a->source_vid != b->source_vid || a->source_pid != b->source_pid ||
+	     a->source_xid != b->source_xid))
+		return false;
+	for (i = 0; i < a->nr; i++) {
+		if (a->min_mv[i] != b->min_mv[i] || a->max_mv[i] != b->max_mv[i] ||
+		    a->ma[i] != b->ma[i])
+			return false;
+	}
+	return true;
+}
+
+static void mtk_pd_block_9v(struct mtk_pd *pd)
+{
+	pd->failed_9v_cap = pd->cap;
+	pd->failed_9v_until = jiffies + msecs_to_jiffies(PD_FIXED_RECONNECT_MS);
+	pd_info("fixed PD: defer 9 V on matching source after transition failure\n");
+}
+
 static int mtk_pd_input_limit(struct mtk_pd *pd, int mv, int ma)
 {
 	int limit = ma * 1000;
@@ -363,6 +396,8 @@ static int mtk_pd_input_limit(struct mtk_pd *pd, int mv, int ma)
 		else if (mv == 9000)
 			limit = min(limit, 1500000);
 	}
+	if (mv == 5000 && pd->fixed_5v_fallback)
+		limit = min(limit, PD_FIXED_FALLBACK_UA);
 	if (pd->input_current_limit1 != -1)
 		limit = min(limit, pd->input_current_limit1);
 
@@ -373,9 +408,12 @@ static int __mtk_pdc_setup(struct chg_alg_device *alg, int idx)
 {
 	struct mtk_pd *pd = dev_get_drvdata(&alg->dev);
 	struct pd_power_cap *cap = &pd->cap;
-	unsigned int oldmivr = 4600000, old_input = 0;
-	int ret, old_idx = cap->selected_cap_idx;
-	int mv, ma, input_limit;
+	int oldmivr = 4600000, old_idx = cap->selected_cap_idx;
+	u32 old_input, input_limit, restore_input;
+	bool protected_9v, standby_up, fallback;
+	int mv, ma, ret, measured;
+
+	lockdep_assert_held(&pd->access_lock);
 
 	if (idx < 0 || idx >= cap->nr)
 		return -EINVAL;
@@ -384,27 +422,81 @@ static int __mtk_pdc_setup(struct chg_alg_device *alg, int idx)
 	if (mv < pd->vbus_l || mv > pd->vbus_h || ma <= 0)
 		return -EINVAL;
 
+	protected_9v = pd->enable_inductor_protect && alg->config == SINGLE_CHARGER &&
+		       of_machine_is_compatible("mediatek,MT6989") && mv == 9000;
+	standby_up = protected_9v && old_idx < cap->nr && cap->max_mv[old_idx] == 5000;
+	fallback = mv == 5000 && pd->fixed_5v_fallback;
+
 	pd_hal_get_mivr(alg, CHG1, &oldmivr);
 	if (pd->pd_idx == idx && old_idx == idx &&
-	    mv <= oldmivr / 1000 + PD_VBUS_IR_DROP_THRESHOLD)
-		return 0;
+	    mv <= oldmivr / 1000 + PD_VBUS_IR_DROP_THRESHOLD) {
+		if (!fallback && !protected_9v)
+			return 0;
+		measured = pd_hal_get_primary_vbus(alg);
+		if (fallback)
+			return measured >= 4500 && measured <= 5500 ? 0 : -EAGAIN;
+		if (measured >= 8550 && measured <= 9450)
+			return 0;
+		mtk_pd_block_9v(pd);
+		return -EAGAIN;
+	}
 
-	pd_hal_get_input_current(alg, CHG1, &old_input);
+	ret = pd_hal_get_input_current(alg, CHG1, &old_input);
+	if (ret)
+		return -EIO;
 	input_limit = mtk_pd_input_limit(pd, mv, ma);
-	if (old_input > input_limit)
-		pd_hal_set_input_current(alg, CHG1, input_limit);
+	/* Shed the main charger load before Request, not in the async notifier. */
+	if (protected_9v || fallback)
+		input_limit = min_t(u32, input_limit, PD_FIXED_UP_STANDBY_UA);
+	if (old_input > input_limit &&
+	    pd_hal_set_input_current(alg, CHG1, input_limit))
+		return -EIO;
+	if (standby_up) {
+		measured = pd_hal_get_primary_vbus(alg);
+		if (measured < 4500 || measured > 5500)
+			return -EAGAIN;
+	}
 	pd_hal_set_mivr(alg, CHG1, pd->min_charger_voltage);
-	if (mv > 5000)
+	if (protected_9v)
+		pd_hal_enable_vbus_ovp(alg, true);
+	else if (mv > 5000)
 		pd_hal_enable_vbus_ovp(alg, false);
 
 	ret = pd_hal_set_adapter_cap(alg, mv, ma);
 	if (ret) {
-		if (old_idx < 0 || old_idx >= cap->nr || cap->max_mv[old_idx] <= 5000)
+		if (protected_9v || fallback || old_idx >= cap->nr ||
+		    cap->max_mv[old_idx] <= 5000)
 			pd_hal_enable_vbus_ovp(alg, true);
 		else
 			pd_hal_enable_vbus_ovp(alg, false);
+
+		/* Only a Reject confirms that the requested PDO was not applied. */
+		if (ret == MTK_ADAPTER_REJECT && old_input > input_limit &&
+		    old_idx >= 0 && old_idx < cap->nr) {
+			restore_input = min_t(u32, old_input,
+				mtk_pd_input_limit(pd, cap->max_mv[old_idx],
+						   cap->ma[old_idx]));
+			if (restore_input > input_limit &&
+			    pd_hal_set_input_current(alg, CHG1, restore_input))
+				pd_err("%s: failed to restore AICR\n", __func__);
+		}
 		pd_hal_set_mivr(alg, CHG1, oldmivr);
+		if (standby_up && ret == MTK_ADAPTER_VBUS_INVALID)
+			mtk_pd_block_9v(pd);
+		if ((protected_9v && ret != MTK_ADAPTER_REJECT) || fallback)
+			return -EAGAIN;
 		return -EIO;
+	}
+	if (protected_9v || fallback) {
+		measured = pd_hal_get_primary_vbus(alg);
+		if (measured < (protected_9v ? 8550 : 4500) ||
+		    measured > (protected_9v ? 9450 : 5500)) {
+			pd->pd_idx = -1;
+			if (protected_9v)
+				mtk_pd_block_9v(pd);
+			return -EAGAIN;
+		}
+		pd_info("fixed PD: verified %d mV contract, VBUS %d mV\n", mv, measured);
 	}
 	if (mv <= 5000)
 		pd_hal_enable_vbus_ovp(alg, true);
@@ -499,6 +591,8 @@ static int __mtk_pdc_get_setting(struct chg_alg_device *alg, int *newvbus, int *
 	}
 
 	vbus = pd_hal_get_vbus(alg);
+	if (vbus < 0)
+		return vbus;
 	ibus = ibus / 1000;
 	if (ibus == 0)
 		ibus = 1000;
@@ -506,6 +600,23 @@ static int __mtk_pdc_get_setting(struct chg_alg_device *alg, int *newvbus, int *
 	selected_idx = cap->selected_cap_idx;
 	if (selected_idx >= cap->nr)
 		return -ENODATA;
+
+	/* A charger polling cycle can miss detach; key fallback to the PE attach. */
+	pd->fixed_5v_fallback = pd->failed_9v_cap.nr &&
+		mtk_pd_same_source(cap, &pd->failed_9v_cap) &&
+		((pd->fixed_5v_fallback && pd->fixed_5v_gen == cap->attach_gen) ||
+		 (cap->attach_gen - pd->failed_9v_cap.attach_gen <= 1 &&
+		  time_before(jiffies, pd->failed_9v_until)));
+	if (pd->fixed_5v_fallback) {
+		pd->fixed_5v_gen = cap->attach_gen;
+		if (pd->pd_reset_idx < 0)
+			return -ENODATA;
+		*newidx = pd->pd_reset_idx;
+		*newvbus = cap->max_mv[*newidx];
+		*newcur = cap->ma[*newidx];
+		return 0;
+	}
+	pd->failed_9v_cap.nr = 0;
 
 	if ((chg1_mivr && (vbus < mivr1 / 1000 - 500)) ||
 	    (chg2_mivr && (vbus < mivr2 / 1000 - 500)) ||
@@ -801,7 +912,8 @@ static int __pd_run(struct chg_alg_device *alg)
 	if (!ret) {
 		limit = mtk_pd_input_limit(pd, vbus, cur);
 	} else {
-		limit = PD_FAIL_CURRENT;
+		limit = ret == -EAGAIN || pd->fixed_5v_fallback ?
+			PD_FIXED_UP_STANDBY_UA : PD_FAIL_CURRENT;
 		if (pd->charging_current_limit1 == -1 ||
 		    pd->charging_current_limit1 > PD_FAIL_CURRENT)
 			pd->charging_current_limit1 = PD_FAIL_CURRENT;
@@ -1072,8 +1184,11 @@ static int _pd_notifier_call(struct chg_alg_device *alg,
 
 	switch (notify->evt) {
 	case EVT_PLUG_OUT:
+		mutex_lock(&pd->access_lock);
+		pd->fixed_5v_fallback = false;
 		pd->stop_6pin_re_en = 0;
 		ret_value = pd_plugout_reset(alg);
+		mutex_unlock(&pd->access_lock);
 		break;
 	case EVT_FULL:
 		pd->stop_6pin_re_en = 1;

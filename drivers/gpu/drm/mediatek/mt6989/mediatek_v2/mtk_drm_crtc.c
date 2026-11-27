@@ -40,6 +40,7 @@
 #include "mtk_drm_arr.h"
 #include "mtk_drm_drv.h"
 #include "mtk_drm_crtc.h"
+#include "rothko_fod.h"
 #include "mtk_drm_ddp.h"
 #include "mtk_drm_ddp_comp.h"
 #include "mtk_drm_gem.h"
@@ -1637,6 +1638,8 @@ static void bl_cmdq_cb(struct cmdq_cb_data data)
 
 	CRTC_MMP_MARK(0, backlight, 0xffffffff, 0);
 
+	if (!data.err && cb_data->fod_dbv_valid)
+		rothko_fod_backlight_done(cb_data->crtc, cb_data->fod_dbv);
 	cmdq_pkt_destroy(cb_data->cmdq_handle);
 	kfree(cb_data);
 }
@@ -1848,6 +1851,9 @@ int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level,
 
 	cb_data->crtc = crtc;
 	cb_data->cmdq_handle = cmdq_handle;
+	cb_data->fod_dbv = level;
+	cb_data->fod_dbv_valid = index == 0 && comp->id == DDP_COMPONENT_DSI0 &&
+			(cfg_flag & BIT(SET_BACKLIGHT_LEVEL));
 
 	if (cmdq_pkt_flush_threaded(cmdq_handle, bl_cmdq_cb, cb_data) < 0) {
 		DDPPR_ERR("failed to flush bl_cmdq_cb\n");

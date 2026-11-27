@@ -27,6 +27,8 @@
 #include <linux/power_supply.h>
 
 #include "charger_class.h"
+#include "sc858x_charger.h"
+#include "rothko_pd_cp.h"
 #include "mtk_charger.h"
 
 #include "mtk_chg_type_det.h"
@@ -306,6 +308,12 @@ struct mt6375_chg_data {
 	struct device *dev;
 	struct regmap *rmap;
 	struct regmap_field *rmap_fields[F_MAX];
+#ifdef CONFIG_ROTHKO_SC858X
+	struct mutex pps_lock;
+	bool pps_hold;
+	int apdo_max;
+	int quick_charge_type;
+#endif
 	struct power_supply *psy;
 	struct power_supply *usb_psy;
 	struct power_supply_desc psy_desc;
@@ -908,6 +916,19 @@ static inline int mt6375_chg_field_set(struct mt6375_chg_data *ddata,
 	mt_dbg(ddata->dev, "%s, val=%d\n", mt6375_chg_fields[fd].name,
 	       val);
 	val = mt6375_chg_val_toreg(mt6375_chg_fields[fd].range, val);
+#ifdef CONFIG_ROTHKO_SC858X
+	if (fd == F_CHG_EN || fd == F_BUCK_EN) {
+		int ret;
+
+		mutex_lock(&ddata->pps_lock);
+		if (val && ddata->pps_hold)
+			ret = -EBUSY;
+		else
+			ret = regmap_field_write(ddata->rmap_fields[fd], val);
+		mutex_unlock(&ddata->pps_lock);
+		return ret;
+	}
+#endif
 	return regmap_field_write(ddata->rmap_fields[fd], val);
 }
 
@@ -3020,6 +3041,40 @@ static const struct charger_ops mt6375_chg_ops = {
 	.enable_usbid_floating = mt6375_enable_usbid_floating,
 };
 
+#ifdef CONFIG_ROTHKO_SC858X
+int mt6375_pps_hold(struct charger_device *chgdev, bool hold, bool restore_buck)
+{
+	const unsigned int mask = BIT(0) | BIT(1);
+	struct mt6375_chg_data *ddata;
+	unsigned int value;
+	int ret;
+
+	if (!chgdev || chgdev->ops != &mt6375_chg_ops)
+		return -ENODEV;
+	ddata = charger_get_data(chgdev);
+
+	mutex_lock(&ddata->pps_lock);
+	if (hold) {
+		/* Keep the interlock on even when a bus error leaves state unknown. */
+		ddata->pps_hold = true;
+		ret = regmap_update_bits(ddata->rmap, MT6375_REG_CHG_TOP1, mask, 0);
+		if (!ret) {
+			ret = regmap_read(ddata->rmap, MT6375_REG_CHG_TOP1, &value);
+			if (!ret && (value & mask))
+				ret = -EIO;
+		}
+	} else {
+		ret = regmap_update_bits(ddata->rmap, MT6375_REG_CHG_TOP1, mask,
+					 restore_buck ? BIT(1) : 0);
+		if (!ret)
+			ddata->pps_hold = false;
+	}
+	mutex_unlock(&ddata->pps_lock);
+	return ret;
+}
+#endif
+
+
 static irqreturn_t mt6375_fl_wdt_handler(int irq, void *data)
 {
 	int ret;
@@ -3733,6 +3788,67 @@ static ssize_t real_type_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(real_type);
 
+#ifdef CONFIG_ROTHKO_SC858X
+void mt6375_report_pd_tier(struct mtk_charger *info, int watts, int type)
+{
+	struct charger_device *primary = info->chg1_dev;
+	struct mt6375_chg_data *ddata;
+	char quick[40], apdo[40];
+	char *env[] = { quick, apdo, NULL };
+
+	if (!primary || primary->ops != &mt6375_chg_ops)
+		return;
+	ddata = charger_get_data(primary);
+	mutex_lock(&ddata->attach_lock);
+	if (!ddata->usb_psy || ddata->stopping)
+		goto out;
+	if (atomic_read(&ddata->attach[ddata->active_idx]) < ATTACH_TYPE_PD) {
+		watts = 0;
+		type = 0;
+	}
+	if (ddata->quick_charge_type == type && ddata->apdo_max == watts)
+		goto out;
+	ddata->apdo_max = watts;
+	ddata->quick_charge_type = type;
+	mutex_unlock(&ddata->attach_lock);
+	snprintf(quick, sizeof(quick), "POWER_SUPPLY_QUICK_CHARGE_TYPE=%d", type);
+	snprintf(apdo, sizeof(apdo), "POWER_SUPPLY_APDO_MAX=%d", watts);
+	kobject_uevent_env(&info->pdev->dev.kobj, KOBJ_CHANGE, env);
+	power_supply_changed(ddata->usb_psy);
+	return;
+out:
+	mutex_unlock(&ddata->attach_lock);
+}
+
+static ssize_t quick_charge_type_show(struct device *dev, struct device_attribute *attr,
+				      char *buf)
+{
+	struct mt6375_chg_data *ddata = power_supply_get_drvdata(dev_get_drvdata(dev));
+	int type;
+
+	mutex_lock(&ddata->attach_lock);
+	type = atomic_read(&ddata->attach[ddata->active_idx]) >= ATTACH_TYPE_PD ?
+		ddata->quick_charge_type : 0;
+	mutex_unlock(&ddata->attach_lock);
+	return sysfs_emit(buf, "%d\n", type);
+}
+static DEVICE_ATTR_RO(quick_charge_type);
+
+static ssize_t apdo_max_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mt6375_chg_data *ddata = power_supply_get_drvdata(dev_get_drvdata(dev));
+	int watts;
+
+	mutex_lock(&ddata->attach_lock);
+	watts = atomic_read(&ddata->attach[ddata->active_idx]) >= ATTACH_TYPE_PD ?
+		ddata->apdo_max : 0;
+	mutex_unlock(&ddata->attach_lock);
+	return sysfs_emit(buf, "%d\n", watts);
+}
+static DEVICE_ATTR_RO(apdo_max);
+static DEVICE_ATTR(power_max, 0444, apdo_max_show, NULL);
+#endif
+
 static ssize_t voltage_now_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
@@ -3776,11 +3892,33 @@ static ssize_t power_now_show(struct device *dev,
 static DEVICE_ATTR_RO(power_now);
 
 #ifdef CONFIG_ROTHKO_SC858X_READBACK
-/* Stock sc858x_reg_fields[24, 53] and ops_cp_get_{ibus,vbus}. */
+/* Stock sc858x_reg_fields[24, 29, 53] and ops_cp_get_{ibus,vbus,ibatt,tdie}. */
 #define SC858X_SWITCH_STATUS	0x0a
+#define SC858X_SWITCHING	BIT(1)
+#define SC858X_CHARGE_CONTROL	0x0b
+#define SC858X_CHARGE_ENABLE	BIT(7)
 #define SC858X_ADC_CONTROL	0x15
+#define SC858X_ADC_ENABLE	BIT(7)
 #define SC858X_IBUS_ADC		0x17
 #define SC858X_VBUS_ADC		0x19
+#define SC858X_IBAT_ADC		0x23
+#define SC858X_TDIE_ADC		0x27
+
+#ifndef CONFIG_ROTHKO_SC858X
+struct sc858x_pump {
+	const char *name;
+	u16 addr;
+	struct i2c_client *client;
+	struct charger_device *chgdev;
+};
+
+/* Class references can outlive I2C unbind; callbacks use these stable slots. */
+static DEFINE_MUTEX(sc858x_lock);
+static struct sc858x_pump sc858x_master = { .name = "cp_master", .addr = 0x6e };
+static struct sc858x_pump sc858x_slave = { .name = "cp_slave", .addr = 0x6f };
+static struct i2c_driver sc858x_driver;
+
+#endif
 
 struct sc858x_read_attr {
 	struct device_attribute attr;
@@ -3794,25 +3932,225 @@ static int sc858x_read_value(struct i2c_client *client, u8 reg)
 
 	if (reg == SC858X_SWITCH_STATUS) {
 		ret = i2c_smbus_read_byte_data(client, reg);
-		return ret < 0 ? ret : !!(ret & BIT(1));
+		return ret < 0 ? ret : !!(ret & SC858X_SWITCHING);
 	}
 
 	ret = i2c_smbus_read_byte_data(client, SC858X_ADC_CONTROL);
 	if (ret < 0)
 		return ret;
 	if (reg == SC858X_ADC_CONTROL)
-		return !!(ret & BIT(7));
-	if (!(ret & BIT(7)))
+		return !!(ret & SC858X_ADC_ENABLE);
+	if (!(ret & SC858X_ADC_ENABLE))
 		return -ENODATA;
 
 	/* The factory ADC result is a single big-endian register pair. */
 	ret = i2c_smbus_read_word_swapped(client, reg);
 	if (ret < 0)
 		return ret;
+	if (reg == SC858X_TDIE_ADC) {
+		int ctrl;
+
+		/* An enabled ADC may still hold its last sample, not a fresh one. */
+		ctrl = i2c_smbus_read_byte_data(client, SC858X_ADC_CONTROL);
+		if (ctrl < 0)
+			return ctrl;
+		if (!(ctrl & SC858X_ADC_ENABLE) || !ret)
+			return -ENODATA;
+		return ret >> 1;
+	}
 	if (reg == SC858X_VBUS_ADC)
 		return ret * 625 / 100;
+	if (reg == SC858X_IBAT_ADC)
+		return ret * 375 / 100;
 	return ret * 15625 / 10000;
 }
+
+#ifndef CONFIG_ROTHKO_SC858X
+static int sc858x_enable(struct charger_device *chgdev, bool enable)
+{
+	struct sc858x_pump *pump = charger_get_data(chgdev);
+	struct i2c_client *client;
+	int ret;
+
+	/* No enable path until PD handoff and fault handling are in place. */
+	if (enable)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&sc858x_lock);
+	ret = -ENODEV;
+	if (pump->chgdev != chgdev)
+		goto out;
+	client = pump->client;
+	ret = i2c_smbus_read_byte_data(client, SC858X_CHARGE_CONTROL);
+	if (ret < 0)
+		goto out;
+	if (ret & SC858X_CHARGE_ENABLE) {
+		ret = i2c_smbus_write_byte_data(client, SC858X_CHARGE_CONTROL,
+					       ret & ~SC858X_CHARGE_ENABLE);
+		if (ret < 0)
+			goto out;
+		ret = i2c_smbus_read_byte_data(client, SC858X_CHARGE_CONTROL);
+		if (ret < 0)
+			goto out;
+		if (ret & SC858X_CHARGE_ENABLE) {
+			ret = -EIO;
+			goto out;
+		}
+	}
+	ret = sc858x_read_value(client, SC858X_SWITCH_STATUS);
+	if (ret > 0)
+		ret = -EBUSY;
+out:
+	mutex_unlock(&sc858x_lock);
+	return ret;
+}
+
+static int sc858x_read_charger(struct charger_device *chgdev, u8 reg)
+{
+	struct sc858x_pump *pump = charger_get_data(chgdev);
+	int ret = -ENODEV;
+
+	mutex_lock(&sc858x_lock);
+	if (pump->chgdev == chgdev)
+		ret = sc858x_read_value(pump->client, reg);
+	mutex_unlock(&sc858x_lock);
+	return ret;
+}
+
+static int sc858x_is_enabled(struct charger_device *chgdev, bool *enabled)
+{
+	int ret = sc858x_read_charger(chgdev, SC858X_SWITCH_STATUS);
+
+	if (ret < 0)
+		return ret;
+	*enabled = ret;
+	return 0;
+}
+
+static int sc858x_get_adc(struct charger_device *chgdev, enum adc_channel chan,
+			  int *min, int *max)
+{
+	u8 reg;
+	int ret;
+
+	switch (chan) {
+	case ADC_CHANNEL_VBUS:
+		reg = SC858X_VBUS_ADC;
+		break;
+	case ADC_CHANNEL_IBUS:
+		reg = SC858X_IBUS_ADC;
+		break;
+	case ADC_CHANNEL_IBAT:
+		reg = SC858X_IBAT_ADC;
+		break;
+	case ADC_CHANNEL_TEMP_JC:
+		reg = SC858X_TDIE_ADC;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	/* Last ADC sample only; this provider never starts conversion. */
+	ret = sc858x_read_charger(chgdev, reg);
+	if (ret < 0)
+		return ret;
+	/* The charger class uses uV/uA and degrees C, unlike the stock CP ops. */
+	*min = *max = reg == SC858X_TDIE_ADC ? ret : ret * 1000;
+	return 0;
+}
+
+static int sc858x_get_vbus(struct charger_device *chgdev, u32 *vbus)
+{
+	return sc858x_get_adc(chgdev, ADC_CHANNEL_VBUS, vbus, vbus);
+}
+
+static int sc858x_get_ibus(struct charger_device *chgdev, u32 *ibus)
+{
+	return sc858x_get_adc(chgdev, ADC_CHANNEL_IBUS, ibus, ibus);
+}
+
+static int sc858x_get_ibat(struct charger_device *chgdev, u32 *ibat)
+{
+	return sc858x_get_adc(chgdev, ADC_CHANNEL_IBAT, ibat, ibat);
+}
+
+static int sc858x_get_tdie(struct charger_device *chgdev, int *min, int *max)
+{
+	return sc858x_get_adc(chgdev, ADC_CHANNEL_TEMP_JC, min, max);
+}
+
+static const struct charger_ops sc858x_charger_ops = {
+	.enable = sc858x_enable,
+	.is_enabled = sc858x_is_enabled,
+	.get_adc = sc858x_get_adc,
+	.get_vbus_adc = sc858x_get_vbus,
+	.get_ibus_adc = sc858x_get_ibus,
+	.get_ibat_adc = sc858x_get_ibat,
+	.get_tchg_adc = sc858x_get_tdie,
+};
+
+static const struct of_device_id sc858x_of_match[] = {
+	{ .compatible = "sc,sc858x-master", .data = &sc858x_master },
+	{ .compatible = "sc,sc858x-slave", .data = &sc858x_slave },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, sc858x_of_match);
+
+static int sc858x_probe(struct i2c_client *client)
+{
+	struct sc858x_pump *pump = (void *)i2c_get_match_data(client);
+	struct charger_device *chgdev;
+	int ret = 0;
+
+	if (!pump || client->addr != pump->addr)
+		return -ENODEV;
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE_DATA |
+				     I2C_FUNC_SMBUS_READ_WORD_DATA))
+		return -EOPNOTSUPP;
+
+	mutex_lock(&sc858x_lock);
+	if (pump->client) {
+		ret = -EBUSY;
+		goto out;
+	}
+	chgdev = charger_device_register(pump->name, &client->dev, pump,
+					 &sc858x_charger_ops, NULL);
+	if (IS_ERR(chgdev)) {
+		ret = PTR_ERR(chgdev);
+		goto out;
+	}
+	i2c_set_clientdata(client, pump);
+	pump->client = client;
+	pump->chgdev = chgdev;
+out:
+	mutex_unlock(&sc858x_lock);
+	return ret;
+}
+
+static void sc858x_remove(struct i2c_client *client)
+{
+	struct sc858x_pump *pump = i2c_get_clientdata(client);
+	struct charger_device *chgdev;
+
+	mutex_lock(&sc858x_lock);
+	chgdev = pump->chgdev;
+	pump->chgdev = NULL;
+	pump->client = NULL;
+	mutex_unlock(&sc858x_lock);
+	charger_device_unregister(chgdev);
+}
+
+static struct i2c_driver sc858x_driver = {
+	.probe = sc858x_probe,
+	.remove = sc858x_remove,
+	.driver = {
+		.name = "rothko-sc858x",
+		.of_match_table = sc858x_of_match,
+		.suppress_bind_attrs = true,
+	},
+};
+
+#endif
 
 static ssize_t sc858x_read_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
@@ -3831,12 +4169,23 @@ static ssize_t sc858x_read_show(struct device *dev,
 	if (!client)
 		return -ENODEV;
 
-	/* Serialize with driver probe/remove without claiming the client. */
+	/* Serialize I2C readback with control writes on a bound pump. */
 	if (device_trylock(&client->dev)) {
-		if (!device_is_registered(&client->dev))
+		if (!device_is_registered(&client->dev)) {
 			ret = -ENODEV;
-		else if (!client->dev.driver)
+#ifdef CONFIG_ROTHKO_SC858X
+		} else if (client->dev.driver) {
+			ret = sc858x_read_legacy(client, field->reg);
+		} else {
 			ret = sc858x_read_value(client, field->reg);
+#else
+		} else if (!client->dev.driver ||
+			   client->dev.driver == &sc858x_driver.driver) {
+			mutex_lock(&sc858x_lock);
+			ret = sc858x_read_value(client, field->reg);
+			mutex_unlock(&sc858x_lock);
+#endif
+		}
 		device_unlock(&client->dev);
 	}
 	put_device(&client->dev);
@@ -3852,14 +4201,21 @@ SC858X_ATTR(master, enabled, SC858X_SWITCH_STATUS);
 SC858X_ATTR(master, adc_enabled, SC858X_ADC_CONTROL);
 SC858X_ATTR(master, last_vbus_mv, SC858X_VBUS_ADC);
 SC858X_ATTR(master, last_ibus_ma, SC858X_IBUS_ADC);
+SC858X_ATTR(master, last_tdie_c, SC858X_TDIE_ADC);
 SC858X_ATTR(slave, enabled, SC858X_SWITCH_STATUS);
 SC858X_ATTR(slave, adc_enabled, SC858X_ADC_CONTROL);
 SC858X_ATTR(slave, last_vbus_mv, SC858X_VBUS_ADC);
 SC858X_ATTR(slave, last_ibus_ma, SC858X_IBUS_ADC);
+SC858X_ATTR(slave, last_tdie_c, SC858X_TDIE_ADC);
 #endif
 
 /* Keep ADC reads out of the asynchronous connection uevent. */
 static struct attribute *rothko_usb_attrs[] = {
+#ifdef CONFIG_ROTHKO_SC858X
+	&dev_attr_quick_charge_type.attr,
+	&dev_attr_apdo_max.attr,
+	&dev_attr_power_max.attr,
+#endif
 	&dev_attr_real_type.attr,
 	&dev_attr_voltage_now.attr,
 	&dev_attr_current_now.attr,
@@ -3869,10 +4225,12 @@ static struct attribute *rothko_usb_attrs[] = {
 	&master_adc_enabled.attr.attr,
 	&master_last_vbus_mv.attr.attr,
 	&master_last_ibus_ma.attr.attr,
+	&master_last_tdie_c.attr.attr,
 	&slave_enabled.attr.attr,
 	&slave_adc_enabled.attr.attr,
 	&slave_last_vbus_mv.attr.attr,
 	&slave_last_ibus_ma.attr.attr,
+	&slave_last_tdie_c.attr.attr,
 #endif
 	NULL,
 };
@@ -4182,6 +4540,9 @@ static int mt6375_chg_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ddata->dev = dev;
+#ifdef CONFIG_ROTHKO_SC858X
+	mutex_init(&ddata->pps_lock);
+#endif
 	ddata->rmap = dev_get_regmap(dev->parent, NULL);
 	if (!ddata->rmap) {
 		dev_err(dev, "failed to get regmap\n");
@@ -4352,7 +4713,37 @@ static struct platform_driver mt6375_chg_driver = {
 		.of_match_table = of_match_ptr(mt6375_chg_of_match),
 	},
 };
+#if defined(CONFIG_ROTHKO_SC858X_READBACK) && !defined(CONFIG_ROTHKO_SC858X)
+static bool sc858x_driver_registered;
+
+static int __init mt6375_chg_init(void)
+{
+	int ret;
+
+	ret = platform_driver_register(&mt6375_chg_driver);
+	if (ret)
+		return ret;
+
+	ret = i2c_add_driver(&sc858x_driver);
+	if (ret)
+		pr_warn("rothko-sc858x: failed to register I2C driver: %d\n", ret);
+	else
+		sc858x_driver_registered = true;
+
+	return 0;
+}
+module_init(mt6375_chg_init);
+
+static void __exit mt6375_chg_exit(void)
+{
+	if (sc858x_driver_registered)
+		i2c_del_driver(&sc858x_driver);
+	platform_driver_unregister(&mt6375_chg_driver);
+}
+module_exit(mt6375_chg_exit);
+#else
 module_platform_driver(mt6375_chg_driver);
+#endif
 
 MODULE_AUTHOR("ShuFan Lee <shufan_lee@richtek.com>");
 MODULE_DESCRIPTION("MT6375 Charger Driver");

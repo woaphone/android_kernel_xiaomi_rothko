@@ -574,6 +574,7 @@ struct tcpm_power_cap {
 };
 
 struct tcpm_remote_power_cap {
+	u32 attach_gen;
 	uint8_t selected_cap_idx;
 	uint8_t nr;
 	int max_mv[PDO_MAX_NR];
@@ -659,6 +660,7 @@ enum tcp_dpm_return_code {
 
 	TCP_DPM_RET_BK_TIMEOUT,
 	TCP_DPM_RET_NO_RESPONSE,
+	TCP_DPM_RET_DROP_VBUS_INVALID,
 
 	TCP_DPM_RET_NR,
 };
@@ -686,6 +688,7 @@ enum TCP_DPM_EVT_ID {
 	TCP_DPM_EVT_REQUEST,
 	TCP_DPM_EVT_REQUEST_EX,
 	TCP_DPM_EVT_REQUEST_AGAIN,
+	TCP_DPM_EVT_EXIT_PPS,
 	TCP_DPM_EVT_BIST_CM2,
 
 	TCP_DPM_EVT_DUMMY,	/* wakeup event thread */
@@ -754,6 +757,8 @@ struct tcp_dpm_new_role {
 struct tcp_dpm_pd_request {
 	int mv;
 	int ma;
+	u32 attach_gen;
+	bool scoped_pps;
 };
 
 struct tcp_dpm_pd_request_ex {
@@ -798,7 +803,10 @@ struct tcp_dpm_event {
 	union {
 		struct tcp_dpm_pd_request pd_req;
 		struct tcp_dpm_pd_request_ex pd_req_ex;
-
+		struct {
+			u32 attach_gen;
+			int ma;
+		} pps_exit;
 
 		struct tcp_dpm_dp_data dp_data;
 		struct tcp_dpm_custom_vdm_data cvdm_data;
@@ -1080,6 +1088,11 @@ extern int tcpm_dpm_pd_source_cap(struct tcpc_device *tcpc,
 	const struct tcp_dpm_event_cb_data *data);
 extern int tcpm_dpm_pd_request(struct tcpc_device *tcpc,
 	int mv, int ma, const struct tcp_dpm_event_cb_data *data);
+int tcpm_claim_board_pps(struct tcpc_device *tcpc, u32 attach_gen);
+void tcpm_release_board_pps(struct tcpc_device *tcpc);
+bool tcpm_board_pps_owned(struct tcpc_device *tcpc);
+int tcpm_dpm_pd_request_pps(struct tcpc_device *tcpc, u32 attach_gen, int mv, int ma);
+int tcpm_dpm_pd_exit_pps(struct tcpc_device *tcpc, u32 attach_gen, int ma);
 extern int tcpm_dpm_pd_request_ex(struct tcpc_device *tcpc,
 	uint8_t pos, int vmin, uint32_t max, uint32_t oper,
 	const struct tcp_dpm_event_cb_data *data);
@@ -1681,6 +1694,26 @@ static inline int tcpm_dpm_pd_source_cap(struct tcpc_device *tcpc,
 
 static inline int tcpm_dpm_pd_request(struct tcpc_device *tcpc,
 	int mv, int ma, const struct tcp_dpm_event_cb_data *data)
+{
+	return TCPM_ERROR_NO_IMPLEMENT;
+}
+
+static inline int tcpm_claim_board_pps(struct tcpc_device *tcpc, u32 attach_gen)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void tcpm_release_board_pps(struct tcpc_device *tcpc) { }
+
+static inline bool tcpm_board_pps_owned(struct tcpc_device *tcpc) { return false; }
+
+static inline int tcpm_dpm_pd_request_pps(struct tcpc_device *tcpc, u32 attach_gen,
+					  int mv, int ma)
+{
+	return TCPM_ERROR_NO_IMPLEMENT;
+}
+
+static inline int tcpm_dpm_pd_exit_pps(struct tcpc_device *tcpc, u32 attach_gen, int ma)
 {
 	return TCPM_ERROR_NO_IMPLEMENT;
 }

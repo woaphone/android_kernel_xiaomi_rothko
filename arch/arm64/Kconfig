@@ -449,6 +449,15 @@ source "arch/arm64/Kconfig.platforms"
 
 menu "Kernel Features"
 
+config ROTHKO_NOGZ_HCRX_TEST
+	bool "Rothko NoGZ HCRX compatibility test"
+	depends on ARCH_MEDIATEK
+	help
+	  Test booting Rothko at EL2 with firmware that may not permit
+	  accesses to HCRX_EL2. Leave the register untouched in the kernel
+	  and nVHE entry paths and mask HCX after a direct EL2 boot.
+	  This is an opt-in test for the Rothko build, not a generic quirk.
+
 menu "ARM errata workarounds via the alternatives framework"
 
 config AMPERE_ERRATUM_AC03_CPU_38

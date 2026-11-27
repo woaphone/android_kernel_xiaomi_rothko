@@ -93,8 +93,9 @@ void pe_snk_select_capability_entry(struct pd_port *pd_port)
 
 void pe_snk_select_capability_exit(struct pd_port *pd_port)
 {
+	pd_port->pending_snk_cap = 0;
 	if (pd_check_ctrl_msg_event(pd_port, PD_CTRL_ACCEPT))
-		pd_port->pe_data.selected_cap = RDO_POS(pd_port->last_rdo);
+		pd_port->pending_snk_cap = RDO_POS(pd_port->last_rdo);
 	else if (pd_check_ctrl_msg_event(pd_port, PD_CTRL_REJECT))
 		pd_port->pe_data.request_rejected = true;
 }

@@ -65,7 +65,7 @@ extern void pd_event_buf_reset(struct tcpc_device *tcpc);
 
 bool __pd_put_cc_attached_event(struct tcpc_device *tcpc, uint8_t type);
 bool pd_put_cc_attached_event(struct tcpc_device *tcpc, uint8_t type);
-void pd_put_cc_detached_event(struct tcpc_device *tcpc);
+void pd_put_cc_detached_event(struct tcpc_device *tcpc, bool vbus_invalid);
 void pd_put_recv_hard_reset_event(struct tcpc_device *tcpc);
 void pd_put_sent_hard_reset_event(struct tcpc_device *tcpc);
 bool pd_put_pd_msg_event(struct tcpc_device *tcpc, struct pd_msg *pd_msg);

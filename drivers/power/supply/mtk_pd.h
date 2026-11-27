@@ -85,6 +85,10 @@ struct pd_power_cap {
 	int minwatt[PD_CAP_MAX_NR];
 	uint8_t type[PD_CAP_MAX_NR];
 	int info[PD_CAP_MAX_NR];
+	u16 source_vid, source_pid;
+	u32 source_xid;
+	u32 source_port, attach_gen;
+	bool source_id_valid;
 };
 
 struct mtk_pd {
@@ -135,6 +139,10 @@ struct mtk_pd {
 	int dual_polling_ieoc;
 
 	struct pd_power_cap cap;
+	struct pd_power_cap failed_9v_cap;
+	unsigned long failed_9v_until;
+	u32 fixed_5v_gen;
+	bool fixed_5v_fallback;
 	int pdc_max_watt;
 	int pdc_max_watt_setting;
 
@@ -160,6 +168,7 @@ extern int pd_hal_is_adapter_ready(struct chg_alg_device *alg);
 extern int pd_hal_get_adapter_cap(struct chg_alg_device *alg,
 	struct pd_power_cap *cap);
 extern int pd_hal_get_vbus(struct chg_alg_device *alg);
+int pd_hal_get_primary_vbus(struct chg_alg_device *alg);
 extern int pd_hal_get_ibus(struct chg_alg_device *alg, int *ibus);
 extern int pd_hal_get_mivr_state(struct chg_alg_device *alg,
 	enum chg_idx chgidx, bool *in_loop);

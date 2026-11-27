@@ -25,6 +25,10 @@ struct adapter_power_cap {
 	int minwatt[ADAPTER_CAP_MAX_NR];
 	uint8_t type[ADAPTER_CAP_MAX_NR];
 	int info[ADAPTER_CAP_MAX_NR];
+	u16 source_vid, source_pid;
+	u32 source_xid;
+	u32 source_port, attach_gen;
+	bool source_id_valid;
 };
 
 struct adapter_auth_data {
@@ -86,6 +90,7 @@ enum adapter_return_value {
 	MTK_ADAPTER_REJECT,
 	MTK_ADAPTER_ERROR,
 	MTK_ADAPTER_ADJUST,
+	MTK_ADAPTER_VBUS_INVALID,
 };
 
 

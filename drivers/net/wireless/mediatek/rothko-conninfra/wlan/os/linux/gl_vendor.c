@@ -3637,10 +3637,9 @@ int mtk_cfg80211_vendor_acs(struct wiphy *wiphy,
 	bool ht_enabled, ht40_enabled, vht_enabled, eht_enabled = false;
 	uint16_t ch_width = 0;
 	enum P2P_VENDOR_ACS_HW_MODE hw_mode;
-	uint32_t *ch_list = NULL;
-	uint8_t ch_list_count = 0;
-	uint8_t i;
-	uint32_t msg_size;
+	const uint32_t *ch_list;
+	unsigned int ch_list_count, i;
+	size_t msg_size;
 	struct MSG_P2P_ACS_REQUEST *prMsgAcsRequest;
 	struct RF_CHANNEL_INFO *prRfChannelInfo;
 	struct sk_buff *reply_skb;
@@ -3714,40 +3713,20 @@ int mtk_cfg80211_vendor_acs(struct wiphy *wiphy,
 	if (tb[WIFI_VENDOR_ATTR_ACS_CHWIDTH])
 		ch_width = nla_get_u16(tb[WIFI_VENDOR_ATTR_ACS_CHWIDTH]);
 
-	if (tb[WIFI_VENDOR_ATTR_ACS_FREQ_LIST]) {
-		uint32_t *freq =
-			nla_data(tb[WIFI_VENDOR_ATTR_ACS_FREQ_LIST]);
-
-		ch_list_count = nla_len(tb[WIFI_VENDOR_ATTR_ACS_FREQ_LIST]) /
-				sizeof(uint32_t);
-		if (ch_list_count) {
-			if (ch_list_count > MAX_CHN_NUM) {
-				DBGLOG(REQ, ERROR, "Invalid freq count.\n");
-				rStatus = -EINVAL;
-				goto exit;
-			}
-			ch_list = kalMemAlloc(
-				sizeof(uint32_t) * ch_list_count,
-				VIR_MEM_TYPE);
-			if (ch_list == NULL) {
-				DBGLOG(REQ, ERROR, "allocate ch_list fail.\n");
-				rStatus = -ENOMEM;
-				goto exit;
-			}
-
-			for (i = 0; i < ch_list_count; i++)
-				ch_list[i] = freq[i];
-		}
+	if (!tb[WIFI_VENDOR_ATTR_ACS_FREQ_LIST] ||
+	    nla_len(tb[WIFI_VENDOR_ATTR_ACS_FREQ_LIST]) % sizeof(*ch_list)) {
+		rStatus = -EINVAL;
+		goto exit;
 	}
-
-	if (!ch_list_count) {
-		DBGLOG(REQ, ERROR, "channel list count can NOT be 0\n");
+	ch_list = nla_data(tb[WIFI_VENDOR_ATTR_ACS_FREQ_LIST]);
+	ch_list_count = nla_len(tb[WIFI_VENDOR_ATTR_ACS_FREQ_LIST]) / sizeof(*ch_list);
+	if (!ch_list_count || ch_list_count > MAX_CHN_NUM) {
+		DBGLOG(REQ, ERROR, "Invalid ACS frequency count: %u\n", ch_list_count);
 		rStatus = -EINVAL;
 		goto exit;
 	}
 
-	msg_size = sizeof(struct MSG_P2P_ACS_REQUEST) +
-			(ch_list_count * sizeof(struct RF_CHANNEL_INFO));
+	msg_size = struct_size(prMsgAcsRequest, arChannelListInfo, ch_list_count);
 
 	prMsgAcsRequest = cnmMemAlloc(prGlueInfo->prAdapter,
 			RAM_TYPE_MSG, msg_size);
@@ -3812,9 +3791,6 @@ int mtk_cfg80211_vendor_acs(struct wiphy *wiphy,
 			prRfChannelInfo->eBand,
 			prRfChannelInfo->ucChannelNum,
 			ch_list[i]);
-
-		/* Iteration. */
-		prRfChannelInfo++;
 	}
 
 	mboxSendMsg(prGlueInfo->prAdapter,
@@ -3823,9 +3799,6 @@ int mtk_cfg80211_vendor_acs(struct wiphy *wiphy,
 			MSG_SEND_METHOD_BUF);
 
 exit:
-	if (ch_list)
-		kalMemFree(ch_list, VIR_MEM_TYPE,
-				sizeof(uint8_t) * ch_list_count);
 	if (rStatus == WLAN_STATUS_SUCCESS) {
 		reply_skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy,
 				NLMSG_HDRLEN);

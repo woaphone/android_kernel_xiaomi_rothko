@@ -331,6 +331,14 @@ config USB_CONFIGFS_RNDIS
 	   XP, you'll need to download drivers from Microsoft's website; a URL
 	   is given in comments found in that info file.
 
+config USB_CONFIGFS_MTK_RNDIS
+	bool "MediaTek Android RNDIS function compatibility"
+	depends on USB_CONFIGFS_RNDIS
+	help
+	  Expose the mtk_rndis function used by MediaTek Android USB gadget
+	  configurations. This uses the software RNDIS data path and does
+	  not implement MediaTek tethering offload.
+
 config USB_CONFIGFS_EEM
 	bool "Ethernet Emulation Model (EEM)"
 	depends on USB_CONFIGFS

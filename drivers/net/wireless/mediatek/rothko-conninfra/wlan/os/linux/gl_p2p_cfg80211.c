@@ -1270,10 +1270,18 @@ int mtk_p2p_cfg80211_scan(struct wiphy *wiphy,
 			ucBssIdx = prGlueInfo->prAdapter->ucP2PDevBssIdx;
 		}
 
-		u4MsgSize = sizeof(struct MSG_P2P_SCAN_REQUEST) +
-		    (request->n_channels * sizeof(struct RF_CHANNEL_INFO)) +
-		    (request->n_ssids * sizeof(struct PARAM_SSID)) +
-		    request->ie_len;
+		{
+			size_t size;
+
+			size = struct_size(prMsgScanRequest, arChannelListInfo,
+					   request->n_channels);
+			size = size_add(size, size_mul(request->n_ssids,
+						       sizeof(*prSsidStruct)));
+			size = size_add(size, request->ie_len);
+			if (size > U32_MAX)
+				break;
+			u4MsgSize = size;
+		}
 
 		prMsgScanRequest = cnmMemAlloc(prGlueInfo->prAdapter,
 			RAM_TYPE_MSG, u4MsgSize);
@@ -1332,9 +1340,6 @@ int mtk_p2p_cfg80211_scan(struct wiphy *wiphy,
 				prChannel->band,
 				prChannel->hw_value,
 				prChannel->center_freq);
-
-			/* Iteration. */
-			prRfChannelInfo++;
 		}
 		prMsgScanRequest->u4NumChannel = request->n_channels;
 		if (fgIsFullChanScan)
@@ -1343,14 +1348,9 @@ int mtk_p2p_cfg80211_scan(struct wiphy *wiphy,
 
 		/* SSID */
 		prSsid = request->ssids;
-		prSsidStruct = (struct P2P_SSID_STRUCT *) prRfChannelInfo;
-		if (request->n_ssids) {
-			ASSERT((unsigned long) prSsidStruct
-				== (unsigned long)
-				&(prMsgScanRequest->arChannelListInfo[u4Idx]));
-
-			prMsgScanRequest->prSSID = prSsidStruct;
-		}
+		prSsidStruct = (void *)(prMsgScanRequest->arChannelListInfo +
+				      request->n_channels);
+		prMsgScanRequest->prSSID = request->n_ssids ? prSsidStruct : NULL;
 
 		for (u4Idx = 0; u4Idx < request->n_ssids; u4Idx++) {
 			COPY_SSID(prSsidStruct->aucSsid,

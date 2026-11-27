@@ -104,4 +104,12 @@ config MTK_ROTHKO_SOCINFO
 	  Expose the MT6989 SoC family and ID for the stock rothko chipinfo
 	  service before Android early-init.
 
+config MTK_ROTHKO_MCUPM
+	bool "MT6989 MCUPM platform timesync for rothko"
+	depends on ARCH_MEDIATEK && ARM64 && OF && ARM_ARCH_TIMER && MTK_MBOX
+	help
+	  Probe the running MCUPM with its platform Alive IPI and maintain the
+	  AP time base in the shared mailbox on the Xiaomi rothko board.
+	  Enable this only for a dedicated rothko kernel build.
+
 endmenu

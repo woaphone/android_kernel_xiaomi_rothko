@@ -268,8 +268,11 @@ enum chg_data_idx_enum {
 	CHGS_SETTING_MAX,
 };
 
+struct rothko_pd_cp;
+
 struct mtk_charger {
 	struct platform_device *pdev;
+	struct rothko_pd_cp *pd_cp;
 	struct charger_device *chg1_dev;
 	struct notifier_block chg1_nb;
 	struct charger_device *chg2_dev;

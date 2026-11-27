@@ -95,6 +95,21 @@ int vis_dsi_rate_notify(unsigned int rate)
 }
 EXPORT_SYMBOL_GPL(vis_dsi_rate_notify);
 
+int n12_vis_mode_notify(unsigned int fps, unsigned int rate)
+{
+	int ret = 0;
+
+	mutex_lock(&vis_lock);
+	if (!vis) {
+		ret = VIS_DSI_UNINITIALIZED;
+	} else {
+		vis->panel_fps = fps;
+		vis->dsi_rate = rate;
+	}
+	mutex_unlock(&vis_lock);
+	return ret;
+}
+
 /* spiDataTranfer uses one full-duplex transfer of max(txlen, rxlen).
  * DMA-safe buffers replace the original stack-buffer transfer, and actual
  * transport errors are returned rather than reporting boolean success.

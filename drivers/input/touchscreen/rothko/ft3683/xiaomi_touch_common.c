@@ -18,10 +18,13 @@ struct xiaomi_touch_backend {
 	const struct xiaomi_touch_ops *ops;
 	void *data;
 	u32 factor;
+	bool fod_pressed;
 };
 
 /* Also serializes unbind against open descriptors and backend requests. */
 static DEFINE_MUTEX(xiaomi_touch_lock);
+/* FOD reports can be made from a backend request holding xiaomi_touch_lock. */
+static DEFINE_MUTEX(xiaomi_touch_fod_lock);
 static struct xiaomi_touch_backend *xiaomi_touch;
 
 static ssize_t resolution_factor_show(struct device *dev,
@@ -60,9 +63,19 @@ static ssize_t palm_sensor_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(palm_sensor);
 
+static ssize_t fod_press_status_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct xiaomi_touch_backend *backend = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(backend->fod_pressed));
+}
+static DEVICE_ATTR_RO(fod_press_status);
+
 static struct attribute *xiaomi_touch_attrs[] = {
 	&dev_attr_resolution_factor.attr,
 	&dev_attr_palm_sensor.attr,
+	&dev_attr_fod_press_status.attr,
 	NULL,
 };
 static umode_t xiaomi_touch_attr_is_visible(struct kobject *kobj,
@@ -72,6 +85,8 @@ static umode_t xiaomi_touch_attr_is_visible(struct kobject *kobj,
 
 	if (attr == &dev_attr_palm_sensor.attr && !backend->ops->write_palm)
 		return 0444;
+	if (attr == &dev_attr_fod_press_status.attr && !backend->ops->reports_fod)
+		return 0;
 	return attr->mode;
 }
 
@@ -122,7 +137,9 @@ static void xiaomi_touch_unregister(void *arg)
 
 	misc_deregister(&backend->misc);
 	mutex_lock(&xiaomi_touch_lock);
+	mutex_lock(&xiaomi_touch_fod_lock);
 	xiaomi_touch = NULL;
+	mutex_unlock(&xiaomi_touch_fod_lock);
 	mutex_unlock(&xiaomi_touch_lock);
 	device_unregister(backend->sysdev);
 	class_destroy(backend->class);
@@ -156,7 +173,8 @@ int devm_xiaomi_touch_register(struct device *dev,
 		ret = PTR_ERR(backend->class);
 		goto out_unlock;
 	}
-	backend->sysdev = device_create_with_groups(backend->class, dev, 0,
+	/* Keep the vendor genfscon path under /devices/virtual/touch. */
+	backend->sysdev = device_create_with_groups(backend->class, NULL, 0,
 						   backend, xiaomi_touch_groups,
 						   "touch_dev");
 	if (IS_ERR(backend->sysdev)) {
@@ -170,7 +188,9 @@ int devm_xiaomi_touch_register(struct device *dev,
 		class_destroy(backend->class);
 		goto out_unlock;
 	}
+	mutex_lock(&xiaomi_touch_fod_lock);
 	xiaomi_touch = backend;
+	mutex_unlock(&xiaomi_touch_fod_lock);
 	mutex_unlock(&xiaomi_touch_lock);
 	return devm_add_action_or_reset(dev, xiaomi_touch_unregister, backend);
 
@@ -180,6 +200,18 @@ out_unlock:
 }
 EXPORT_SYMBOL_GPL(devm_xiaomi_touch_register);
 
+int xiaomi_touch_panel_blank(bool blank)
+{
+	int ret = 0;
+
+	mutex_lock(&xiaomi_touch_lock);
+	if (xiaomi_touch && xiaomi_touch->ops->panel_blank)
+		ret = xiaomi_touch->ops->panel_blank(xiaomi_touch->data, blank);
+	mutex_unlock(&xiaomi_touch_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(xiaomi_touch_panel_blank);
+
 void xiaomi_touch_notify_palm(struct device *dev)
 {
 	mutex_lock(&xiaomi_touch_lock);
@@ -188,6 +220,21 @@ void xiaomi_touch_notify_palm(struct device *dev)
 	mutex_unlock(&xiaomi_touch_lock);
 }
 EXPORT_SYMBOL_GPL(xiaomi_touch_notify_palm);
+
+void xiaomi_touch_report_fod(struct device *dev, bool pressed)
+{
+	struct xiaomi_touch_backend *backend;
+
+	mutex_lock(&xiaomi_touch_fod_lock);
+	backend = xiaomi_touch;
+	if (backend && backend->misc.parent == dev && backend->ops->reports_fod &&
+	    backend->fod_pressed != pressed) {
+		WRITE_ONCE(backend->fod_pressed, pressed);
+		sysfs_notify(&backend->sysdev->kobj, NULL, "fod_press_status");
+	}
+	mutex_unlock(&xiaomi_touch_fod_lock);
+}
+EXPORT_SYMBOL_GPL(xiaomi_touch_report_fod);
 
 MODULE_DESCRIPTION("Xiaomi touch v3 transport and controller-backed status");
 MODULE_LICENSE("GPL");

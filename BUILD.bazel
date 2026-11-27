@@ -3695,6 +3695,38 @@ filegroup(
 )
 
 filegroup(
+    name = "rothko_nogz_hcrx_test_defconfigs",
+    srcs = [
+        ":rothko_kernelsu_defconfigs",
+        "arch/arm64/configs/rothko_nogz_hcrx_test_defconfig",
+    ],
+)
+
+filegroup(
+    name = "rothko_nogz_vhe_defconfigs",
+    srcs = [
+        ":rothko_nogz_hcrx_test_defconfigs",
+        "arch/arm64/configs/rothko_nogz_vhe_defconfig",
+    ],
+)
+
+filegroup(
+    name = "rothko_nogz_vhe_n12_high_refresh_defconfigs",
+    srcs = [
+        ":rothko_nogz_vhe_defconfigs",
+        "arch/arm64/configs/rothko_nogz_vhe_n12_high_refresh_defconfig",
+    ],
+)
+
+filegroup(
+    name = "rothko_nogz_vhe_n12_power_defconfigs",
+    srcs = [
+        ":rothko_nogz_vhe_n12_high_refresh_defconfigs",
+        "arch/arm64/configs/rothko_nogz_vhe_n12_power_defconfig",
+    ],
+)
+
+filegroup(
     name = "rothko_sleep_pstore_defconfigs",
     srcs = [
         ":rothko_kernelsu_defconfigs",
@@ -3743,6 +3775,7 @@ write_file(
     out = "build.config.rothko.generated",
     content = [
         '. "${ROOT_DIR}/${KERNEL_DIR}/build.config.constants"',
+        # Android 15 libvintf cannot map the Android 17 GKI release to an FCM level.
         "BRANCH=\"rothko-6.18\"",
         "KMI_GENERATION=\"\"",
         "",

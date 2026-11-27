@@ -33,9 +33,12 @@ struct n12_42 {
 	bool peak_hdr;
 	bool doze_active;
 	bool doze_suspended;
+	bool doze_backlight_blocked;
 	bool variant_36;
+	bool lhbm_active;
 	struct backlight_device *backlight;
 	unsigned int last_backlight;
+	unsigned int doze_brightness;
 	int error;
 	u8 build_id;
 	unsigned int refresh_rate;
@@ -261,8 +264,18 @@ static void n12_36_set_refresh(struct n12_42 *ctx, unsigned int refresh)
 	}
 }
 
+/* Experimental host modes keep the stock 144 Hz DDIC programming. */
+static unsigned int n12_ddic_refresh(unsigned int refresh)
+{
+	if (IS_ENABLED(CONFIG_DRM_ROTHKO_N12_HIGH_REFRESH_TEST) &&
+	    (refresh == 165 || refresh == 185))
+		return 144;
+	return refresh;
+}
+
 static void n12_42_set_refresh(struct n12_42 *ctx, unsigned int refresh)
 {
+	refresh = n12_ddic_refresh(refresh);
 	if (ctx->variant_36) {
 		n12_36_set_refresh(ctx, refresh);
 		return;
@@ -322,7 +335,7 @@ static int n12_36_initialize(struct n12_42 *ctx, int country_version)
 		n12_36_send(ctx, lhbm_lut_init);
 	if (!ctx->gir_status)
 		n12_36_send(ctx, gir_off_settings);
-	n12_36_set_refresh(ctx, ctx->refresh_rate);
+	n12_36_set_refresh(ctx, n12_ddic_refresh(ctx->refresh_rate));
 	return ctx->error;
 }
 
@@ -389,6 +402,7 @@ static void n12_42_sleep_in(struct n12_42 *ctx)
 	n12_42_write(ctx, 0x10, NULL, 0);
 	msleep(125);
 	ctx->error = 0;
+	ctx->lhbm_active = false;
 	ctx->prepared = false;
 }
 

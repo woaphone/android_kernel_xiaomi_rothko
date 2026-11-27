@@ -1,3 +1,5 @@
 # USB diagnostic build: use the existing MTU3 peripheral-only mode.
 # CONFIG_USB_MTU3_DUAL_ROLE is not set
 CONFIG_USB_MTU3_GADGET=y
+CONFIG_USB_CONFIGFS_RNDIS=y
+CONFIG_USB_CONFIGFS_MTK_RNDIS=y

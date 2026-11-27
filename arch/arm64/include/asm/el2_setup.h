@@ -75,6 +75,7 @@
 .endm
 
 .macro __init_el2_hcrx
+#ifndef CONFIG_ROTHKO_NOGZ_HCRX_TEST
 	mrs	x0, id_aa64mmfr1_el1
 	ubfx	x0, x0, #ID_AA64MMFR1_EL1_HCX_SHIFT, #4
 	cbz	x0, .Lskip_hcrx_\@
@@ -89,6 +90,7 @@
 .Lset_hcrx_\@:
 	msr_s	SYS_HCRX_EL2, x0
 .Lskip_hcrx_\@:
+#endif
 .endm
 
 /* Check if running in host at EL2 mode, i.e., (h)VHE. Jump to fail if not. */

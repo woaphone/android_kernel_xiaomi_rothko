@@ -1,6 +1,6 @@
 # MT6989 / rothko, 4 KiB pages on the Android 17 common kernel.
 CONFIG_ARCH_MEDIATEK=y
-CONFIG_LOCALVERSION="-rothko-6.18-4k"
+CONFIG_LOCALVERSION="-woaphone-rothko-4k"
 # ARCH_MEDIATEK also enables these unrelated MT8196 modules by default.
 # CONFIG_COMMON_CLK_MT8196_MFGCFG is not set
 # CONFIG_COMMON_CLK_MT8196_MMSYS is not set
@@ -50,6 +50,7 @@ CONFIG_CHARGER_MT6375=y
 CONFIG_MTK_PUMP_EXPRESS=y
 CONFIG_MTK_ROTHKO_USB_POWER_SUPPLY=y
 CONFIG_ROTHKO_SC858X_READBACK=y
+CONFIG_ROTHKO_SC858X=y
 CONFIG_REGULATOR_MT6316=y
 CONFIG_REGULATOR_MT6363=y
 CONFIG_REGULATOR_MT6373=y
@@ -93,6 +94,7 @@ CONFIG_TOUCHSCREEN_FT3683_ROTHKO=y
 CONFIG_XIAOMI_TOUCH_COMMON_ROTHKO=y
 CONFIG_ROTHKO_THN31_NFC=y
 CONFIG_ROTHKO_AW8697_HAPTIC=y
+CONFIG_ROTHKO_FINGERPRINT=y
 
 # Rebuilt MT6989 modem transport and connection infrastructure.
 CONFIG_MTK_CCCI_DEVICES=y
@@ -271,6 +273,6 @@ CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y
 CONFIG_WATCHDOG_OPEN_TIMEOUT=0
 
 # Keep LK clocks until the rebuilt board consumers take ownership.
-CONFIG_CMDLINE="console=ttynull stack_depot_disable=on cgroup_disable=pressure kasan.stacktrace=off kvm-arm.mode=protected bootconfig clk_ignore_unused"
+CONFIG_CMDLINE="console=ttynull stack_depot_disable=on cgroup_disable=pressure kasan.stacktrace=off kvm-arm.mode=protected bootconfig clk_ignore_unused" # nocheck: The dedicated NoGZ VHE fragment replaces this value.
 
 CONFIG_REGULATOR_ROTHKO_WL2868C=y

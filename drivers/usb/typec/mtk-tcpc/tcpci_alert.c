@@ -451,13 +451,14 @@ int tcpci_report_usb_port_attached(struct tcpc_device *tcpc)
 	return 0;
 }
 
-int tcpci_report_usb_port_detached(struct tcpc_device *tcpc)
+int tcpci_report_usb_port_detached(struct tcpc_device *tcpc,
+					  bool vbus_invalid)
 {
 	TCPC_DBG("usb_port_detached\n");
 
 #if IS_ENABLED(CONFIG_USB_POWER_DELIVERY)
 	if (tcpc->pd_inited_flag)
-		pd_put_cc_detached_event(tcpc);
+		pd_put_cc_detached_event(tcpc, vbus_invalid);
 	else {
 		pd_event_buf_reset(tcpc);
 		tcpc_enable_timer(tcpc, TYPEC_RT_TIMER_PE_IDLE);
@@ -472,13 +473,14 @@ int tcpci_report_usb_port_detached(struct tcpc_device *tcpc)
 	return 0;
 }
 
-int tcpci_report_usb_port_changed(struct tcpc_device *tcpc)
+int tcpci_report_usb_port_changed(struct tcpc_device *tcpc,
+					  bool vbus_invalid)
 {
 	tcpci_notify_typec_state(tcpc);
 
 	if (tcpc->typec_attach_new == TYPEC_UNATTACHED ||
 	    tcpc->typec_attach_new == TYPEC_PROTECTION)
-		tcpci_report_usb_port_detached(tcpc);
+		tcpci_report_usb_port_detached(tcpc, vbus_invalid);
 	else if (tcpc->typec_attach_old == TYPEC_UNATTACHED)
 		tcpci_report_usb_port_attached(tcpc);
 	else

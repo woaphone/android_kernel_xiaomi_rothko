@@ -1193,6 +1193,20 @@ static int battery_psy_set_property(struct power_supply *psy,
 	return ret;
 }
 
+static bool mtk_battery_pump_online(const char *name)
+{
+	union power_supply_propval online;
+	struct power_supply *pump;
+	int ret;
+
+	pump = power_supply_get_by_name(name);
+	if (!pump)
+		return false;
+	ret = power_supply_get_property(pump, POWER_SUPPLY_PROP_ONLINE, &online);
+	power_supply_put(pump);
+	return !ret && online.intval;
+}
+
 static void mtk_battery_external_power_changed(struct power_supply *psy)
 {
 	struct mtk_battery *gm;
@@ -1229,6 +1243,14 @@ static void mtk_battery_external_power_changed(struct power_supply *psy)
 
 		ret = power_supply_get_property(chg_psy,
 			POWER_SUPPLY_PROP_ENERGY_EMPTY, &vbat0);
+
+		if (IS_ENABLED(CONFIG_ROTHKO_SC858X) &&
+		    status.intval != POWER_SUPPLY_STATUS_FULL &&
+		    mtk_battery_pump_online("cp_master") &&
+		    mtk_battery_pump_online("cp_slave")) {
+			online.intval = 1;
+			status.intval = POWER_SUPPLY_STATUS_CHARGING;
+		}
 
 		if (!online.intval) {
 			bs_data->bat_status = POWER_SUPPLY_STATUS_DISCHARGING;

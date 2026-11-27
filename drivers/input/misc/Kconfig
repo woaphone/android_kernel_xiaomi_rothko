@@ -994,4 +994,13 @@ config INPUT_STPMIC1_ONKEY
 
 source "drivers/input/misc/rothko_aw8697/Kconfig"
 
+config ROTHKO_FINGERPRINT
+	bool "Xiaomi Rothko Goodix TEE fingerprint controls"
+	depends on OF && PINCTRL && REGULATOR && NET && PM
+	depends on SPI_MT65XX=y
+	help
+	  Exposes the Rothko sensor's regulator, reset, SPI3 clock and IRQ
+	  to the Xiaomi fingerprint HAL. Enrollment and authentication remain
+	  in the vendor TEE stack.
+
 endif

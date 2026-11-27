@@ -263,11 +263,32 @@ static int pd_get_status(struct adapter_device *dev, struct adapter_status *sta)
 	return to_mtk_adapter_ret(ret);
 }
 
+static bool pd_same_sink(struct mtk_pd_adapter_info *info, int port, u32 attach_gen,
+			 struct tcpm_remote_power_cap *cap)
+{
+	struct tcpc_device *tcpc = info->tcpc[port];
+	bool same;
+
+	if (tcpm_inquire_typec_attach_state(tcpc) != TYPEC_ATTACHED_SNK ||
+	    tcpm_get_remote_power_cap(tcpc, cap) || cap->attach_gen != attach_gen)
+		return false;
+
+	mutex_lock(&info->idx_lock);
+	same = info->active_idx == port;
+	mutex_unlock(&info->idx_lock);
+	return same;
+}
+
 static int pd_set_cap(struct adapter_device *dev, enum adapter_cap_type type,
 		      int mV, int mA)
 {
 	struct mtk_pd_adapter_info *info = adapter_dev_get_drvdata(dev);
-	int ret = TCP_DPM_RET_DENIED_UNKNOWN, active_idx = 0;
+	struct tcpm_remote_power_cap cap;
+	bool fixed = type == MTK_PD || type == MTK_PD_APDO_END;
+	struct tcpc_device *tcpc;
+	u32 attach_gen = 0;
+	int active_idx, idx, ret;
+	int contract_mv, contract_ma;
 
 	if (info == NULL)
 		return MTK_ADAPTER_ERROR;
@@ -275,20 +296,44 @@ static int pd_set_cap(struct adapter_device *dev, enum adapter_cap_type type,
 	mutex_lock(&info->idx_lock);
 	active_idx = info->active_idx;
 	mutex_unlock(&info->idx_lock);
+	tcpc = info->tcpc[active_idx];
+	if (tcpm_board_pps_owned(tcpc))
+		return MTK_ADAPTER_REJECT;
+	if (fixed) {
+		if (tcpm_inquire_typec_attach_state(tcpc) != TYPEC_ATTACHED_SNK ||
+		    tcpm_get_remote_power_cap(tcpc, &cap) || !cap.nr)
+			return MTK_ADAPTER_ERROR;
+		attach_gen = cap.attach_gen;
+	}
 
 	dev_info(info->dev, "%s type:%d %dmV %dmA\n", __func__, type, mV, mA);
 
-	if (type == MTK_PD_APDO_START)
-		ret = tcpm_set_apdo_charging_policy(info->tcpc[active_idx],
-						    DPM_CHARGING_POLICY_PPS,
+	if (type == MTK_PD_APDO_END) {
+		if (mV != 5000 || !pd_same_sink(info, active_idx, attach_gen, &cap))
+			return MTK_ADAPTER_ERROR;
+		ret = tcpm_dpm_pd_exit_pps(tcpc, attach_gen, mA);
+	} else if (type == MTK_PD_APDO_START) {
+		ret = tcpm_set_apdo_charging_policy(tcpc, DPM_CHARGING_POLICY_PPS,
 						    mV, mA, NULL);
-	else {
-		if (type == MTK_PD_APDO_END)
-			tcpm_reset_pd_charging_policy(info->tcpc[active_idx],
-						      NULL);
-		ret = tcpm_dpm_pd_request(info->tcpc[active_idx], mV, mA, NULL);
+	} else {
+		ret = tcpm_dpm_pd_request(tcpc, mV, mA, NULL);
 	}
 
+	if (fixed && ret == TCP_DPM_RET_DROP_VBUS_INVALID)
+		return MTK_ADAPTER_VBUS_INVALID;
+	if (fixed && ret == TCP_DPM_RET_SUCCESS) {
+		/* A completed TCPM call alone does not prove a fixed PDO is active. */
+		if (tcpm_inquire_pd_contract(tcpc, &contract_mv, &contract_ma) ||
+		    contract_mv != mV || contract_ma <= 0 ||
+		    (type == MTK_PD_APDO_END && contract_ma > mA) ||
+		    !pd_same_sink(info, active_idx, attach_gen, &cap))
+			return MTK_ADAPTER_ERROR;
+		idx = cap.selected_cap_idx - 1;
+		if (idx < 0 || idx >= cap.nr ||
+		    cap.type[idx] != TCPM_POWER_CAP_VAL_TYPE_FIXED ||
+		    cap.min_mv[idx] != mV || cap.max_mv[idx] != mV)
+			return MTK_ADAPTER_ERROR;
+	}
 	return to_mtk_adapter_ret(ret);
 }
 
@@ -346,6 +391,8 @@ static inline int pd_get_cap_pdo(struct mtk_pd_adapter_info *info,
 
 	dev_info(info->dev, "%s nr:%d idx:%d\n",
 			    __func__, pd_cap.nr, pd_cap.selected_cap_idx);
+	cap->source_port = active_idx;
+	cap->attach_gen = pd_cap.attach_gen;
 	cap->selected_cap_idx = -1;
 	for (i = 0, j = 0; i < pd_cap.nr && j < ADAPTER_CAP_MAX_NR; i++) {
 		if (pd_cap.type[i] != TCPM_POWER_CAP_VAL_TYPE_FIXED)
@@ -379,6 +426,7 @@ static int pd_get_cap(struct adapter_device *dev, enum adapter_cap_type type,
 	int ret = MTK_ADAPTER_ERROR, active_idx = 0;
 	int ret_tcp = TCP_DPM_RET_DENIED_UNKNOWN;
 	struct pd_source_cap_ext src_cap_ext;
+	struct tcpm_remote_power_cap fixed_cap;
 
 	if (info == NULL)
 		return ret;
@@ -388,17 +436,27 @@ static int pd_get_cap(struct adapter_device *dev, enum adapter_cap_type type,
 	mutex_unlock(&info->idx_lock);
 
 	memset(cap, 0, sizeof(*cap));
+	if (type == MTK_PD &&
+	    (tcpm_get_remote_power_cap(info->tcpc[active_idx], &fixed_cap) || !fixed_cap.nr))
+		return ret;
 
 	ret_tcp = tcpm_dpm_pd_get_source_cap_ext(info->tcpc[active_idx],
 						 NULL, &src_cap_ext);
-	if (ret_tcp == TCP_DPM_RET_SUCCESS)
+	if (ret_tcp == TCP_DPM_RET_SUCCESS) {
 		cap->pdp = src_cap_ext.source_pdp;
+		cap->source_vid = src_cap_ext.vid;
+		cap->source_pid = src_cap_ext.pid;
+		cap->source_xid = src_cap_ext.xid;
+		cap->source_id_valid = true;
+	}
 
 	if (type == MTK_PD_APDO)
 		ret = pd_get_cap_apdo(info, active_idx, cap);
-	else if (type == MTK_PD)
+	else if (type == MTK_PD) {
 		ret = pd_get_cap_pdo(info, active_idx, cap);
-	else
+		if (ret == MTK_ADAPTER_OK && cap->attach_gen != fixed_cap.attach_gen)
+			return MTK_ADAPTER_ERROR;
+	} else
 		ret = MTK_ADAPTER_ERROR;
 
 	return ret;

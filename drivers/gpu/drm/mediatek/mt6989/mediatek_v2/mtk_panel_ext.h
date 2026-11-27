@@ -732,6 +732,11 @@ struct mtk_panel_funcs {
 		struct mtk_panel_params **ext_para,
 		unsigned int mode);
 	void (*hbm_set_state)(struct drm_panel *panel, bool state);
+	/* Synchronous panel operation under the primary CRTC lock. */
+	int (*set_local_hbm)(struct drm_panel *panel, unsigned int mode);
+	/* MI Display doze brightness, serialized by the primary CRTC lock. */
+	int (*set_doze_brightness)(struct drm_panel *panel, unsigned int level);
+	int (*get_doze_brightness)(struct drm_panel *panel, unsigned int *level);
 	enum RES_SWITCH_TYPE (*get_res_switch_type)(void);
 	int (*scaling_mode_mapping)(int mode_idx);
 	int (*mode_switch)(struct drm_panel *panel,

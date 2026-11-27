@@ -773,6 +773,7 @@ int pd_reset_protocol_layer(struct pd_port *pd_port, bool sop_only)
 	pe_data->during_swap = false;
 	pe_data->cap_counter = 0;
 	pe_data->selected_cap = 0;
+	pd_port->pending_snk_cap = 0;
 
 #if CONFIG_USB_PD_REV30_ALERT_REMOTE
 	pe_data->remote_alert = 0;

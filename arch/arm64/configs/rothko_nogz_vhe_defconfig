@@ -1,0 +1,2 @@
+# Leave KVM in its default mode so a VHE-capable EL2 boot uses host VHE.
+CONFIG_CMDLINE="console=ttynull stack_depot_disable=on cgroup_disable=pressure kasan.stacktrace=off bootconfig clk_ignore_unused"

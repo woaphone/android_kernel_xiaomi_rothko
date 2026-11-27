@@ -62,6 +62,7 @@
 #include <asm/setup.h>
 
 #include "mtk_charger.h"
+#include "rothko_pd_cp.h"
 #include "mtk_battery.h"
 
 struct tag_bootmode {
@@ -616,7 +617,7 @@ static void mtk_charger_parse_dt(struct mtk_charger *info,
 
 static void mtk_charger_start_timer(struct mtk_charger *info)
 {
-	struct timespec64 end_time, time_now;
+	struct timespec64 end_time;
 	ktime_t ktime, ktime_now;
 	int ret = 0;
 
@@ -628,11 +629,14 @@ static void mtk_charger_start_timer(struct mtk_charger *info)
 	}
 
 	ktime_now = ktime_get_boottime();
-	time_now = ktime_to_timespec64(ktime_now);
-	end_time.tv_sec = time_now.tv_sec + info->polling_interval;
-	end_time.tv_nsec = time_now.tv_nsec + 0;
+	if (rothko_pd_cp_switching(info))
+		ktime = ktime_add_ms(ktime_now, 500);
+	else if (rothko_pd_cp_active(info))
+		ktime = ktime_add_ms(ktime_now, 1000);
+	else
+		ktime = ktime_add(ktime_now, ktime_set(info->polling_interval, 0));
+	end_time = ktime_to_timespec64(ktime);
 	info->endtime = end_time;
-	ktime = ktime_set(info->endtime.tv_sec, info->endtime.tv_nsec);
 
 	chr_err("%s: alarm timer start:%d, %lld %ld\n", __func__, ret,
 		info->endtime.tv_sec, info->endtime.tv_nsec);
@@ -2834,6 +2838,10 @@ static bool mtk_is_charger_on(struct mtk_charger *info)
 {
 	int chr_type;
 
+	/* MT6375 CHGVIN is isolated while the pumps own the input. */
+	if (rothko_pd_cp_attached(info))
+		return true;
+
 	chr_type = get_charger_type(info);
 	if (chr_type == POWER_SUPPLY_TYPE_UNKNOWN) {
 		if (info->chr_type != POWER_SUPPLY_TYPE_UNKNOWN) {
@@ -3034,30 +3042,30 @@ static int charger_routine_thread(void *arg)
 
 		is_charger_on = mtk_is_charger_on(info);
 
-		if (info->charger_thread_polling == true)
-			mtk_charger_start_timer(info);
-
 		check_battery_exist(info);
 		check_dynamic_mivr(info);
 		charger_check_status(info);
 		mtk_check_ta_status(info);
 		kpoc_power_off_check(info);
 
-		if (is_disable_charger(info) == false &&
-			is_charger_on == true &&
-			info->can_charging == true) {
-			if (info->algo.do_algorithm)
-				info->algo.do_algorithm(info);
-			charger_status_check(info);
-		} else {
-			chr_debug("disable charging %d %d %d\n",
-			    is_disable_charger(info), is_charger_on, info->can_charging);
+		{
+			bool allowed = !is_disable_charger(info) && is_charger_on &&
+				       info->can_charging;
+
+			if (!rothko_pd_cp_poll(info, allowed) && allowed) {
+				if (info->algo.do_algorithm)
+					info->algo.do_algorithm(info);
+				charger_status_check(info);
+			}
 		}
+		if (info->charger_thread_polling || rothko_pd_cp_active(info))
+			mtk_charger_start_timer(info);
 		if (info->bootmode != 1 && info->bootmode != 2 && info->bootmode != 4
 			&& info->bootmode != 8 && info->bootmode != 9)
 			smart_charging(info);
 		spin_lock_irqsave(&info->slock, flags);
-		__pm_relax(info->charger_wakelock);
+		if (!rothko_pd_cp_switching(info))
+			__pm_relax(info->charger_wakelock);
 		spin_unlock_irqrestore(&info->slock, flags);
 		chr_debug("%s end , %d\n",
 			__func__, info->charger_thread_timeout);
@@ -3818,6 +3826,7 @@ static int mtk_charger_probe(struct platform_device *pdev)
 
 	mutex_init(&info->cable_out_lock);
 	mutex_init(&info->charger_lock);
+	rothko_pd_cp_init(info);
 	mutex_init(&info->pd_lock);
 	mutex_init(&info->ta_lock);
 	for (i = 0; i < CHG2_SETTING + 1; i++) {
@@ -3844,7 +3853,7 @@ static int mtk_charger_probe(struct platform_device *pdev)
 	srcu_init_notifier_head(&info->evt_nh);
 	/* Keep standard fixed PD available until Android supplies its mask. */
 	if (info->adapter_dev[PD])
-		info->fast_charging_indicator = PDC_ID;
+		info->fast_charging_indicator = PDC_ID | (info->pd_cp ? PE5_ID : 0);
 	mtk_charger_setup_files(pdev);
 	mtk_charger_get_atm_mode(info);
 
@@ -4045,6 +4054,10 @@ static void mtk_charger_shutdown(struct platform_device *dev)
 {
 	struct mtk_charger *info = platform_get_drvdata(dev);
 	int i;
+
+	mutex_lock(&info->charger_lock);
+	rothko_pd_cp_poll(info, false);
+	mutex_unlock(&info->charger_lock);
 
 	for (i = 0; i < MAX_ALG_NO; i++) {
 		if (info->alg[i] == NULL)

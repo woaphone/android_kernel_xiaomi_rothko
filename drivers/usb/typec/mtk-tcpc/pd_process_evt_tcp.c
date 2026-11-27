@@ -184,6 +184,10 @@ static inline int pd_handle_tcp_event_request(struct pd_port *pd_port)
 	case TCP_DPM_EVT_REQUEST_AGAIN:
 		ret = pd_dpm_update_tcp_request_again(pd_port);
 		break;
+	case TCP_DPM_EVT_EXIT_PPS:
+		ret = pd_dpm_exit_pps(pd_port, tcp_event->tcp_dpm_data.pps_exit.attach_gen,
+				      tcp_event->tcp_dpm_data.pps_exit.ma);
+		break;
 	}
 
 	if (ret != TCP_DPM_RET_SUCCESS)
@@ -401,6 +405,7 @@ static inline int pd_handle_tcp_dpm_event(
 	case TCP_DPM_EVT_REQUEST:
 	case TCP_DPM_EVT_REQUEST_EX:
 	case TCP_DPM_EVT_REQUEST_AGAIN:
+	case TCP_DPM_EVT_EXIT_PPS:
 		ret = pd_handle_tcp_event_request(pd_port);
 		break;
 #endif	/* CONFIG_USB_PD_PE_SINK */

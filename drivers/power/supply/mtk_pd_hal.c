@@ -172,6 +172,12 @@ int pd_hal_get_adapter_cap(struct chg_alg_device *alg, struct pd_power_cap *cap)
 	cap->selected_cap_idx = acap.selected_cap_idx;
 	cap->nr = acap.nr;
 	cap->pdp = acap.pdp;
+	cap->source_vid = acap.source_vid;
+	cap->source_pid = acap.source_pid;
+	cap->source_xid = acap.source_xid;
+	cap->source_id_valid = acap.source_id_valid;
+	cap->source_port = acap.source_port;
+	cap->attach_gen = acap.attach_gen;
 	for (i = 0; i < 10; i++) {
 		cap->pwr_limit[i] = acap.pwr_limit[i];
 		cap->min_mv[i] = acap.min_mv[i];
@@ -202,6 +208,19 @@ static int get_pmic_vbus(int *vchr)
 	return ret;
 }
 
+/* PD transition checks must not fall back to a different VBUS source. */
+int pd_hal_get_primary_vbus(struct chg_alg_device *alg)
+{
+	struct pd_hal *hal = chg_alg_dev_get_drv_hal_data(alg);
+	u32 uv;
+	int ret;
+
+	ret = charger_dev_get_vbus(hal->chg1_dev, &uv);
+	if (ret < 0)
+		return ret;
+	return uv / 1000;
+}
+
 int pd_hal_get_vbus(struct chg_alg_device *alg)
 {
 	int ret = 0;
@@ -221,7 +240,7 @@ int pd_hal_get_vbus(struct chg_alg_device *alg)
 		vchr /= 1000;
 	}
 
-	return vchr;
+	return ret < 0 ? ret : vchr;
 }
 
 int pd_hal_get_ibus(struct chg_alg_device *alg, int *ibus)
@@ -362,8 +381,7 @@ int pd_hal_get_input_current(struct chg_alg_device *alg,
 
 	hal = chg_alg_dev_get_drv_hal_data(alg);
 	if (chgidx == CHG1)
-		charger_dev_get_input_current(hal->chg1_dev,
-		ua);
+		return charger_dev_get_input_current(hal->chg1_dev, ua);
 	else if (chgidx == CHG2)
 		charger_dev_get_input_current(hal->chg2_dev,
 		ua);
@@ -380,11 +398,11 @@ int pd_hal_set_input_current(struct chg_alg_device *alg,
 		return -EINVAL;
 
 	hal = chg_alg_dev_get_drv_hal_data(alg);
-	charger_dev_set_input_current(hal->chg1_dev, ua);
-
 	if (chgidx == CHG1)
-		charger_dev_set_input_current(hal->chg1_dev, ua);
-	else if (chgidx == CHG2)
+		return charger_dev_set_input_current(hal->chg1_dev, ua);
+
+	charger_dev_set_input_current(hal->chg1_dev, ua);
+	if (chgidx == CHG2)
 		charger_dev_set_input_current(hal->chg2_dev, ua);
 
 	return 0;

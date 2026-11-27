@@ -20,6 +20,8 @@ struct xiaomi_touch_ops {
 	int (*read_palm)(void *data, u8 *value);
 	int (*write_palm)(void *data, bool enable);
 	int (*request)(void *data, struct xiaomi_touch_request *request);
+	int (*panel_blank)(void *data, bool blank);
+	bool reports_fod;
 };
 
 int devm_xiaomi_touch_register(struct device *dev,
@@ -27,5 +29,9 @@ int devm_xiaomi_touch_register(struct device *dev,
 			      void *data, u32 resolution_factor);
 
 void xiaomi_touch_notify_palm(struct device *dev);
+void xiaomi_touch_report_fod(struct device *dev, bool pressed);
+
+/* DSI0 display blank/low-power transition; sleepable context only. */
+int xiaomi_touch_panel_blank(bool blank);
 
 #endif

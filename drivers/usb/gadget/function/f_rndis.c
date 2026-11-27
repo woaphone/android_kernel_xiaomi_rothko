@@ -92,9 +92,16 @@ static inline struct f_rndis *func_to_rndis(struct usb_function *f)
 /*
  */
 
+/* Wireless RNDIS class tuple used by the MediaTek Android gadget. */
+#define RNDIS_WIRELESS_SUBCLASS		0x01
+#define RNDIS_WIRELESS_PROTOCOL		0x03
+
 #define RNDIS_STATUS_INTERVAL_MS	32
 #define STATUS_BYTECOUNT		8	/* 8 bytes data */
 
+
+/* Protect the shared templates until the bind path copies them. */
+static DEFINE_MUTEX(rndis_desc_lock);
 
 /* interface descriptor: */
 
@@ -681,10 +688,6 @@ rndis_bind(struct usb_configuration *c, struct usb_function *f)
 	}
 
 	scoped_guard(mutex, &rndis_opts->lock) {
-		rndis_iad_descriptor.bFunctionClass = rndis_opts->class;
-		rndis_iad_descriptor.bFunctionSubClass = rndis_opts->subclass;
-		rndis_iad_descriptor.bFunctionProtocol = rndis_opts->protocol;
-
 		if (rndis_opts->bind_count == 0 && !rndis_opts->borrowed_net) {
 			if (!device_is_registered(&rndis_opts->net->dev)) {
 				gether_set_gadget(rndis_opts->net, cdev->gadget);
@@ -696,6 +699,22 @@ rndis_bind(struct usb_configuration *c, struct usb_function *f)
 				return status;
 			net = rndis_opts->net;
 		}
+	}
+
+	guard(mutex)(&rndis_desc_lock);
+	scoped_guard(mutex, &rndis_opts->lock) {
+		if (rndis_opts->mtk_rndis) {
+			rndis_control_intf.bInterfaceClass = USB_CLASS_WIRELESS_CONTROLLER;
+			rndis_control_intf.bInterfaceSubClass = RNDIS_WIRELESS_SUBCLASS;
+			rndis_control_intf.bInterfaceProtocol = RNDIS_WIRELESS_PROTOCOL;
+		} else {
+			rndis_control_intf.bInterfaceClass = USB_CLASS_COMM;
+			rndis_control_intf.bInterfaceSubClass = USB_CDC_SUBCLASS_ACM;
+			rndis_control_intf.bInterfaceProtocol = USB_CDC_ACM_PROTO_VENDOR;
+		}
+		rndis_iad_descriptor.bFunctionClass = rndis_opts->class;
+		rndis_iad_descriptor.bFunctionSubClass = rndis_opts->subclass;
+		rndis_iad_descriptor.bFunctionProtocol = rndis_opts->protocol;
 	}
 
 	us = usb_gstrings_attach(cdev, rndis_strings,
@@ -885,7 +904,7 @@ static void rndis_free_inst(struct usb_function_instance *f)
 	kfree(opts);
 }
 
-static struct usb_function_instance *rndis_alloc_inst(void)
+static struct usb_function_instance *rndis_alloc_inst_common(bool mtk_rndis)
 {
 	struct f_rndis_opts *opts;
 	struct usb_os_desc *descs[1];
@@ -899,7 +918,8 @@ static struct usb_function_instance *rndis_alloc_inst(void)
 
 	mutex_init(&opts->lock);
 	opts->func_inst.free_func_inst = rndis_free_inst;
-	opts->net = gether_setup_default();
+	opts->mtk_rndis = mtk_rndis;
+	opts->net = gether_setup_name_default(mtk_rndis ? "rndis" : "usb");
 	if (IS_ERR(opts->net)) {
 		struct net_device *net = opts->net;
 		kfree(opts);
@@ -907,9 +927,15 @@ static struct usb_function_instance *rndis_alloc_inst(void)
 	}
 	INIT_LIST_HEAD(&opts->rndis_os_desc.ext_prop);
 
-	opts->class = rndis_iad_descriptor.bFunctionClass;
-	opts->subclass = rndis_iad_descriptor.bFunctionSubClass;
-	opts->protocol = rndis_iad_descriptor.bFunctionProtocol;
+	if (mtk_rndis) {
+		opts->class = USB_CLASS_WIRELESS_CONTROLLER;
+		opts->subclass = RNDIS_WIRELESS_SUBCLASS;
+		opts->protocol = RNDIS_WIRELESS_PROTOCOL;
+	} else {
+		opts->class = USB_CLASS_COMM;
+		opts->subclass = USB_CDC_SUBCLASS_ETHERNET;
+		opts->protocol = USB_CDC_PROTO_NONE;
+	}
 
 	descs[0] = &opts->rndis_os_desc;
 	names[0] = "rndis";
@@ -1008,7 +1034,45 @@ static struct usb_function *rndis_alloc(struct usb_function_instance *fi)
 	return &rndis->port.func;
 }
 
-DECLARE_USB_FUNCTION_INIT(rndis, rndis_alloc_inst, rndis_alloc);
+static struct usb_function_instance *rndis_alloc_inst(void)
+{
+	return rndis_alloc_inst_common(false);
+}
+DECLARE_USB_FUNCTION(rndis, rndis_alloc_inst, rndis_alloc);
+
+#ifdef CONFIG_USB_CONFIGFS_MTK_RNDIS
+static struct usb_function_instance *mtk_rndis_alloc_inst(void)
+{
+	return rndis_alloc_inst_common(true);
+}
+DECLARE_USB_FUNCTION(mtk_rndis, mtk_rndis_alloc_inst, rndis_alloc);
+#endif
+
+static int __init rndis_mod_init(void)
+{
+	int ret;
+
+	ret = usb_function_register(&rndisusb_func);
+	if (ret)
+		return ret;
+
+#ifdef CONFIG_USB_CONFIGFS_MTK_RNDIS
+	ret = usb_function_register(&mtk_rndisusb_func);
+	if (ret)
+		usb_function_unregister(&rndisusb_func);
+#endif
+	return ret;
+}
+module_init(rndis_mod_init);
+
+static void __exit rndis_mod_exit(void)
+{
+#ifdef CONFIG_USB_CONFIGFS_MTK_RNDIS
+	usb_function_unregister(&mtk_rndisusb_func);
+#endif
+	usb_function_unregister(&rndisusb_func);
+}
+module_exit(rndis_mod_exit);
 MODULE_DESCRIPTION("RNDIS link function driver");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("David Brownell");

@@ -574,6 +574,9 @@ static void __tcp_event_buf_reset(
 
 	pd_notify_tcp_event_2nd_result(&tcpc->pd_port, reason);
 
+	/* A queued request never entered the failed voltage transition. */
+	if (reason == TCP_DPM_RET_DROP_VBUS_INVALID)
+		reason = TCP_DPM_RET_DROP_CC_DETACH;
 	while (__pd_get_deferred_tcp_event(tcpc, &tcp_event)) {
 		if (tcp_event.event_cb != NULL)
 			tcp_event.event_cb(tcpc, reason, &tcp_event);
@@ -707,7 +710,7 @@ bool pd_put_cc_attached_event(
 	return ret;
 }
 
-void pd_put_cc_detached_event(struct tcpc_device *tcpc)
+void pd_put_cc_detached_event(struct tcpc_device *tcpc, bool vbus_invalid)
 {
 	mutex_lock(&tcpc->access_lock);
 
@@ -721,7 +724,8 @@ void pd_put_cc_detached_event(struct tcpc_device *tcpc)
 	tcpci_notify_hard_reset_state(
 		tcpc, TCP_HRESET_RESULT_FAIL);
 
-	__pd_event_buf_reset(tcpc, TCP_DPM_RET_DROP_CC_DETACH);
+	__pd_event_buf_reset(tcpc, vbus_invalid ? TCP_DPM_RET_DROP_VBUS_INVALID :
+			     TCP_DPM_RET_DROP_CC_DETACH);
 	__pd_put_hw_event(tcpc, PD_HW_CC_DETACHED);
 
 	tcpc->pd_wait_pe_idle = true;

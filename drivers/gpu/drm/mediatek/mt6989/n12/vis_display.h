@@ -10,6 +10,7 @@ void nvt_get_lcm_id_notify(unsigned int (*get_id)(void));
 void vis_display_ops_osc_tricking_notify(int (*osc_tricking)(unsigned int setting));
 int vis_fps_notify(unsigned int fps);
 int vis_dsi_rate_notify(unsigned int rate);
+int n12_vis_mode_notify(unsigned int fps, unsigned int rate);
 int n12_vis_panel_power(bool enable);
 
 /* Actual VIS SPI protocol: no register cache or fabricated READY response. */

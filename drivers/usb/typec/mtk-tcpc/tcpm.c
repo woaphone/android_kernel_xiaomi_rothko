@@ -193,9 +193,10 @@ int tcpm_inquire_vbus_level(struct tcpc_device *tcpc, bool from_ic)
 	if (from_ic) {
 		rv = tcpci_get_power_status(tcpc);
 		if (rv < 0)
-			return rv;
+			goto out;
 	}
 	rv = tcpc->vbus_level;
+out:
 	tcpci_unlock_typec(tcpc);
 
 	return rv;
@@ -694,6 +695,7 @@ int tcpm_get_remote_power_cap(struct tcpc_device *tcpc,
 	int i;
 
 	mutex_lock(&pd_port->pd_lock);
+	remote_cap->attach_gen = pd_port->attach_gen;
 	remote_cap->selected_cap_idx = pd_port->pe_data.selected_cap;
 	remote_cap->nr = pd_port->pe_data.remote_src_cap.nr;
 	for (i = 0; i < remote_cap->nr; i++) {
@@ -959,6 +961,69 @@ int tcpm_dpm_pd_request(struct tcpc_device *tcpc,
 		tcpc, &tcp_event, cb_data, TCPM_BK_REQUEST_TOUT);
 }
 EXPORT_SYMBOL(tcpm_dpm_pd_request);
+
+int tcpm_claim_board_pps(struct tcpc_device *tcpc, u32 attach_gen)
+{
+	struct pd_port *pd_port = &tcpc->pd_port;
+	int ret = -EBUSY;
+
+	mutex_lock(&pd_port->pd_lock);
+	if (!pd_port->board_pps_owned && pd_port->attach_gen == attach_gen &&
+	    pd_port->pe_data.explicit_contract && pd_port->request_v == 5000) {
+		WRITE_ONCE(pd_port->board_pps_owned, true);
+		ret = 0;
+	}
+	mutex_unlock(&pd_port->pd_lock);
+	return ret;
+}
+EXPORT_SYMBOL(tcpm_claim_board_pps);
+
+void tcpm_release_board_pps(struct tcpc_device *tcpc)
+{
+	struct pd_port *pd_port = &tcpc->pd_port;
+
+	mutex_lock(&pd_port->pd_lock);
+	WRITE_ONCE(pd_port->board_pps_owned, false);
+	mutex_unlock(&pd_port->pd_lock);
+}
+EXPORT_SYMBOL(tcpm_release_board_pps);
+
+bool tcpm_board_pps_owned(struct tcpc_device *tcpc)
+{
+	return READ_ONCE(tcpc->pd_port.board_pps_owned);
+}
+EXPORT_SYMBOL(tcpm_board_pps_owned);
+
+int tcpm_dpm_pd_request_pps(struct tcpc_device *tcpc, u32 attach_gen, int mv, int ma)
+{
+	struct tcp_dpm_event event = {
+		.event_id = TCP_DPM_EVT_REQUEST,
+		.tcp_dpm_data.pd_req = {
+			.mv = mv,
+			.ma = ma,
+			.attach_gen = attach_gen,
+			.scoped_pps = true,
+		},
+	};
+
+	return tcpm_put_tcp_dpm_event_cbk1(tcpc, &event, NULL, TCPM_BK_REQUEST_TOUT);
+}
+EXPORT_SYMBOL(tcpm_dpm_pd_request_pps);
+
+int tcpm_dpm_pd_exit_pps(struct tcpc_device *tcpc, u32 attach_gen, int ma)
+{
+	struct tcp_dpm_event event = {
+		.event_id = TCP_DPM_EVT_EXIT_PPS,
+		.tcp_dpm_data.pps_exit.attach_gen = attach_gen,
+		.tcp_dpm_data.pps_exit.ma = ma,
+	};
+
+	if (ma < 10)
+		return TCPM_ERROR_PARAMETER;
+
+	return tcpm_put_tcp_dpm_event_cbk1(tcpc, &event, NULL, TCPM_BK_REQUEST_TOUT);
+}
+EXPORT_SYMBOL(tcpm_dpm_pd_exit_pps);
 
 int tcpm_dpm_pd_request_ex(struct tcpc_device *tcpc,
 	uint8_t pos, int vmin, uint32_t max, uint32_t oper,
@@ -1595,6 +1660,10 @@ int tcpm_set_pd_charging_policy(struct tcpc_device *tcpc,
 		return TCPM_ERROR_PARAMETER;
 
 	mutex_lock(&pd_port->pd_lock);
+	if (pd_port->board_pps_owned) {
+		mutex_unlock(&pd_port->pd_lock);
+		return TCPM_ERROR_INVALID_POLICY;
+	}
 	if (pd_port->dpm_charging_policy == policy) {
 		mutex_unlock(&pd_port->pd_lock);
 		return TCPM_SUCCESS;
@@ -1683,7 +1752,7 @@ int tcpm_set_apdo_charging_policy(struct tcpc_device *tcpc,
 		return TCPM_ERROR_PARAMETER;
 
 	mutex_lock(&pd_port->pd_lock);
-	if (!pd_is_source_support_apdo(pd_port)) {
+	if (pd_port->board_pps_owned || !pd_is_source_support_apdo(pd_port)) {
 		mutex_unlock(&pd_port->pd_lock);
 		return TCPM_ERROR_INVALID_POLICY;
 	}
@@ -2065,6 +2134,7 @@ static const char * const bk_event_ret_name[] = {
 
 	"BKTOUT",
 	"NoResponse",
+	"VbusInvalid",
 };
 #endif /* TCPM_DBG_ENABLE */
 

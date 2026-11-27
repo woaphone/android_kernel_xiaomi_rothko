@@ -795,6 +795,8 @@ struct dpm_pdo_info_t {
 struct pd_port {
 	struct tcpc_device *tcpc;
 	struct mutex pd_lock;
+	u32 attach_gen;
+	bool board_pps_owned;
 
 	/* PD */
 	uint8_t state_machine;
@@ -805,6 +807,7 @@ struct pd_port {
 
 	uint8_t pe_state_next;
 	uint8_t pe_state_curr;
+	u8 pending_snk_cap;
 
 	uint8_t data_role;
 	uint8_t power_role;

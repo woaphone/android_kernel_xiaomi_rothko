@@ -55,8 +55,10 @@
 #define AW86927_PLAYCFG3_REG			0x08
 #define AW86927_PLAYCFG3_AUTO_BST_MASK		GENMASK(4, 4)
 #define AW86927_PLAYCFG3_AUTO_BST_DISABLE	0
+#define AW86927_PLAYCFG3_BRK_EN			BIT(2)
 #define AW86927_PLAYCFG3_PLAY_MODE_MASK		GENMASK(1, 0)
 #define AW86927_PLAYCFG3_PLAY_MODE_RAM		0
+#define AW86927_PLAYCFG3_PLAY_MODE_CONT		2
 
 #define AW86927_PLAYCFG4_REG			0x09
 #define AW86927_PLAYCFG4_STOP			BIT(1)
@@ -74,18 +76,29 @@
 
 #define AW86927_CONTCFG1_REG			0x18
 #define AW86927_CONTCFG1_BRK_BST_MD_MASK	GENMASK(6, 6)
+#define AW86927_CONTCFG1_F0_DET			BIT(5)
+#define AW86927_CONTCFG3_REG			0x1a
 
 #define AW86927_CONTCFG5_REG			0x1c
 #define AW86927_CONTCFG5_BST_BRK_GAIN_MASK	GENMASK(7, 4)
 #define AW86927_CONTCFG5_BRK_GAIN_MASK		GENMASK(3, 0)
 
+#define AW86927_CONTCFG6_REG			0x1d
+#define AW86927_CONTCFG6_TRACK_EN		BIT(7)
+#define AW86927_CONTCFG7_REG			0x1e
+#define AW86927_CONTCFG8_REG			0x1f
+#define AW86927_CONTCFG9_REG			0x20
+
 #define AW86927_CONTCFG10_REG			0x21
 #define AW86927_CONTCFG10_BRK_TIME_MASK		GENMASK(7, 0)
 #define AW86927_CONTCFG10_BRK_TIME_DEFAULT	8
 
+#define AW86927_CONTCFG11_REG			0x22
 #define AW86927_CONTCFG13_REG			0x24
 #define AW86927_CONTCFG13_TSET_MASK		GENMASK(7, 4)
 #define AW86927_CONTCFG13_BEME_SET_MASK		GENMASK(3, 0)
+#define AW86927_LRA_F0_H_REG			0x25
+#define AW86927_F0_COUNTER_HZ			384000
 
 #define AW86927_BASEADDRH_REG			0x2d
 #define AW86927_BASEADDRL_REG			0x2e
@@ -190,6 +203,7 @@ struct aw86927_data {
 	u8 selected_wave, level;
 	u16 gain, duration;
 	int playing_id;
+	u32 f0_value;
 	bool running, loop, play_pending, gain_pending;
 };
 
@@ -296,6 +310,108 @@ static int aw86927_stop(struct aw86927_data *haptics)
 }
 
 static int aw86927_prepare_waveforms(struct aw86927_data *haptics);
+
+static int aw86927_init_f0(struct aw86927_data *haptics)
+{
+	struct regmap *regmap = haptics->regmap;
+	struct device *dev = haptics->dev;
+	u32 nominal, tolerance, drv1, drv2, time1, time2, margin, width;
+	unsigned int boost, play, cont, vbat, det, period, f0;
+	u8 raw[2];
+	int ret, stopped, restored;
+	struct reg_sequence setup[11], restore[5];
+
+	if (device_property_read_u32(dev, "aw86927_vib_f0_pre", &nominal) ||
+	    device_property_read_u32(dev, "aw86927_vib_f0_cali_percen", &tolerance) ||
+	    device_property_read_u32(dev, "aw86927_vib_cont_drv1_lvl", &drv1) ||
+	    device_property_read_u32(dev, "aw86927_vib_cont_drv2_lvl", &drv2) ||
+	    device_property_read_u32(dev, "aw86927_vib_cont_drv1_time", &time1) ||
+	    device_property_read_u32(dev, "aw86927_vib_cont_drv2_time", &time2) ||
+	    device_property_read_u32(dev, "aw86927_vib_cont_track_margin", &margin) ||
+	    device_property_read_u32(dev, "aw86927_vib_cont_drv_width", &width) ||
+	    !nominal || nominal > U16_MAX || tolerance > 100 ||
+	    drv1 > 0x7f || drv2 > 0x7f || !time1 || time1 >= U8_MAX ||
+	    !time2 || time2 >= U8_MAX || !margin || margin > U8_MAX || width > U8_MAX)
+		return -EINVAL;
+
+	ret = regmap_read(regmap, AW86927_PLAYCFG1_REG, &boost);
+	if (ret)
+		return ret;
+	ret = regmap_read(regmap, AW86927_PLAYCFG3_REG, &play);
+	if (ret)
+		return ret;
+	ret = regmap_read(regmap, AW86927_CONTCFG1_REG, &cont);
+	if (ret)
+		return ret;
+	ret = regmap_read(regmap, AW86927_VBATCTRL_REG, &vbat);
+	if (ret)
+		return ret;
+	ret = regmap_read(regmap, AW86927_DETCFG2_REG, &det);
+	if (ret)
+		return ret;
+
+	setup[0] = (struct reg_sequence) { AW86927_PLAYCFG1_REG,
+					 boost & ~AW86927_PLAYCFG1_BST_MODE_MASK };
+	setup[1] = (struct reg_sequence) { AW86927_PLAYCFG3_REG,
+					 (play & ~AW86927_PLAYCFG3_PLAY_MODE_MASK) |
+					 AW86927_PLAYCFG3_PLAY_MODE_CONT | AW86927_PLAYCFG3_BRK_EN };
+	setup[2] = (struct reg_sequence) { AW86927_CONTCFG1_REG, cont | AW86927_CONTCFG1_F0_DET };
+	setup[3] = (struct reg_sequence) { AW86927_CONTCFG6_REG, AW86927_CONTCFG6_TRACK_EN | drv1 };
+	setup[4] = (struct reg_sequence) { AW86927_CONTCFG7_REG, drv2 };
+	setup[5] = (struct reg_sequence) { AW86927_CONTCFG8_REG, time1 };
+	setup[6] = (struct reg_sequence) { AW86927_CONTCFG9_REG, time2 };
+	setup[7] = (struct reg_sequence) { AW86927_CONTCFG11_REG, margin };
+	setup[8] = (struct reg_sequence) { AW86927_CONTCFG3_REG, width };
+	setup[9] = (struct reg_sequence) { AW86927_VBATCTRL_REG, vbat | AW86927_VBATCTRL_VBAT_MODE_MASK };
+	setup[10] = (struct reg_sequence) { AW86927_DETCFG2_REG, det | AW86927_DETCFG2_D2S_GAIN_MASK };
+	ret = regmap_multi_reg_write(regmap, setup, ARRAY_SIZE(setup));
+	if (!ret)
+		ret = regmap_write(regmap, AW86927_PLAYCFG4_REG, AW86927_PLAYCFG4_GO);
+	if (!ret) {
+		usleep_range(20000, 20500);
+		ret = aw86927_wait_enter_standby(haptics);
+	}
+	if (!ret)
+		ret = regmap_bulk_read(regmap, AW86927_LRA_F0_H_REG, raw, sizeof(raw));
+
+	stopped = aw86927_stop(haptics);
+	restore[0] = (struct reg_sequence) { AW86927_CONTCFG1_REG, cont };
+	restore[1] = (struct reg_sequence) { AW86927_PLAYCFG3_REG, play };
+	restore[2] = (struct reg_sequence) { AW86927_PLAYCFG1_REG, boost };
+	restore[3] = (struct reg_sequence) { AW86927_VBATCTRL_REG, vbat };
+	restore[4] = (struct reg_sequence) { AW86927_DETCFG2_REG, det };
+	restored = regmap_multi_reg_write(regmap, restore, ARRAY_SIZE(restore));
+	if (stopped || restored)
+		return stopped ?: restored;
+
+	period = ret ? 0 : get_unaligned_be16(raw);
+	f0 = period ? AW86927_F0_COUNTER_HZ * 10 / period : 0;
+	if (f0 < nominal * (100 - tolerance) / 100 ||
+	    f0 > nominal * (100 + tolerance) / 100) {
+		dev_warn(dev, "LRA F0 sample %u invalid (%d); using nominal %u (0.1 Hz)\n",
+			 f0, ret, nominal);
+		f0 = nominal;
+	}
+	haptics->f0_value = f0;
+	return 0;
+}
+
+static ssize_t f0_value_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct aw86927_data *haptics = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", haptics->f0_value);
+}
+static DEVICE_ATTR_RO(f0_value);
+
+static struct attribute *aw86927_attrs[] = {
+	&dev_attr_f0_value.attr,
+	NULL,
+};
+static const struct attribute_group aw86927_group = {
+	.attrs = aw86927_attrs,
+};
 
 static int aw86927_upload(struct input_dev *dev, struct ff_effect *effect,
 			  struct ff_effect *old)
@@ -922,6 +1038,13 @@ static int aw86927_probe(struct i2c_client *client)
 	err = aw86927_haptic_init(haptics);
 	if (err)
 		return dev_err_probe(haptics->dev, err, "Haptic init failed\n");
+
+	err = aw86927_init_f0(haptics);
+	if (err)
+		return dev_err_probe(haptics->dev, err, "F0 initialization failed\n");
+	err = devm_device_add_group(haptics->dev, &aw86927_group);
+	if (err)
+		return dev_err_probe(haptics->dev, err, "Cannot expose F0 to vibrator HAL\n");
 
 	err = input_register_device(haptics->input_dev);
 	if (err)

@@ -285,6 +285,14 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	*cmdline_p = boot_command_line;
 
+	if (IS_ENABLED(CONFIG_ROTHKO_NOGZ_HCRX_TEST) &&
+	    (id_aa64mmfr1_override.mask & ID_AA64MMFR1_EL1_HCX_MASK)) {
+		u64 mmfr1 = read_sysreg(id_aa64mmfr1_el1);
+
+		pr_info("Rothko NoGZ HCRX test: EL2 entry, raw HCX=%lu, HCRX untouched\n",
+			FIELD_GET(ID_AA64MMFR1_EL1_HCX_MASK, mmfr1));
+	}
+
 	kaslr_init();
 
 	early_fixmap_init();

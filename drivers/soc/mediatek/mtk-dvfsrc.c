@@ -16,6 +16,7 @@
 #include <linux/soc/mediatek/dvfsrc.h>
 #include <linux/soc/mediatek/mtk_sip_svc.h>
 #include <linux/spinlock.h>
+#include <linux/unaligned.h>
 
 #include "mtk-dvfsrc-rothko-helper.h"
 
@@ -30,6 +31,7 @@
 
 #define DVFSRC_MT6989_DRAM_REQ		GENMASK(15, 12)
 #define DVFSRC_MT6989_DRAM_CUR		GENMASK(3, 0)
+#define DVFSRC_MT6989_MAX_OPP		GENMASK(26, 20)
 #define DVFSRC_V2_SW_REQ_DRAM_LEVEL	GENMASK(3, 0)
 #define DVFSRC_V2_SW_REQ_VCORE_LEVEL	GENMASK(6, 4)
 
@@ -84,6 +86,7 @@ struct mtk_dvfsrc {
 	struct dvfsrc_opp_desc dynamic_opps;
 	spinlock_t req_lock;
 	bool opp_forced;
+	bool firmware_disabled;
 };
 
 struct dvfsrc_soc_data {
@@ -565,8 +568,12 @@ int mtk_dvfsrc_send_request(const struct device *dev, u32 cmd, u64 data)
 			dvfsrc->dvd->set_dram_peak_bw(dvfsrc, data);
 		return 0;
 	case MTK_DVFSRC_CMD_DRAM_GEAR:
+		if (dvfsrc->firmware_disabled)
+			return -EOPNOTSUPP;
 		return dvfsrc_request_mt6989_dram_gear(dvfsrc, data);
 	case MTK_DVFSRC_CMD_OPP:
+		if (dvfsrc->firmware_disabled)
+			return -EOPNOTSUPP;
 		if (dvfsrc->num_opp && data >= dvfsrc->num_opp)
 			return -EINVAL;
 
@@ -588,6 +595,10 @@ int mtk_dvfsrc_send_request(const struct device *dev, u32 cmd, u64 data)
 		dev_err(dvfsrc->dev, "unknown command: %d\n", cmd);
 		return -EOPNOTSUPP;
 	}
+
+	/* Stock keeps VCORE votes but does not wait for transitions in this mode. */
+	if (dvfsrc->firmware_disabled)
+		return 0;
 
 	/* DVFSRC needs at least 2T(~196ns) to handle a request */
 	udelay(STARTUP_TIME_US);
@@ -662,6 +673,9 @@ static int mtk_dvfsrc_register_mt6989_children(struct mtk_dvfsrc *dvfsrc)
 	if (ret)
 		return ret;
 
+	if (dvfsrc->firmware_disabled)
+		goto register_emi;
+
 	start = platform_device_register_data(dvfsrc->dev, "mtk-dvfsrc-start",
 					     PLATFORM_DEVID_AUTO, NULL, 0);
 	if (IS_ERR(start))
@@ -683,6 +697,7 @@ static int mtk_dvfsrc_register_mt6989_children(struct mtk_dvfsrc *dvfsrc)
 			return ret;
 	}
 
+register_emi:
 	if (!IS_ENABLED(CONFIG_INTERCONNECT_MTK_EMI))
 		return 0;
 
@@ -700,7 +715,7 @@ static int mtk_dvfsrc_init_mt6989_opps(struct mtk_dvfsrc *dvfsrc)
 	struct dvfsrc_opp *opps;
 	u32 max_opp, i;
 
-	max_opp = FIELD_GET(GENMASK(26, 20),
+	max_opp = FIELD_GET(DVFSRC_MT6989_MAX_OPP,
 			    dvfsrc_readl(dvfsrc, DVFSRC_BASIC_CONTROL));
 	if (!max_opp)
 		return dev_err_probe(dvfsrc->dev, -EINVAL,
@@ -733,6 +748,23 @@ static int mtk_dvfsrc_init_mt6989_opps(struct mtk_dvfsrc *dvfsrc)
 	return 0;
 }
 
+static bool mt6989_dvfsrc_recovery_disabled(struct mtk_dvfsrc *dvfsrc)
+{
+	const __le32 *boot;
+	int len;
+
+	if (dvfsrc->dvd->regs != dvfsrc_mt6989_regs ||
+	    !of_machine_is_compatible("mediatek,MT6989"))
+		return false;
+
+	/* LK atag,boot: little-endian size, tag, mode, type. */
+	boot = of_get_property(of_chosen, "atag,boot", &len);
+	return boot && len >= 4 * sizeof(*boot) &&
+	       get_unaligned_le32(boot + 2) == 2 &&
+	       !FIELD_GET(DVFSRC_MT6989_MAX_OPP,
+			  dvfsrc_readl(dvfsrc, DVFSRC_BASIC_CONTROL));
+}
+
 static int mtk_dvfsrc_probe(struct platform_device *pdev)
 {
 	struct arm_smccc_res ares;
@@ -753,8 +785,22 @@ static int mtk_dvfsrc_probe(struct platform_device *pdev)
 
 	arm_smccc_smc(MTK_SIP_DVFSRC_VCOREFS_CONTROL, MTK_SIP_DVFSRC_INIT,
 		      0, 0, 0, 0, 0, 0, &ares);
-	if (ares.a0)
-		return dev_err_probe(&pdev->dev, -EINVAL, "DVFSRC init failed: %lu\n", ares.a0);
+	if (ares.a0) {
+		if (!mt6989_dvfsrc_recovery_disabled(dvfsrc))
+			return dev_err_probe(&pdev->dev, -EINVAL,
+					     "DVFSRC init failed: %lu\n", ares.a0);
+
+		/* Recovery still needs the real VCORE and EMI providers. */
+		dvfsrc->firmware_disabled = true;
+		platform_set_drvdata(pdev, dvfsrc);
+		ret = mtk_dvfsrc_register_mt6989_children(dvfsrc);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "Failed to register Recovery DVFSRC providers\n");
+
+		dev_info(&pdev->dev, "Recovery DVFS disabled (firmware status %#lx)\n", ares.a0);
+		return 0;
+	}
 
 	dvfsrc->dram_type = ares.a1;
 	dvfsrc_dram_type = dvfsrc->dram_type;

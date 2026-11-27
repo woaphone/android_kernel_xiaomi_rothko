@@ -26,6 +26,14 @@ config DRM_ROTHKO_N12
 	  Build the N12 command-mode DSI panel and its Novatek VIS SPI
 	  controller for Redmi K70 Ultra (rothko).
 
+config DRM_ROTHKO_N12_HIGH_REFRESH_TEST
+	bool "Experimental 165 Hz and 185 Hz modes for Rothko N12"
+	depends on DRM_ROTHKO_N12
+	help
+	  Advertise experimental high-refresh DRM modes using the existing
+	  144 Hz panel commands and higher pixel and DSI clocks. The stock
+	  modes and preferred mode are unchanged. Enable only for testing.
+
 source "drivers/gpu/drm/mediatek/mt6989/mml/Kconfig"
 source "drivers/gpu/drm/mediatek/mt6989/dpc/Kconfig"
 

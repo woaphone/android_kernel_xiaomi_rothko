@@ -20,12 +20,16 @@
 #include <linux/umh.h>
 #include <linux/security.h>
 #include <linux/overflow.h>
+#include <linux/lz4.h>
+#include <linux/of.h>
+#include <linux/unaligned.h>
 
 #include "do_mounts.h"
 #include "initramfs_internal.h"
 
 static __initdata bool csum_present;
 static __initdata u32 io_csum;
+static __initdata bool cpio_trailer_seen;
 
 static ssize_t __init xwrite(struct file *file, const unsigned char *p,
 		size_t count, loff_t *pos)
@@ -372,6 +376,7 @@ static int __init do_name(void)
 	}
 
 	if (strcmp(collected, "TRAILER!!!") == 0) {
+		cpio_trailer_seen = true;
 		free_hash();
 		return 0;
 	}
@@ -499,16 +504,55 @@ static unsigned long my_inptr __initdata; /* index of next byte to be processed 
 
 #include <linux/decompress/generic.h>
 
-/**
- * unpack_to_rootfs - decompress and extract an initramfs archive
- * @buf: input initramfs archive to extract
- * @len: length of initramfs data to process
- *
- * Returns: NULL for success or an error message string
- *
- * This symbol shouldn't be used externally. It's available for unit tests.
- */
-char * __init unpack_to_rootfs(char *buf, unsigned long len)
+static bool __init rothko_recovery_initrd(void)
+{
+	struct device_node *chosen;
+	const __le32 *boot;
+	bool recovery;
+	int len;
+
+	if (!IS_ENABLED(CONFIG_ROTHKO_HWID) ||
+	    !of_machine_is_compatible("mediatek,MT6989"))
+		return false;
+
+	chosen = of_find_node_by_path("/chosen");
+	boot = of_get_property(chosen, "atag,boot", &len);
+	recovery = boot && len >= 4 * sizeof(*boot) &&
+		   get_unaligned_le32(boot + 2) == 2;
+	of_node_put(chosen);
+	return recovery;
+}
+
+static unsigned long __init rothko_recovery_lz4_len(const char *buf,
+						   unsigned long len)
+{
+	const u32 legacy_magic = 0x184c2102;
+	unsigned long offset = sizeof(legacy_magic);
+
+	if (len < offset || get_unaligned_le32(buf) != legacy_magic)
+		return len;
+
+	while (len - offset >= sizeof(u32)) {
+		const u8 *next = (const u8 *)buf + offset;
+		u32 chunk = get_unaligned_le32(next);
+
+		if (offset > sizeof(legacy_magic) && len - offset >= 18 &&
+		    next[0] == 0x1f && next[1] == 0x8b && next[2] == 8 &&
+		    !(next[3] & 0xe0))
+			return offset;
+		offset += sizeof(chunk);
+		if (chunk == legacy_magic)
+			continue;
+		if (!chunk || chunk > LZ4_COMPRESSBOUND(8 << 20) ||
+		    chunk > len - offset)
+			break;
+		offset += chunk;
+	}
+	return len;
+}
+
+static char * __init unpack_initramfs(char *buf, unsigned long len,
+				     bool recovery)
 {
 	long written;
 	decompress_fn decompress;
@@ -531,6 +575,7 @@ char * __init unpack_to_rootfs(char *buf, unsigned long len)
 	message = NULL;
 	while (!message && len) {
 		loff_t saved_offset = this_header;
+		unsigned long member_len = len;
 		if (*buf == '0' && !(this_header & 3)) {
 			state = Start;
 			written = write_buffer(buf, len);
@@ -548,10 +593,18 @@ char * __init unpack_to_rootfs(char *buf, unsigned long len)
 		decompress = decompress_method(buf, len, &compress_name);
 		pr_debug("Detected %s compressed data\n", compress_name);
 		if (decompress) {
-			int res = decompress(buf, len, NULL, flush_buffer, NULL,
-				   &my_inptr, error);
+			int res;
+
+			if (recovery && !strcmp(compress_name, "lz4"))
+				member_len = rothko_recovery_lz4_len(buf, len);
+			cpio_trailer_seen = false;
+			res = decompress(buf, member_len, NULL, flush_buffer, NULL,
+					 &my_inptr, error);
 			if (res)
 				error("decompressor failed");
+			if (member_len != len &&
+			    (!cpio_trailer_seen || my_inptr != member_len))
+				error("incomplete Recovery LZ4 archive");
 		} else if (compress_name) {
 			pr_err("compression method %s not configured\n",
 			       compress_name);
@@ -569,6 +622,20 @@ char * __init unpack_to_rootfs(char *buf, unsigned long len)
 	free_hash();
 	kfree(bufs);
 	return message;
+}
+
+/**
+ * unpack_to_rootfs - decompress and extract an initramfs archive
+ * @buf: input initramfs archive to extract
+ * @len: length of initramfs data to process
+ *
+ * Returns: NULL for success or an error message string
+ *
+ * This symbol shouldn't be used externally. It's available for unit tests.
+ */
+char * __init unpack_to_rootfs(char *buf, unsigned long len)
+{
+	return unpack_initramfs(buf, len, false);
 }
 
 static int __initdata do_retain_initrd;
@@ -730,7 +797,8 @@ static void __init do_populate_rootfs(void *unused, async_cookie_t cookie)
 	else
 		printk(KERN_INFO "Unpacking initramfs...\n");
 
-	err = unpack_to_rootfs((char *)initrd_start, initrd_end - initrd_start);
+	err = unpack_initramfs((char *)initrd_start, initrd_end - initrd_start,
+			       rothko_recovery_initrd());
 	if (err) {
 #ifdef CONFIG_BLK_DEV_RAM
 		populate_initrd_image(err);

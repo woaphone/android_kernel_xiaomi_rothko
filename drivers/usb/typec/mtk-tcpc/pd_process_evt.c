@@ -182,6 +182,7 @@ static const char *const tcp_dpm_evt_name[] = {
 	"request",
 	"request_ex",
 	"request_again",
+	"exit_pps",
 	"bist_cm2",
 	"dummy",
 
@@ -224,6 +225,7 @@ static const char *const tcp_dpm_evt_name[] = {
 	"hard_reset",
 	"error_recovery",
 };
+static_assert(ARRAY_SIZE(tcp_dpm_evt_name) == TCP_DPM_EVT_NR);
 
 static inline void print_tcp_event(struct tcpc_device *tcpc,
 	uint8_t msg, uint8_t from)
@@ -766,6 +768,7 @@ static inline bool pe_transit_startup_state(
 	if (startup_state == 0xff)
 		return false;
 
+	pd_port->attach_gen++;
 	pd_dpm_notify_pe_startup(pd_port);
 	PE_TRANSIT_STATE(pd_port, startup_state);
 
