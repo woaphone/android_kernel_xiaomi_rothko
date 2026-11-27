@@ -1,34 +1,34 @@
 # 红米 K70 至尊版（rothko）· ACK 6.18 内核移植
 
-这是面向红米 K70 至尊版（`rothko`，MediaTek MT6989）的实验性内核移植，基于 **Android Common Kernel（ACK）6.18.33**，上游分支为 `android17-6.18`。实机验证使用的是 **Android 15 用户态**；`android17-6.18` 是内核源码分支名，不代表本项目移植了 Android 17 ROM。
+这是面向红米 K70 至尊版（`rothko`，MediaTek MT6989）的实验性内核移植，基于 **Android Common Kernel（ACK）6.18.33**，上游分支为 `android17-6.18`。实机主要在 **Android 15（HyperOS 2，NoGZ 普通 VHE）** 上验证，同时也在 Android 14–18 环境进行过兼容性适配；`android17-6.18` 是上游内核分支名，不代表本项目移植了 Android 17 ROM。
 
-本仓库是 ACK 工作区的 **`common/` 源码树**，不包含完整 Android 系统、可直接刷入的 `boot.img`、签名私钥、原厂 HAL 或固件。本项目不是小米或 Google 的官方发布，也不建议在未保留恢复方案的日用设备上部署。
+本仓库是 ACK 工作区的 **`common/` 源码树**，不包含完整 Android 系统、签名私钥、原厂 HAL 或固件。当前 `rothko-android17-6.18` 分支为**单 `boot.img` 整核内建形态**（将 MT6989/rothko 驱动编入内核）；拆分为标准 GKI `boot` + `vendor_boot`（DTB 与首阶段 `.ko`）+ `vendor_dlkm` + `system_dlkm` 的模块化工作正在独立新分支推进。本项目不是小米或 Google 的官方发布，请务必保留备份与恢复手段。
 
-## 功能与实测状态
+## 功能与当前状态
 
-下表汇总的是同一台 `rothko` 在**不同阶段构建**中的验证结果，不表示每项功能都在当前公开提交上重新测过。已接入驱动、设备已枚举与完整可用分别记录。
+下表按同一台 `rothko` 的最新实机验证与离线接入进度如实区分**已实机验证**、**部分可用**与**刚接入待实测**状态：
 
 | 功能 | 当前状态 |
 | --- | --- |
-| Android 启动、USB 调试 | 实机进入 Android，USB ADB 可用。ADB 正常不等于所有 USB 模式、Type-C 附件或 OTG 均已验收。 |
-| 显示、触控与按键 | 实体屏、Goodix 触控和物理按键已恢复；Mali、DRM/HWC 与 N12 面板已有适配。不同面板批次和 AOD 长待机仍需回归。 |
-| 手电筒 | 实体点亮已确认。OCP81373 常亮路径接入了外置电量计和实际功率预算，保留低预算保护。相机拍照主闪、完整热控 ABI 尚未验收。 |
-| Wi-Fi | MT6639 已在实机连接并取得收发记录；系统睡眠后的恢复与长待机仍待验证。 |
-| 蓝牙 | 已在阶段构建中验证连接恢复；未覆盖所有编解码器、外设和长时间回归。 |
-| 音频 | 基础音频已由实机确认可用；不代表 DSP 压缩卸载和所有音频周边路径均通过。 |
-| 蜂窝网络 | 移动数据、短信在阶段构建中实测正常；通话、IMS/VoLTE 和完整运营商兼容性未作全面验收。 |
-| 相机和媒体 | 相机已有实机初测，前摄有真实出帧记录；Codec2 硬解与 MDP 后处理已有任务回执。全摄像头、拍照闪光、录像、编解码组合及性能仍需逐项测试。 |
-| NFC、GNSS、传感器、振动 | 有相应驱动或接口适配；不能用节点出现代替读卡、定位、传感器覆盖、振感及 eSE 业务验收。 |
-| 电池与温控 | 外置 BMS 电量、温度和 PPB 预算已在实机读取；接入板级热控与充电相关驱动，完整充电策略见下节。 |
-| KernelSU、pstore | 开发构建可选内置 KernelSU；普通 ramoops/pstore 用于保留重启和睡眠诊断信息。 |
+| Android 启动、NoGZ VHE 与 MiTEE | 已实机验证。兼容 Android 15 `libvintf` 内核命名；NoGZ 普通 VHE 启动正常，FF-A / MiTEE（`0x8001`）、Gatekeeper 与 KeyMint 正常绑定。 |
+| USB 调试、网络共享与 Recovery | 已实机验证。USB ADB 与 MTK RNDIS USB 共享网络可用；OrangeFox Recovery 混合 LZ4+gzip initramfs 解包与 DVFSRC 路径已修复。 |
+| 显示、高刷与 AOD | 已实机验证。0A/0B 面板点亮、常规刷新率与 VIS 高刷同步、普通 AOD 正常；包含实验性 165/185 Hz 测试档。 |
+| 屏下指纹与触控 | 已实机验证（亮屏与普通 AOD）。物理指纹驱动 `xiaomi_spi_tee`（`/dev/xiaomi-fp`）、`/dev/mi_display/disp_feature` 局部高亮与 Goodix FOD 触控已打通，亮屏与普通 AOD 解锁可用；全黑深度休眠息屏指纹仍待完善。 |
+| 触觉马达 | 已实机验证基础与侧滑返回触觉。AW86927 实测 LRA F0 频率并暴露只读 `f0_value` 节点，侧滑返回与系统预置波形已恢复；流式 RTP / `custom_wave` 仍在核对。 |
+| 普通 CPU 深态与调度 | 已实机验证。已恢复 MCUPM Alive / 校时与 MCDI phase 3，八核 MCUSYS-off / system-vcore 普通空闲深态驻留已恢复增长；MT6989 CCI 双档联动调频已补齐；内置只读默认状态的 MCUPM UV32 通道。 |
+| 电池、双泵 PPS 与 120W 快充 | **双泵 PPS 已实机验证；小米 120W 私有协议刚离线接入待实测**。外置 BQ27xxx BMS 电量/温度/电流正负号已校准；双 SC858x 4:1 电荷泵 PPS 直充已实机启泵带载，状态栏快充与 55 W 锁屏瓦数接口已恢复。`9b485e15` 新增 `Charging_Adapter/pd_adapter` 15 节点、`"SNK_Ready"` 映射、SVID `0x2717`/`0x2b01` UVDM 与 `MTK_PD_APDO_REGAIN` 120 W 策略，待原装 120 W 充电器实机验证。 |
+| Wi-Fi、热点与蓝牙 | 已实机验证基础功能。MT6639 Wi-Fi（含 PCIe 父子拓扑与休眠恢复修复）、热点 ACS/P2P 尾数组与蓝牙连接可用；长待机与全编解码回归仍需继续。 |
+| 手电筒 | 已实机验证常亮。OCP81373 常亮路径已接入外置电量计与 PPB 实际电池预算；相机拍照主闪脉冲与完整热控 ABI 仍待完善。 |
+| 音频、蜂窝与相机/媒体 | 部分实机验证。基础音频、移动数据与短信、前摄出帧及 Codec2 硬解已有实测记录；OS4 VOW 大模型共享区、全摄像头/录像、通话与 IMS 仍需逐项验收。 |
+| NFC、GNSS、传感器 | 已接入驱动与接口；完整读卡、eSE、定位与全传感器长期稳定性仍需实测验收。 |
+| KernelSU 与 pstore | 测试构建启用 KernelSU（v3.3.1）与普通 ramoops/pstore（保留重启与睡眠诊断信息）。 |
 
-## 三项主要遗留
+## 已知遗留与下一步
 
-1. **息屏睡死／睡眠后自动重启**：系统能走到 `s2idle` 的部分阶段，但曾在挂起等待或恢复附近出现异常。诊断版增加了等待、唤醒通知和返回标记；尚无完整回归证明问题已修复。
-2. **普通 CPU 深态**：实机普通空闲采样中，各核深态进入次数与驻留时间仍未增长，曾记录 PSCI 固件返回 `-2`。已补 MCUPM/MCDI 校时及握手观测，尚未恢复稳定驻留。它与系统 `s2idle` 是两项不同的验收。
-3. **充电与原厂快充**：基础上报、固定档 USB PD 协商和充电在阶段构建中有实测记录，不是完全不能充。原厂级双 SC858x 充电泵、PPS 直充、温控限流与降档等尚未完整实现或验收，不宣称达到原厂充电功率。
-
-**另有未完成项：**屏下指纹目前未接入物理指纹驱动，虚拟 HAL 不算解锁可用；OrangeFox Recovery 尚未完成实机闭环。全功能和功耗、性能也未完成全面原厂对照。
+1. **小米 120 W 私有快充实机验收**：`9b485e15` 已离线完成 `batterysecret` UVDM 认证与 20 V / 6 A 双泵放开逻辑，仍待原装 120 W 充电器实测握手、满载温控、拔线退档与第三方 PPS 回归。
+2. **系统深度睡眠（`s2idle`）长待机与全黑息屏指纹**：普通 CPU 深态与 MT6639 `noirq` 拓扑已修复，但长时间 `s2idle` 待机耗电、Wi-Fi 唤醒与全黑状态息屏指纹仍需持续回归。
+3. **多媒体与外设长尾项**：OS4 VOW 模型尺寸兼容、AW86927 `custom_wave` 流式触觉、相机多摄与拍照主闪脉冲等。
+4. **标准 GKI 四分区拆分（进行中）**：正在独立新分支将当前整核形态拆分为标准 GKI `boot` + `vendor_boot`（DTB + 首阶段 `.ko`）+ `vendor_dlkm` + `system_dlkm`。
 
 ## 构建
 
@@ -39,11 +39,11 @@
 ```sh
 tools/bazel run --config=fast --jobs=8 --lto=none \
   --incompatible_autoload_build_config_constants=if_unset \
-  --defconfig_fragment=//common:rothko_kernelsu_defconfigs \
+  --defconfig_fragment=//common:rothko_nogz_vhe_n12_power_defconfigs \
   //common:rothko_dist -- --destdir=out/rothko/dist
 ```
 
-产物在 `out/rothko/dist/`。上述是项目用过的**诊断配置**，含 KernelSU 和 SELinux 宽容诊断选项，并非生产安全配置。原开发树的诊断内核已构建成功；当前公开源码未在全新工作区独立复建。内核构建产物也不等于可直接刷机的启动镜像。
+产物位于 `out/rothko/dist/`（包含 `Image.lz4`、`vmlinux` 与少量 `.ko`）。上述配置面向 NoGZ 普通 VHE 测试环境，含 KernelSU 与诊断选项，并非生产安全配置。
 
 ## 源码来源与许可
 
