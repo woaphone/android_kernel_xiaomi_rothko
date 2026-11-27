@@ -4,6 +4,7 @@
  * Author Wy Chuang<wy.chuang@mediatek.com>
  */
 
+#include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -152,6 +153,92 @@ static void find_active_idx_and_notification(struct mtk_pd_adapter_info *info,
 	info->active_idx = active_idx;
 }
 
+static void pd_reset_xiaomi_state(struct adapter_device *adapter)
+{
+	if (!adapter)
+		return;
+	adapter->adapter_svid = 0;
+	adapter->adapter_id = 0;
+	adapter->adapter_fw_ver = 0;
+	adapter->adapter_hw_ver = 0;
+	adapter->uvdm_state = USBPD_UVDM_DISCONNECT;
+	adapter->verifed = false;
+	adapter->verify_process = false;
+	adapter->verify_done = false;
+	memset(&adapter->vdm_data, 0, sizeof(adapter->vdm_data));
+	memset(adapter->received_pdos, 0, sizeof(adapter->received_pdos));
+}
+
+static void pd_handle_cvdm_response(struct mtk_pd_adapter_info *info,
+				    const struct tcp_ny_cvdm *cvdm)
+{
+	struct adapter_device *adapter = info->adapter;
+	u32 vdm_hdr;
+	u16 svid;
+	u8 cmd;
+	int i;
+
+	if (!adapter)
+		return;
+
+	if (!cvdm->ack || cvdm->cnt < 1) {
+		dev_info(info->dev, "%s: cvdm nak/empty ack=%d cnt=%u\n",
+			 __func__, cvdm->ack, cvdm->cnt);
+		adapter->uvdm_state = USBPD_UVDM_NAN_ACK;
+		return;
+	}
+
+	vdm_hdr = cvdm->data[0];
+	svid = (vdm_hdr >> 16) & 0xffff;
+	cmd = vdm_hdr & 0xff;
+	if (svid != XIAOMI_USB_VID && svid != XIAOMI_USB_VID_ALT) {
+		dev_info(info->dev, "%s: ignore non-xiaomi svid=0x%04x\n",
+			 __func__, svid);
+		return;
+	}
+
+	dev_info(info->dev, "%s: svid=0x%04x cmd=%u cnt=%u\n",
+		 __func__, svid, cmd, cvdm->cnt);
+
+	switch (cmd) {
+	case USBPD_UVDM_CHARGER_VERSION:
+		if (cvdm->cnt >= 2)
+			adapter->vdm_data.ta_version = cvdm->data[1];
+		break;
+	case USBPD_UVDM_CHARGER_VOLTAGE:
+		if (cvdm->cnt >= 2)
+			adapter->vdm_data.ta_voltage =
+				(cvdm->data[1] & 0xffff) * 10 * 1000;
+		break;
+	case USBPD_UVDM_CHARGER_TEMP:
+		if (cvdm->cnt >= 2)
+			adapter->vdm_data.ta_temp =
+				(cvdm->data[1] & 0xffff) * 10;
+		break;
+	case USBPD_UVDM_SESSION_SEED:
+		if (cvdm->cnt >= 5) {
+			for (i = 0; i < USBPD_UVDM_SS_LEN; i++)
+				adapter->vdm_data.s_secert[i] = cvdm->data[i + 1];
+		}
+		break;
+	case USBPD_UVDM_AUTHENTICATION:
+		if (cvdm->cnt >= 5) {
+			for (i = 0; i < USBPD_UVDM_SS_LEN; i++)
+				adapter->vdm_data.digest[i] = cvdm->data[i + 1];
+		}
+		break;
+	case USBPD_UVDM_REVERSE_AUTHEN:
+		if (cvdm->cnt >= 2)
+			adapter->vdm_data.reauth = !!(cvdm->data[1] & 0xffff);
+		break;
+	case USBPD_UVDM_VERIFIED:
+	case USBPD_UVDM_REMOVE_COMPENSATION:
+	default:
+		break;
+	}
+	adapter->uvdm_state = cmd;
+}
+
 static int pd_tcp_notifier_call(struct notifier_block *nb,
 				unsigned long event, void *data)
 {
@@ -163,18 +250,23 @@ static int pd_tcp_notifier_call(struct notifier_block *nb,
 	int idx = pd_nb - info->pd_nb;
 	uint8_t old_state = TYPEC_UNATTACHED, new_state = TYPEC_UNATTACHED;
 
-	dev_info(info->dev, "%s event = %lu, idx = %d\n", __func__, event, idx);
+	dev_info(info->dev, "%s: port:%d event:%lu\n", __func__, idx, event);
 
 	switch (event) {
 	case TCP_NOTIFY_PD_STATE:
-		dev_info(info->dev, "%s pd state = %d\n",
-				    __func__, noti->pd_state.connected);
+		dev_info(info->dev, "%s: pd state = %d\n",
+			 __func__, noti->pd_state.connected);
 		mutex_lock(&info->idx_lock);
 		if (noti->pd_state.connected >= ARRAY_SIZE(pd_connect_tbl))
 			info->pd_type[idx] = MTK_PD_CONNECT_NONE;
 		else
 			info->pd_type[idx] =
 				pd_connect_tbl[noti->pd_state.connected];
+		if (noti->pd_state.connected == PD_CONNECT_NONE)
+			pd_reset_xiaomi_state(adapter);
+		else if (noti->pd_state.connected == PD_CONNECT_PE_READY_SNK_PD30 ||
+			 noti->pd_state.connected == PD_CONNECT_PE_READY_SNK_APDO)
+			adapter->uvdm_state = USBPD_UVDM_CONNECT;
 		find_active_idx_and_notification(info, idx);
 		mutex_unlock(&info->idx_lock);
 		break;
@@ -196,17 +288,29 @@ static int pd_tcp_notifier_call(struct notifier_block *nb,
 			    new_state == TYPEC_UNATTACHED) {
 			mutex_lock(&info->idx_lock);
 			info->pd_type[idx] = MTK_PD_CONNECT_NONE;
+			pd_reset_xiaomi_state(adapter);
 			find_active_idx_and_notification(info, idx);
 			mutex_unlock(&info->idx_lock);
 		}
+		break;
+	case TCP_NOTIFY_CVDM:
+		pd_handle_cvdm_response(info, &noti->cvdm_msg);
 		break;
 	case TCP_NOTIFY_WD_STATUS:
 		srcu_notifier_call_chain(&adapter->evt_nh, MTK_TYPEC_WD_STATUS,
 					 &noti->wd_status.water_detected);
 		break;
+	case TCP_NOTIFY_HARD_RESET_STATE:
+		srcu_notifier_call_chain(&adapter->evt_nh,
+					 MTK_TYPEC_HRESET_STATUS,
+					 &noti->hreset_state.state);
+		break;
 	case TCP_NOTIFY_CC_HI:
 		srcu_notifier_call_chain(&adapter->evt_nh,
-					 MTK_TYPEC_CC_HI_STATUS, &noti->cc_hi);
+					 MTK_TYPEC_CC_HI_STATUS,
+					 &noti->wd_status.water_detected);
+		break;
+	default:
 		break;
 	}
 
@@ -431,6 +535,10 @@ static int pd_get_cap(struct adapter_device *dev, enum adapter_cap_type type,
 	if (info == NULL)
 		return ret;
 
+	if (info->adapter && info->adapter->verify_process &&
+	    type != MTK_PD_APDO_REGAIN)
+		return MTK_ADAPTER_ERROR;
+
 	mutex_lock(&info->idx_lock);
 	active_idx = info->active_idx;
 	mutex_unlock(&info->idx_lock);
@@ -439,6 +547,19 @@ static int pd_get_cap(struct adapter_device *dev, enum adapter_cap_type type,
 	if (type == MTK_PD &&
 	    (tcpm_get_remote_power_cap(info->tcpc[active_idx], &fixed_cap) || !fixed_cap.nr))
 		return ret;
+
+	if (type == MTK_PD_APDO_REGAIN) {
+		int retry;
+
+		for (retry = 0; retry < 15; retry++) {
+			ret_tcp = tcpm_dpm_pd_get_source_cap(info->tcpc[active_idx], NULL);
+			if (ret_tcp == TCP_DPM_RET_SUCCESS)
+				break;
+			msleep(80);
+		}
+		dev_info(info->dev, "%s: regain source_cap ret=%d retry=%d\n",
+			 __func__, ret_tcp, retry);
+	}
 
 	ret_tcp = tcpm_dpm_pd_get_source_cap_ext(info->tcpc[active_idx],
 						 NULL, &src_cap_ext);
@@ -450,9 +571,12 @@ static int pd_get_cap(struct adapter_device *dev, enum adapter_cap_type type,
 		cap->source_id_valid = true;
 	}
 
-	if (type == MTK_PD_APDO)
+	if (type == MTK_PD_APDO || type == MTK_PD_APDO_REGAIN) {
 		ret = pd_get_cap_apdo(info, active_idx, cap);
-	else if (type == MTK_PD) {
+		if (type == MTK_PD_APDO_REGAIN && info->adapter)
+			srcu_notifier_call_chain(&info->adapter->evt_nh,
+						 TA_ATTACH, &active_idx);
+	} else if (type == MTK_PD) {
 		ret = pd_get_cap_pdo(info, active_idx, cap);
 		if (ret == MTK_ADAPTER_OK && cap->attach_gen != fixed_cap.attach_gen)
 			return MTK_ADAPTER_ERROR;
@@ -668,6 +792,210 @@ static int pd_send_hardreset(struct adapter_device *dev)
 	return to_mtk_adapter_ret(ret);
 }
 
+static int tcp_dpm_event_cb_uvdm(struct tcpc_device *tcpc, int ret,
+				 struct tcp_dpm_event *event)
+{
+	struct mtk_pd_adapter_info *info = event->user_data;
+
+	if (!info)
+		return 0;
+	dev_info(info->dev, "%s: ret=%d\n", __func__, ret);
+	if (ret != TCP_DPM_RET_SUCCESS && info->adapter)
+		info->adapter->uvdm_state = USBPD_UVDM_NAN_ACK;
+	return 0;
+}
+
+static int pd_get_svid(struct adapter_device *dev)
+{
+	struct mtk_pd_adapter_info *info = adapter_dev_get_drvdata(dev);
+	struct pd_source_cap_ext src_cap_ext;
+	struct tcpm_svid_list svid_list;
+	u32 vdos[VDO_MAX_NR] = {0};
+	int active_idx, ret, i;
+
+	if (!info || !info->tcpc)
+		return MTK_ADAPTER_ERROR;
+
+	if (dev->adapter_svid != 0 && dev->adapter_svid != 0xff00)
+		return MTK_ADAPTER_OK;
+
+	mutex_lock(&info->idx_lock);
+	active_idx = info->active_idx;
+	mutex_unlock(&info->idx_lock);
+
+	ret = tcpm_inquire_pd_partner_inform(info->tcpc[active_idx], vdos);
+	if (ret == TCPM_SUCCESS) {
+		dev->adapter_svid = vdos[0] & 0xffff;
+		dev->adapter_id = vdos[2] & 0xffff;
+		dev_info(info->dev, "%s: partner inform svid=%04x id=%08x\n",
+			 __func__, dev->adapter_svid, dev->adapter_id);
+
+		memset(&svid_list, 0, sizeof(svid_list));
+		if (tcpm_inquire_pd_partner_svids(info->tcpc[active_idx],
+						  &svid_list) == TCPM_SUCCESS) {
+			for (i = 0; i < svid_list.cnt && i < VDO_MAX_SVID_NR; i++) {
+				if (svid_list.svids[i] == XIAOMI_USB_VID ||
+				    svid_list.svids[i] == XIAOMI_USB_VID_ALT) {
+					dev->adapter_svid = svid_list.svids[i];
+					break;
+				}
+			}
+		}
+		return MTK_ADAPTER_OK;
+	}
+
+	memset(&src_cap_ext, 0, sizeof(src_cap_ext));
+	ret = tcpm_dpm_pd_get_source_cap_ext(info->tcpc[active_idx],
+					     NULL, &src_cap_ext);
+	if (ret == TCP_DPM_RET_SUCCESS) {
+		dev->adapter_svid = src_cap_ext.vid;
+		dev->adapter_id = src_cap_ext.pid;
+		dev->adapter_fw_ver = src_cap_ext.fw_ver;
+		dev->adapter_hw_ver = src_cap_ext.hw_ver;
+		dev_info(info->dev, "%s: src_cap_ext svid=%04x id=%08x\n",
+			 __func__, dev->adapter_svid, dev->adapter_id);
+		return MTK_ADAPTER_OK;
+	}
+
+	return MTK_ADAPTER_ERROR;
+}
+
+static int pd_request_vdm_cmd(struct adapter_device *dev, enum uvdm_state cmd,
+			      unsigned char *data, unsigned int data_len)
+{
+	struct mtk_pd_adapter_info *info = adapter_dev_get_drvdata(dev);
+	struct tcp_dpm_custom_vdm_data cvdm_data;
+	struct tcp_dpm_event_cb_data cb_data = {
+		.event_cb = tcp_dpm_event_cb_uvdm,
+		.user_data = info,
+	};
+	u32 out[USBPD_UVDM_SS_LEN] = {0};
+	int active_idx, ret, i;
+
+	if (!info || !info->tcpc)
+		return MTK_ADAPTER_ERROR;
+
+	mutex_lock(&info->idx_lock);
+	active_idx = info->active_idx;
+	mutex_unlock(&info->idx_lock);
+
+	memset(&cvdm_data, 0, sizeof(cvdm_data));
+	cvdm_data.cable = false;
+	cvdm_data.wait_resp = true;
+	cvdm_data.data[0] = ((dev->adapter_svid & 0xffff) << 16) | 0x0100 |
+			    (cmd & 0xff);
+
+	switch (cmd) {
+	case USBPD_UVDM_CHARGER_VERSION:
+	case USBPD_UVDM_CHARGER_VOLTAGE:
+	case USBPD_UVDM_CHARGER_TEMP:
+		cvdm_data.cnt = 1;
+		break;
+	case USBPD_UVDM_SESSION_SEED:
+	case USBPD_UVDM_AUTHENTICATION:
+	case USBPD_UVDM_REVERSE_AUTHEN:
+		if (data && data_len > 0)
+			memcpy(out, data, min_t(unsigned int, data_len, sizeof(out)));
+		for (i = 0; i < USBPD_UVDM_SS_LEN; i++)
+			cvdm_data.data[i + 1] = swab32(out[i]);
+		cvdm_data.cnt = 1 + USBPD_UVDM_SS_LEN;
+		break;
+	case USBPD_UVDM_VERIFIED:
+	case USBPD_UVDM_REMOVE_COMPENSATION:
+		if (data && data_len > 0)
+			memcpy(out, data, min_t(unsigned int, data_len, sizeof(u32)));
+		cvdm_data.data[1] = out[0];
+		cvdm_data.cnt = 1 + USBPD_UVDM_VERIFIED_LEN;
+		break;
+	default:
+		dev_err(info->dev, "%s: unsupported uvdm cmd %d\n", __func__, cmd);
+		return MTK_ADAPTER_NOT_SUPPORT;
+	}
+
+	dev_info(info->dev, "%s: cmd=%d hdr=0x%08x cnt=%u\n",
+		 __func__, cmd, cvdm_data.data[0], cvdm_data.cnt);
+	ret = tcpm_dpm_send_custom_vdm(info->tcpc[active_idx], &cvdm_data, &cb_data);
+	return to_mtk_adapter_ret(ret);
+}
+
+static int pd_get_power_role(struct adapter_device *dev)
+{
+	struct mtk_pd_adapter_info *info = adapter_dev_get_drvdata(dev);
+	int active_idx;
+
+	if (!info || !info->tcpc)
+		return MTK_ADAPTER_ERROR;
+
+	mutex_lock(&info->idx_lock);
+	active_idx = info->active_idx;
+	mutex_unlock(&info->idx_lock);
+
+	dev->current_pr = tcpm_inquire_pd_power_role(info->tcpc[active_idx]);
+	return MTK_ADAPTER_OK;
+}
+
+static int pd_get_current_state(struct adapter_device *dev)
+{
+	struct mtk_pd_adapter_info *info = adapter_dev_get_drvdata(dev);
+	int active_idx;
+
+	if (!info || !info->tcpc)
+		return MTK_ADAPTER_ERROR;
+
+	mutex_lock(&info->idx_lock);
+	active_idx = info->active_idx;
+	mutex_unlock(&info->idx_lock);
+
+	dev->current_state = tcpm_inquire_pd_state_curr(info->tcpc[active_idx]);
+	dev->current_state_name = tcpm_inquire_pd_state_name(info->tcpc[active_idx]);
+	return MTK_ADAPTER_OK;
+}
+
+static int pd_get_pdos(struct adapter_device *dev)
+{
+	struct mtk_pd_adapter_info *info = adapter_dev_get_drvdata(dev);
+	struct tcpm_power_cap pd_cap;
+	int active_idx, ret, cnt;
+
+	if (!info || !info->tcpc)
+		return MTK_ADAPTER_ERROR;
+
+	mutex_lock(&info->idx_lock);
+	active_idx = info->active_idx;
+	mutex_unlock(&info->idx_lock);
+
+	memset(&pd_cap, 0, sizeof(pd_cap));
+	ret = tcpm_inquire_pd_source_cap(info->tcpc[active_idx], &pd_cap);
+	if (ret != TCPM_SUCCESS)
+		return MTK_ADAPTER_ERROR;
+
+	memset(dev->received_pdos, 0, sizeof(dev->received_pdos));
+	cnt = min_t(int, pd_cap.cnt, USBPD_PDO_MAX_NR);
+	if (cnt > 0)
+		memcpy(dev->received_pdos, pd_cap.pdos, cnt * sizeof(u32));
+	return MTK_ADAPTER_OK;
+}
+
+static int pd_set_pd_verify_process(struct adapter_device *dev, int verifying)
+{
+	struct mtk_pd_adapter_info *info = adapter_dev_get_drvdata(dev);
+	int active_idx;
+
+	if (!info || !info->tcpc)
+		return MTK_ADAPTER_ERROR;
+
+	mutex_lock(&info->idx_lock);
+	active_idx = info->active_idx;
+	mutex_unlock(&info->idx_lock);
+
+	dev->verify_process = !!verifying;
+	dev->verify_done = !verifying;
+	dev_info(info->dev, "%s: pd verify in process:%d done:%d\n",
+		 __func__, dev->verify_process, dev->verify_done);
+	srcu_notifier_call_chain(&dev->evt_nh, TA_ATTACH, &active_idx);
+	return MTK_ADAPTER_OK;
+}
+
 static struct adapter_ops adapter_ops = {
 	.get_property = pd_get_property,
 	.get_status = pd_get_status,
@@ -679,6 +1007,12 @@ static struct adapter_ops adapter_ops = {
 	.set_wdt = pd_set_wdt,
 	.enable_wdt = pd_enable_wdt,
 	.send_hardreset = pd_send_hardreset,
+	.get_svid = pd_get_svid,
+	.request_vdm_cmd = pd_request_vdm_cmd,
+	.get_power_role = pd_get_power_role,
+	.get_pd_state = pd_get_current_state,
+	.get_pdos = pd_get_pdos,
+	.set_pd_verify_process = pd_set_pd_verify_process,
 };
 
 static void mtk_pd_adapter_remove_helper(struct mtk_pd_adapter_info *info)

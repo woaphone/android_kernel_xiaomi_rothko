@@ -79,8 +79,39 @@ enum adapter_cap_type {
 	MTK_PD_APDO_END,
 	MTK_PD,
 	MTK_PD_APDO,
+	MTK_PD_APDO_REGAIN,
 	MTK_UFCS,
 	MTK_CAP_TYPE_UNKNOWN,
+};
+
+enum uvdm_state {
+	USBPD_UVDM_DISCONNECT = 0,
+	USBPD_UVDM_CHARGER_VERSION = 1,
+	USBPD_UVDM_CHARGER_VOLTAGE = 2,
+	USBPD_UVDM_CHARGER_TEMP = 3,
+	USBPD_UVDM_SESSION_SEED = 4,
+	USBPD_UVDM_AUTHENTICATION = 5,
+	USBPD_UVDM_VERIFIED = 6,
+	USBPD_UVDM_REMOVE_COMPENSATION = 7,
+	USBPD_UVDM_REVERSE_AUTHEN = 8,
+	USBPD_UVDM_CONNECT = 9,
+	USBPD_UVDM_NAN_ACK = 10,
+};
+
+#define USBPD_UVDM_SS_LEN		4
+#define USBPD_UVDM_VERIFIED_LEN		1
+#define USBPD_PDO_MAX_NR		7
+
+#define XIAOMI_USB_VID			0x2717
+#define XIAOMI_USB_VID_ALT		0x2b01
+
+struct usbpd_vdm_data {
+	int ta_version;
+	int ta_temp;
+	int ta_voltage;
+	bool reauth;
+	unsigned long s_secert[USBPD_UVDM_SS_LEN];
+	unsigned long digest[USBPD_UVDM_SS_LEN];
 };
 
 enum adapter_return_value {
@@ -112,7 +143,19 @@ struct adapter_device {
 	struct device dev;
 	struct srcu_notifier_head evt_nh;
 	void	*driver_data;
-
+	uint32_t adapter_svid;
+	uint32_t adapter_id;
+	uint32_t adapter_fw_ver;
+	uint32_t adapter_hw_ver;
+	struct usbpd_vdm_data vdm_data;
+	int uvdm_state;
+	bool verify_process;
+	bool verifed;
+	bool verify_done;
+	uint8_t current_pr;
+	uint8_t current_state;
+	const char *current_state_name;
+	uint32_t received_pdos[USBPD_PDO_MAX_NR];
 };
 
 struct adapter_ops {
@@ -135,6 +178,13 @@ struct adapter_ops {
 	int (*sync_volt)(struct adapter_device *dev, u32 mV);
 	int (*send_hardreset)(struct adapter_device *dev);
 	int (*exit_mode)(struct adapter_device *dev);
+	int (*get_svid)(struct adapter_device *dev);
+	int (*request_vdm_cmd)(struct adapter_device *dev, enum uvdm_state cmd,
+		unsigned char *data, unsigned int data_len);
+	int (*get_power_role)(struct adapter_device *dev);
+	int (*get_pd_state)(struct adapter_device *dev);
+	int (*get_pdos)(struct adapter_device *dev);
+	int (*set_pd_verify_process)(struct adapter_device *dev, int verifying);
 };
 
 static inline void *adapter_dev_get_drvdata(
@@ -185,4 +235,13 @@ extern int adapter_dev_enable_wdt(struct adapter_device *adapter_dev, bool en);
 extern int adapter_dev_sync_volt(struct adapter_device *adapter_dev, u32 mV);
 extern int adapter_dev_send_hardreset(struct adapter_device *adapter_dev);
 extern int adapter_dev_exit_mode(struct adapter_device *adapter_dev);
+extern int adapter_dev_get_svid(struct adapter_device *adapter_dev);
+extern int adapter_dev_request_vdm_cmd(struct adapter_device *adapter_dev,
+	enum uvdm_state cmd, unsigned char *data, unsigned int data_len);
+extern int adapter_dev_get_power_role(struct adapter_device *adapter_dev);
+extern int adapter_dev_get_current_state(struct adapter_device *adapter_dev);
+extern int adapter_dev_get_pdos(struct adapter_device *adapter_dev);
+extern int adapter_dev_set_pd_verify_process(struct adapter_device *adapter_dev,
+	int verifying);
+
 #endif /*LINUX_POWER_ADAPTER_CLASS_H*/

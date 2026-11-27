@@ -430,6 +430,65 @@ uint8_t tcpm_inquire_pd_pe_ready(struct tcpc_device *tcpc)
 }
 EXPORT_SYMBOL(tcpm_inquire_pd_pe_ready);
 
+uint8_t tcpm_inquire_pd_state_curr(struct tcpc_device *tcpc)
+{
+	struct pd_port *pd_port = &tcpc->pd_port;
+
+	return pd_port->pe_state_curr;
+}
+EXPORT_SYMBOL(tcpm_inquire_pd_state_curr);
+
+const char *tcpm_inquire_pd_state_name(struct tcpc_device *tcpc)
+{
+	struct pd_port *pd_port = &tcpc->pd_port;
+
+	switch (pd_port->pe_state_curr) {
+#if CONFIG_USB_PD_PE_SINK
+	case PE_SNK_STARTUP:
+		return "SNK_Startup";
+	case PE_SNK_DISCOVERY:
+		return "SNK_Discovery";
+	case PE_SNK_WAIT_FOR_CAPABILITIES:
+		return "SNK_Wait_For_Capabilities";
+	case PE_SNK_EVALUATE_CAPABILITY:
+		return "SNK_Evaluate_Capability";
+	case PE_SNK_SELECT_CAPABILITY:
+		return "SNK_Select_Capability";
+	case PE_SNK_TRANSITION_SINK:
+		return "SNK_Transition_Sink";
+	case PE_SNK_READY:
+		return "SNK_Ready";
+	case PE_SNK_HARD_RESET:
+		return "SNK_Hard_Reset";
+	case PE_SNK_TRANSITION_TO_DEFAULT:
+		return "SNK_Transition_To_Default";
+	case PE_SNK_GIVE_SINK_CAP:
+		return "SNK_Give_Sink_Cap";
+	case PE_SNK_GET_SOURCE_CAP:
+		return "SNK_Get_Source_Cap";
+#endif
+#if CONFIG_USB_PD_PE_SOURCE
+	case PE_SRC_STARTUP:
+		return "SRC_Startup";
+	case PE_SRC_DISCOVERY:
+		return "SRC_Discovery";
+	case PE_SRC_SEND_CAPABILITIES:
+		return "SRC_Send_Capabilities";
+	case PE_SRC_NEGOTIATE_CAPABILITIES:
+		return "SRC_Negotiate_Capabilities";
+	case PE_SRC_TRANSITION_SUPPLY:
+		return "SRC_Transition_Supply";
+	case PE_SRC_READY:
+		return "SRC_Ready";
+	case PE_SRC_DISABLED:
+		return "SRC_Disabled";
+#endif
+	default:
+		return "Unknown";
+	}
+}
+EXPORT_SYMBOL(tcpm_inquire_pd_state_name);
+
 uint32_t tcpm_inquire_cable_current(struct tcpc_device *tcpc)
 {
 	struct pd_port *pd_port = &tcpc->pd_port;

@@ -18,6 +18,13 @@
 #define ROTHKO_PPS_START_MAX_MA	2000
 #define ROTHKO_PPS_TARGET_IBUS_MA	2900
 #define ROTHKO_PPS_MAX_IBAT_MA	12000
+#define ROTHKO_XM_PPS_MAX_MV	20000
+#define ROTHKO_XM_PPS_MAX_PDO_MV	21000
+#define ROTHKO_XM_PPS_MAX_MA	6000
+#define ROTHKO_XM_PPS_TARGET_IBUS_MA	5900
+#define ROTHKO_XM_PPS_MAX_IBAT_MA	21700
+#define ROTHKO_VERIFY_GRACE_MS	3500
+#define ROTHKO_VERIFY_ACTIVE_MAX_MS	10000
 #define ROTHKO_PPS_STEP_MV	20
 #define ROTHKO_CP_RATIO		4
 #define ROTHKO_CP_HEADROOM_MV	600
@@ -36,6 +43,10 @@ struct rothko_pd_cp {
 	struct power_supply *bms;
 	int gpio;
 	u32 attach_gen;
+	u32 verify_seen_gen;
+	ktime_t verify_first_seen;
+	bool verify_waiting;
+	bool verified_session;
 	bool attempted;
 	bool detached_exit;
 	bool held;
@@ -58,6 +69,29 @@ struct rothko_battery_sample {
 	int mv;
 	int ma;
 };
+
+static bool xiaomi_pd_verified(struct mtk_charger *info)
+{
+	struct adapter_device *pd = info->adapter_dev[PD];
+
+	return pd && pd->verifed &&
+	       (pd->adapter_svid == XIAOMI_USB_VID ||
+		pd->adapter_svid == XIAOMI_USB_VID_ALT);
+}
+
+static bool pd_verify_in_progress(struct mtk_charger *info)
+{
+	struct adapter_device *pd = info->adapter_dev[PD];
+
+	return pd && pd->verify_process;
+}
+
+static bool pd_verify_finished(struct mtk_charger *info)
+{
+	struct adapter_device *pd = info->adapter_dev[PD];
+
+	return pd && (pd->verify_done || pd->verifed);
+}
 
 static int read_bms(struct power_supply *bms, enum power_supply_property prop, int *value)
 {
@@ -87,10 +121,19 @@ static int battery_sample(struct mtk_charger *info, struct rothko_battery_sample
 	if (ret)
 		return ret;
 
-	if (!is_battery_exist(info) || temp < 100 || temp >= 420 ||
-	    uv < 3700000 || uv >= min_t(int, 4350000, info->data.battery_cv - 100000) ||
-	    soc < 0 || soc >= 85)
+	if (!is_battery_exist(info))
 		return -ERANGE;
+	if (xiaomi_pd_verified(info)) {
+		if (temp < 100 || temp >= 460 ||
+		    uv < 3700000 || uv >= min_t(int, 4420000, info->data.battery_cv - 60000) ||
+		    soc < 0 || soc >= 95)
+			return -ERANGE;
+	} else {
+		if (temp < 100 || temp >= 420 ||
+		    uv < 3700000 || uv >= min_t(int, 4350000, info->data.battery_cv - 100000) ||
+		    soc < 0 || soc >= 85)
+			return -ERANGE;
+	}
 
 	sample->mv = uv / 1000;
 	sample->ma = abs(ua / 1000);
@@ -230,6 +273,7 @@ static void stop_pps(struct mtk_charger *info)
 		goto held;
 	tcpm_release_board_pps(cp->tcpc);
 	cp->held = false;
+	cp->verified_session = false;
 	cp->detached_exit = detached;
 	dev_info(dev, "SC858x: both pumps stopped, exit=%s\n", detached ? "detach" : "5 V");
 	return;
@@ -253,29 +297,38 @@ static bool pump_ready(struct charger_device *pump, bool switching, u32 allowed_
 	return true;
 }
 
-static int select_pps(struct rothko_pd_cp *cp, int mv)
+static int select_pps(struct mtk_charger *info, int mv)
 {
+	struct rothko_pd_cp *cp = info->pd_cp;
 	struct tcpm_power_cap_val cap;
 	struct pd_source_cap_ext source;
+	bool verified = xiaomi_pd_verified(info);
+	int max_mv_limit = verified ? ROTHKO_XM_PPS_MAX_MV : ROTHKO_PPS_MAX_MV;
+	int max_ma_limit = verified ? ROTHKO_XM_PPS_MAX_MA : ROTHKO_PPS_MAX_MA;
 	int pdp = 0, ma;
 	u8 index = 0;
 
-	if (tcpm_dpm_pd_get_source_cap_ext(cp->tcpc, NULL, &source) == TCP_DPM_RET_SUCCESS)
+	if (!verified &&
+	    tcpm_dpm_pd_get_source_cap_ext(cp->tcpc, NULL, &source) == TCP_DPM_RET_SUCCESS)
 		pdp = source.source_pdp;
 
 	cp->apdo_ma = 0;
 	while (!tcpm_inquire_pd_source_apdo(cp->tcpc, TCPM_POWER_CAP_APDO_TYPE_PPS,
 					   &index, &cap)) {
-		if (cap.min_mv > mv || cap.max_mv < mv || (cap.pwr_limit && !pdp))
+		if (cap.min_mv > mv || cap.max_mv < mv)
 			continue;
-		ma = min(cap.ma, ROTHKO_PPS_MAX_MA);
-		if (pdp)
-			ma = min(ma, pdp * 1000000 / min(cap.max_mv, ROTHKO_PPS_MAX_MV));
+		if (verified && cap.max_mv > ROTHKO_XM_PPS_MAX_PDO_MV)
+			continue;
+		if (!verified && cap.pwr_limit && !pdp)
+			continue;
+		ma = min(cap.ma, max_ma_limit);
+		if (!verified && pdp)
+			ma = min(ma, pdp * 1000000 / min(cap.max_mv, max_mv_limit));
 		if (ma <= cp->apdo_ma)
 			continue;
 		cp->apdo_ma = ma;
 		cp->apdo_min_mv = cap.min_mv;
-		cp->apdo_max_mv = min(cap.max_mv, ROTHKO_PPS_MAX_MV);
+		cp->apdo_max_mv = min(cap.max_mv, max_mv_limit);
 	}
 	return cp->apdo_ma >= 1000 ? 0 : -EOPNOTSUPP;
 }
@@ -290,7 +343,7 @@ static int target_current(struct mtk_charger *info, int *ibat_ma)
 	int smart = READ_ONCE(info->sc.sc_ibat);
 	int ma = info->pd_cp->apdo_ma;
 
-	*ibat_ma = ROTHKO_PPS_MAX_IBAT_MA;
+	*ibat_ma = xiaomi_pd_verified(info) ? ROTHKO_XM_PPS_MAX_IBAT_MA : ROTHKO_PPS_MAX_IBAT_MA;
 	if (fcc >= 0)
 		*ibat_ma = min(*ibat_ma, fcc / 1000);
 	if (smart >= 0)
@@ -365,7 +418,7 @@ static bool start_pps(struct mtk_charger *info, const struct rothko_battery_samp
 			return false;
 
 	mv = roundup(bat->mv * ROTHKO_CP_RATIO + ROTHKO_CP_HEADROOM_MV, ROTHKO_PPS_STEP_MV);
-	if (select_pps(cp, mv))
+	if (select_pps(info, mv))
 		return false;
 	ma = min(target_current(info, &ibat), ROTHKO_PPS_START_MAX_MA);
 	if (after_detach)
@@ -382,7 +435,10 @@ static bool start_pps(struct mtk_charger *info, const struct rothko_battery_samp
 		return false;
 
 	cp->attach_gen = caps.attach_gen;
+	cp->verified_session = xiaomi_pd_verified(info);
 	cp->attempted = true;
+	dev_info(&info->pdev->dev, "SC858x: start PPS (xm_verified=%d apdo=%d-%dmV/%dmA)\n",
+		 cp->verified_session, cp->apdo_min_mv, cp->apdo_max_mv, cp->apdo_ma);
 	cp->detached_exit = false;
 	cp->start_tune_steps = 0;
 	cp->sample_mv = 0;
@@ -519,7 +575,8 @@ static bool update_pps(struct mtk_charger *info, const struct rothko_battery_sam
 	max_mv = min(max_mv, cp->apdo_max_mv);
 	if (max_mv < cp->apdo_min_mv || max_mv < cp->request_mv - 80)
 		return false;
-	ibus_target = min(ma - 100, ROTHKO_PPS_TARGET_IBUS_MA);
+	ibus_target = min(ma - 100, cp->verified_session ?
+			  ROTHKO_XM_PPS_TARGET_IBUS_MA : ROTHKO_PPS_TARGET_IBUS_MA);
 	mv = cp->request_mv;
 	if (bat->ma >= ibat - 250 || total_ma >= ibus_target) {
 		mv -= ROTHKO_PPS_STEP_MV;
@@ -543,6 +600,41 @@ static bool update_pps(struct mtk_charger *info, const struct rothko_battery_sam
 	return true;
 }
 
+static bool should_wait_pd_verify(struct mtk_charger *info)
+{
+	struct rothko_pd_cp *cp = info->pd_cp;
+	struct tcpm_remote_power_cap caps;
+	ktime_t now;
+	s64 elapsed_ms;
+	int mv;
+	bool fixed;
+
+	if (!cp->tcpc || read_contract(cp, &caps, &mv, &fixed) || !fixed || mv != 5000) {
+		cp->verify_waiting = false;
+		return false;
+	}
+
+	now = ktime_get_boottime();
+	if (cp->verify_seen_gen != caps.attach_gen) {
+		cp->verify_seen_gen = caps.attach_gen;
+		cp->verify_first_seen = now;
+	}
+
+	if (pd_verify_finished(info) && !pd_verify_in_progress(info)) {
+		cp->verify_waiting = false;
+		return false;
+	}
+
+	elapsed_ms = ktime_ms_delta(now, cp->verify_first_seen);
+	if (pd_verify_in_progress(info)) {
+		cp->verify_waiting = elapsed_ms < ROTHKO_VERIFY_ACTIVE_MAX_MS;
+		return cp->verify_waiting;
+	}
+
+	cp->verify_waiting = elapsed_ms < ROTHKO_VERIFY_GRACE_MS;
+	return cp->verify_waiting;
+}
+
 static bool poll_pumps(struct mtk_charger *info, bool allow)
 {
 	struct rothko_pd_cp *cp = info->pd_cp;
@@ -561,6 +653,21 @@ static bool poll_pumps(struct mtk_charger *info, bool allow)
 			  !battery_sample(info, &bat);
 	}
 	if (cp->held) {
+		cp->verify_waiting = false;
+		/*
+		 * If Xiaomi UVDM verification starts late or succeeds after we
+		 * entered an unverified PPS session, cleanly exit to fixed 5 V
+		 * and allow one re-entry with the unlocked 120 W APDO.
+		 */
+		if (!cp->verified_session &&
+		    (pd_verify_in_progress(info) || xiaomi_pd_verified(info))) {
+			dev_info(&info->pdev->dev,
+				 "SC858x: stopping unverified PPS for Xiaomi 120W upgrade\n");
+			stop_pps(info);
+			if (!cp->held)
+				cp->attempted = false;
+			return true;
+		}
 		if (allowed && cp->enable_at && enable_pumps_after_settle(info, &bat))
 			return true;
 		if (allowed && cp->running && update_pps(info, &bat))
@@ -569,6 +676,10 @@ static bool poll_pumps(struct mtk_charger *info, bool allow)
 		return cp->held;
 	}
 
+	if (allowed && should_wait_pd_verify(info))
+		return true;
+
+	cp->verify_waiting = false;
 	return allowed && start_pps(info, &bat);
 }
 
@@ -618,6 +729,21 @@ bool rothko_pd_cp_poll(struct mtk_charger *info, bool allow)
 		}
 	}
 	mt6375_report_pd_tier(info, watts, type);
+	{
+		struct adapter_device *pd = info->adapter_dev[PD];
+		int cap_type = pd ? adapter_dev_get_property(pd, CAP_TYPE) : MTK_CAP_TYPE_UNKNOWN;
+		int pd_type_val = 0;
+
+		if (cap_type == MTK_PD_APDO)
+			pd_type_val = 5;
+		else if (cap_type == MTK_PD)
+			pd_type_val = 3;
+		mt6375_report_pd_auth(info,
+				      pd && pd->verifed,
+				      pd && pd->verify_process,
+				      pd && pd->verify_done,
+				      pd_type_val);
+	}
 	return active;
 }
 
@@ -635,6 +761,11 @@ bool rothko_pd_cp_attached(struct mtk_charger *info)
 bool rothko_pd_cp_switching(struct mtk_charger *info)
 {
 	return rothko_pd_cp_active(info) && info->pd_cp->running;
+}
+
+bool rothko_pd_cp_verifying(struct mtk_charger *info)
+{
+	return info->pd_cp && info->pd_cp->verify_waiting;
 }
 
 static void free_isolation_gpio(void *data)

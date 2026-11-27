@@ -1022,6 +1022,12 @@ extern uint8_t tcpm_inquire_pd_vconn_role(
 extern uint8_t tcpm_inquire_pd_pe_ready(
 	struct tcpc_device *tcpc);
 
+extern uint8_t tcpm_inquire_pd_state_curr(
+	struct tcpc_device *tcpc);
+
+extern const char *tcpm_inquire_pd_state_name(
+	struct tcpc_device *tcpc);
+
 extern uint32_t tcpm_inquire_cable_current(
 	struct tcpc_device *tcpc);
 
@@ -1536,6 +1542,18 @@ static inline uint8_t tcpm_inquire_pd_pe_ready(
 	struct tcpc_device *tcpc)
 {
 	return 0;
+}
+
+static inline uint8_t tcpm_inquire_pd_state_curr(
+	struct tcpc_device *tcpc)
+{
+	return 0;
+}
+
+static inline const char *tcpm_inquire_pd_state_name(
+	struct tcpc_device *tcpc)
+{
+	return "Unknown";
 }
 
 static inline uint32_t tcpm_inquire_cable_current(

@@ -629,7 +629,7 @@ static void mtk_charger_start_timer(struct mtk_charger *info)
 	}
 
 	ktime_now = ktime_get_boottime();
-	if (rothko_pd_cp_switching(info))
+	if (rothko_pd_cp_switching(info) || rothko_pd_cp_verifying(info))
 		ktime = ktime_add_ms(ktime_now, 500);
 	else if (rothko_pd_cp_active(info))
 		ktime = ktime_add_ms(ktime_now, 1000);
@@ -3058,7 +3058,7 @@ static int charger_routine_thread(void *arg)
 				charger_status_check(info);
 			}
 		}
-		if (info->charger_thread_polling || rothko_pd_cp_active(info))
+		if (info->charger_thread_polling || rothko_pd_cp_active(info) || rothko_pd_cp_verifying(info))
 			mtk_charger_start_timer(info);
 		if (info->bootmode != 1 && info->bootmode != 2 && info->bootmode != 4
 			&& info->bootmode != 8 && info->bootmode != 9)

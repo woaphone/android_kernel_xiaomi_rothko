@@ -313,6 +313,10 @@ struct mt6375_chg_data {
 	bool pps_hold;
 	int apdo_max;
 	int quick_charge_type;
+	bool pd_authentication;
+	bool pd_verifying;
+	bool pd_verify_done;
+	int pd_type;
 #endif
 	struct power_supply *psy;
 	struct power_supply *usb_psy;
@@ -3847,6 +3851,98 @@ static ssize_t apdo_max_show(struct device *dev, struct device_attribute *attr, 
 }
 static DEVICE_ATTR_RO(apdo_max);
 static DEVICE_ATTR(power_max, 0444, apdo_max_show, NULL);
+
+void mt6375_report_pd_auth(struct mtk_charger *info, bool auth, bool verifying,
+			   bool verify_done, int pd_type)
+{
+	struct charger_device *primary = info->chg1_dev;
+	struct mt6375_chg_data *ddata;
+	bool changed;
+
+	if (!primary || primary->ops != &mt6375_chg_ops)
+		return;
+	ddata = charger_get_data(primary);
+	mutex_lock(&ddata->attach_lock);
+	if (!ddata->usb_psy || ddata->stopping)
+		goto out;
+	if (atomic_read(&ddata->attach[ddata->active_idx]) < ATTACH_TYPE_PD) {
+		auth = false;
+		verifying = false;
+		verify_done = false;
+		pd_type = 0;
+	}
+	changed = ddata->pd_authentication != auth ||
+		  ddata->pd_verifying != verifying ||
+		  ddata->pd_verify_done != verify_done ||
+		  ddata->pd_type != pd_type;
+	if (!changed)
+		goto out;
+	ddata->pd_authentication = auth;
+	ddata->pd_verifying = verifying;
+	ddata->pd_verify_done = verify_done;
+	ddata->pd_type = pd_type;
+	mutex_unlock(&ddata->attach_lock);
+	power_supply_changed(ddata->usb_psy);
+	return;
+out:
+	mutex_unlock(&ddata->attach_lock);
+}
+
+static ssize_t pd_authentication_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct mt6375_chg_data *ddata = power_supply_get_drvdata(dev_get_drvdata(dev));
+	bool auth;
+
+	mutex_lock(&ddata->attach_lock);
+	auth = atomic_read(&ddata->attach[ddata->active_idx]) >= ATTACH_TYPE_PD &&
+	       ddata->pd_authentication;
+	mutex_unlock(&ddata->attach_lock);
+	return sysfs_emit(buf, "%d\n", auth ? 1 : 0);
+}
+static DEVICE_ATTR_RO(pd_authentication);
+
+static ssize_t pd_verifying_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct mt6375_chg_data *ddata = power_supply_get_drvdata(dev_get_drvdata(dev));
+	bool verifying;
+
+	mutex_lock(&ddata->attach_lock);
+	verifying = atomic_read(&ddata->attach[ddata->active_idx]) >= ATTACH_TYPE_PD &&
+		    ddata->pd_verifying;
+	mutex_unlock(&ddata->attach_lock);
+	return sysfs_emit(buf, "%d\n", verifying ? 1 : 0);
+}
+static DEVICE_ATTR_RO(pd_verifying);
+
+static ssize_t pd_verify_done_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct mt6375_chg_data *ddata = power_supply_get_drvdata(dev_get_drvdata(dev));
+	bool done;
+
+	mutex_lock(&ddata->attach_lock);
+	done = atomic_read(&ddata->attach[ddata->active_idx]) >= ATTACH_TYPE_PD &&
+	       ddata->pd_verify_done;
+	mutex_unlock(&ddata->attach_lock);
+	return sysfs_emit(buf, "%d\n", done ? 1 : 0);
+}
+static DEVICE_ATTR_RO(pd_verify_done);
+
+static ssize_t pd_type_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct mt6375_chg_data *ddata = power_supply_get_drvdata(dev_get_drvdata(dev));
+	int pd_type;
+
+	mutex_lock(&ddata->attach_lock);
+	pd_type = atomic_read(&ddata->attach[ddata->active_idx]) >= ATTACH_TYPE_PD ?
+		  ddata->pd_type : 0;
+	mutex_unlock(&ddata->attach_lock);
+	return sysfs_emit(buf, "%d\n", pd_type);
+}
+static DEVICE_ATTR_RO(pd_type);
 #endif
 
 static ssize_t voltage_now_show(struct device *dev,
@@ -4215,6 +4311,10 @@ static struct attribute *rothko_usb_attrs[] = {
 	&dev_attr_quick_charge_type.attr,
 	&dev_attr_apdo_max.attr,
 	&dev_attr_power_max.attr,
+	&dev_attr_pd_authentication.attr,
+	&dev_attr_pd_verifying.attr,
+	&dev_attr_pd_verify_done.attr,
+	&dev_attr_pd_type.attr,
 #endif
 	&dev_attr_real_type.attr,
 	&dev_attr_voltage_now.attr,

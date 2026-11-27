@@ -162,8 +162,310 @@ EXPORT_SYMBOL(adapter_dev_exit_mode);
 
 static DEVICE_ATTR_RO(name);
 
+int adapter_dev_get_svid(struct adapter_device *adapter_dev)
+{
+	if (adapter_dev != NULL && adapter_dev->ops != NULL &&
+	    adapter_dev->ops->get_svid)
+		return adapter_dev->ops->get_svid(adapter_dev);
+
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(adapter_dev_get_svid);
+
+int adapter_dev_request_vdm_cmd(struct adapter_device *adapter_dev,
+	enum uvdm_state cmd, unsigned char *data, unsigned int data_len)
+{
+	if (adapter_dev != NULL && adapter_dev->ops != NULL &&
+	    adapter_dev->ops->request_vdm_cmd)
+		return adapter_dev->ops->request_vdm_cmd(adapter_dev, cmd, data, data_len);
+
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(adapter_dev_request_vdm_cmd);
+
+int adapter_dev_get_power_role(struct adapter_device *adapter_dev)
+{
+	if (adapter_dev != NULL && adapter_dev->ops != NULL &&
+	    adapter_dev->ops->get_power_role)
+		return adapter_dev->ops->get_power_role(adapter_dev);
+
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(adapter_dev_get_power_role);
+
+int adapter_dev_get_current_state(struct adapter_device *adapter_dev)
+{
+	if (adapter_dev != NULL && adapter_dev->ops != NULL &&
+	    adapter_dev->ops->get_pd_state)
+		return adapter_dev->ops->get_pd_state(adapter_dev);
+
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(adapter_dev_get_current_state);
+
+int adapter_dev_get_pdos(struct adapter_device *adapter_dev)
+{
+	if (adapter_dev != NULL && adapter_dev->ops != NULL &&
+	    adapter_dev->ops->get_pdos)
+		return adapter_dev->ops->get_pdos(adapter_dev);
+
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(adapter_dev_get_pdos);
+
+int adapter_dev_set_pd_verify_process(struct adapter_device *adapter_dev,
+	int verifying)
+{
+	if (adapter_dev != NULL && adapter_dev->ops != NULL &&
+	    adapter_dev->ops->set_pd_verify_process)
+		return adapter_dev->ops->set_pd_verify_process(adapter_dev, verifying);
+
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(adapter_dev_set_pd_verify_process);
+
+static int string_to_hex(const char *str, unsigned char *out, unsigned int max_len)
+{
+	size_t len = strlen(str);
+	unsigned int count = 0;
+	size_t i = 0;
+
+	if (len == 1) {
+		int v = hex_to_bin(str[0]);
+
+		if (v < 0)
+			return -EINVAL;
+		out[0] = (unsigned char)v;
+		return 1;
+	}
+
+	while (i + 1 < len && count < max_len) {
+		int hi = hex_to_bin(str[i]);
+		int lo = hex_to_bin(str[i + 1]);
+
+		if (hi < 0 || lo < 0)
+			return -EINVAL;
+		out[count++] = (unsigned char)((hi << 4) | lo);
+		i += 2;
+	}
+	return count;
+}
+
+static ssize_t request_vdm_cmd_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+	int cmd = adapter->uvdm_state;
+
+	switch (cmd) {
+	case USBPD_UVDM_CHARGER_VERSION:
+		return snprintf(buf, PAGE_SIZE, "%d,%x\n", cmd,
+				adapter->vdm_data.ta_version);
+	case USBPD_UVDM_CHARGER_VOLTAGE:
+		return snprintf(buf, PAGE_SIZE, "%d,%d\n", cmd,
+				adapter->vdm_data.ta_voltage);
+	case USBPD_UVDM_CHARGER_TEMP:
+		return snprintf(buf, PAGE_SIZE, "%d,%d\n", cmd,
+				adapter->vdm_data.ta_temp);
+	case USBPD_UVDM_AUTHENTICATION:
+		return snprintf(buf, PAGE_SIZE, "%d,%08lx%08lx%08lx%08lx\n",
+				cmd,
+				adapter->vdm_data.digest[0],
+				adapter->vdm_data.digest[1],
+				adapter->vdm_data.digest[2],
+				adapter->vdm_data.digest[3]);
+	case USBPD_UVDM_REVERSE_AUTHEN:
+		return snprintf(buf, PAGE_SIZE, "%d,%d\n", cmd,
+				adapter->vdm_data.reauth ? 1 : 0);
+	case USBPD_UVDM_DISCONNECT:
+	case USBPD_UVDM_SESSION_SEED:
+	case USBPD_UVDM_VERIFIED:
+	case USBPD_UVDM_REMOVE_COMPENSATION:
+	case USBPD_UVDM_CONNECT:
+	case USBPD_UVDM_NAN_ACK:
+		return snprintf(buf, PAGE_SIZE, "%d,Null\n", cmd);
+	default:
+		pr_err("feedbak cmd:%d is not support\n", cmd);
+		return snprintf(buf, PAGE_SIZE, "%d,\n", cmd);
+	}
+}
+
+static ssize_t request_vdm_cmd_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t size)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+	int cmd = 0;
+	char str[65] = {0};
+	unsigned char data[32] = {0};
+	int count = 0;
+	int ret;
+
+	ret = sscanf(buf, "%d,%64s", &cmd, str);
+	if (ret < 1)
+		return -EINVAL;
+
+	pr_info("%s: cmd:%d, buffer:%s\n", __func__, cmd, str);
+	if (ret == 2 && str[0] != '\0') {
+		count = string_to_hex(str, data, sizeof(data));
+		if (count < 0)
+			return count;
+	}
+
+	adapter_dev_request_vdm_cmd(adapter, (enum uvdm_state)cmd, data, count);
+	return size;
+}
+static DEVICE_ATTR_RW(request_vdm_cmd);
+
+static ssize_t current_state_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+	const char *state;
+
+	adapter_dev_get_current_state(adapter);
+	state = adapter->current_state_name ? adapter->current_state_name : "Unknown";
+	pr_info("%s: current_state=%d (%s)\n", __func__,
+		adapter->current_state, state);
+	return snprintf(buf, PAGE_SIZE, "%s\n", state);
+}
+static DEVICE_ATTR_RO(current_state);
+
+static ssize_t adapter_id_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+
+	adapter_dev_get_svid(adapter);
+	pr_info("%s: adapter_id is %08x\n", __func__, adapter->adapter_id);
+	return snprintf(buf, PAGE_SIZE, "%08x\n", adapter->adapter_id);
+}
+static DEVICE_ATTR_RO(adapter_id);
+
+static ssize_t adapter_svid_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+
+	adapter_dev_get_svid(adapter);
+	pr_info("%s: adapter_svid is %04x\n", __func__, adapter->adapter_svid);
+	return snprintf(buf, PAGE_SIZE, "%04x\n", adapter->adapter_svid);
+}
+static DEVICE_ATTR_RO(adapter_svid);
+
+static ssize_t verify_process_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", adapter->verify_process ? 1 : 0);
+}
+
+static ssize_t verify_process_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t size)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+	int val = 0;
+
+	if (sscanf(buf, "%d", &val) != 1)
+		return -EINVAL;
+
+	pr_info("%s: batterysecret verify process :%d\n", __func__, val);
+	adapter->verify_process = !!val;
+	adapter_dev_set_pd_verify_process(adapter, val);
+	return size;
+}
+static DEVICE_ATTR_RW(verify_process);
+
+static ssize_t usbpd_verifed_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", adapter->verifed ? 1 : 0);
+}
+
+static ssize_t usbpd_verifed_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t size)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+	struct adapter_power_cap cap;
+	int val = 0;
+
+	if (sscanf(buf, "%d", &val) != 1) {
+		adapter->verifed = false;
+		return -EINVAL;
+	}
+
+	pr_info("%s: batteryd set usbpd verifyed :%d\n", __func__, val);
+	adapter->verifed = !!val;
+	memset(&cap, 0, sizeof(cap));
+	adapter_dev_get_cap(adapter, val ? MTK_PD_APDO_REGAIN : MTK_PD_APDO, &cap);
+	return size;
+}
+static DEVICE_ATTR_RW(usbpd_verifed);
+
+static ssize_t current_pr_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+	const char *pr = "none";
+
+	adapter_dev_get_power_role(adapter);
+	if (adapter->current_pr == 0)
+		pr = "sink";
+	else if (adapter->current_pr == 1)
+		pr = "source";
+	pr_info("%s: current_pr is %d\n", __func__, adapter->current_pr);
+	return snprintf(buf, PAGE_SIZE, "%s\n", pr);
+}
+static DEVICE_ATTR_RO(current_pr);
+
+static ssize_t pdo_show(struct device *dev, struct device_attribute *attr,
+			char *buf, int idx)
+{
+	struct adapter_device *adapter = to_adapter_device(dev);
+
+	if (idx < 0 || idx >= USBPD_PDO_MAX_NR)
+		return -EINVAL;
+	adapter_dev_get_pdos(adapter);
+	return snprintf(buf, PAGE_SIZE, "%08x\n", adapter->received_pdos[idx]);
+}
+
+#define ADAPTER_PDO_ATTR(n)						\
+static ssize_t pdo##n##_show(struct device *dev,			\
+			     struct device_attribute *attr, char *buf)	\
+{									\
+	return pdo_show(dev, attr, buf, (n) - 1);			\
+}									\
+static DEVICE_ATTR_RO(pdo##n)
+
+ADAPTER_PDO_ATTR(1);
+ADAPTER_PDO_ATTR(2);
+ADAPTER_PDO_ATTR(3);
+ADAPTER_PDO_ATTR(4);
+ADAPTER_PDO_ATTR(5);
+ADAPTER_PDO_ATTR(6);
+ADAPTER_PDO_ATTR(7);
+
 static struct attribute *adapter_class_attrs[] = {
 	&dev_attr_name.attr,
+	&dev_attr_request_vdm_cmd.attr,
+	&dev_attr_current_state.attr,
+	&dev_attr_adapter_id.attr,
+	&dev_attr_adapter_svid.attr,
+	&dev_attr_verify_process.attr,
+	&dev_attr_usbpd_verifed.attr,
+	&dev_attr_current_pr.attr,
+	&dev_attr_pdo1.attr,
+	&dev_attr_pdo2.attr,
+	&dev_attr_pdo3.attr,
+	&dev_attr_pdo4.attr,
+	&dev_attr_pdo5.attr,
+	&dev_attr_pdo6.attr,
+	&dev_attr_pdo7.attr,
 	NULL,
 };
 
@@ -302,7 +604,7 @@ static void __exit adapter_class_exit(void)
 
 static int __init adapter_class_init(void)
 {
-	adapter_class = class_create("Charging Adapter");
+	adapter_class = class_create("Charging_Adapter");
 	if (IS_ERR(adapter_class)) {
 		pr_notice("Unable to create Charging Adapter class; errno = %ld\n",
 			PTR_ERR(adapter_class));
