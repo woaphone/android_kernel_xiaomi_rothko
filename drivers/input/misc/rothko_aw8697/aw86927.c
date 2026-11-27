@@ -14,16 +14,22 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
+#include <linux/kfifo.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/regmap.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/property.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <linux/wait.h>
 
 #define AW86927_RSTCFG_REG			0x00
 #define AW86927_RSTCFG_SOFTRST			0xaa
+
+#define AW86927_SYSST_REG			0x01
+#define AW86927_SYSST_FF_AFS			BIT(3)
 
 #define AW86927_SYSINT_REG			0x02
 #define AW86927_SYSINT_BST_SCPI			BIT(7)
@@ -34,6 +40,9 @@
 #define AW86927_SYSINT_OCDI			BIT(2)
 #define AW86927_SYSINT_OTI			BIT(1)
 #define AW86927_SYSINT_DONEI			BIT(0)
+#define AW86927_SYSINT_RTP_FAULTS		(AW86927_SYSINT_BST_SCPI | \
+	AW86927_SYSINT_BST_OVPI | AW86927_SYSINT_UVLI | \
+	AW86927_SYSINT_OCDI | AW86927_SYSINT_OTI)
 
 #define AW86927_SYSINTM_REG			0x03
 #define AW86927_SYSINTM_BST_OVPM		BIT(6)
@@ -48,6 +57,9 @@
 #define AW86927_ROTHKO_BOOST_MAX		0x64
 #define AW86927_ROTHKO_GAIN_MAX		0x7c
 #define AW86927_MAX_EFFECTS		32
+#define AW86927_RTP_QUEUE_SIZE		8192
+#define AW86927_RTP_CHUNK_SIZE		128
+#define AW86927_WAVE_CUSTOM		U8_MAX
 #define AW86927_RAM_FIRMWARE		"aw8697_haptic.bin"
 
 #define AW86927_PLAYCFG2_REG			0x07
@@ -58,6 +70,7 @@
 #define AW86927_PLAYCFG3_BRK_EN			BIT(2)
 #define AW86927_PLAYCFG3_PLAY_MODE_MASK		GENMASK(1, 0)
 #define AW86927_PLAYCFG3_PLAY_MODE_RAM		0
+#define AW86927_PLAYCFG3_PLAY_MODE_RTP		1
 #define AW86927_PLAYCFG3_PLAY_MODE_CONT		2
 
 #define AW86927_PLAYCFG4_REG			0x09
@@ -102,10 +115,13 @@
 
 #define AW86927_BASEADDRH_REG			0x2d
 #define AW86927_BASEADDRL_REG			0x2e
+#define AW86927_RTPCFG3_REG			0x2f
+#define AW86927_RTPDATA_REG			0x32
 
 #define AW86927_GLBRD5_REG			0x3f
 #define AW86927_GLBRD5_STATE_MASK		GENMASK(3, 0)
 #define AW86927_GLBRD5_STATE_STANDBY		0
+#define AW86927_GLBRD5_STATE_RTP_GO		8
 
 #define AW86927_RAMADDRH_REG			0x40
 
@@ -192,6 +208,9 @@ struct aw86927_data {
 	struct work_struct play_work;
 	struct delayed_work stop_work;
 	spinlock_t effect_lock;
+	struct mutex io_lock;
+	wait_queue_head_t rtp_wait;
+	DECLARE_KFIFO(rtp_queue, u8, AW86927_RTP_QUEUE_SIZE);
 	struct device *dev;
 	struct input_dev *input_dev;
 	struct i2c_client *client;
@@ -204,6 +223,9 @@ struct aw86927_data {
 	u16 gain, duration;
 	int playing_id;
 	u32 f0_value;
+	u32 custom_wave_id, rtp_period, rtp_epoch, rtp_space;
+	u8 rtp_gain;
+	bool rtp_armed, rtp_requested, rtp_active, rtp_eof;
 	bool running, loop, play_pending, gain_pending;
 };
 
@@ -311,6 +333,105 @@ static int aw86927_stop(struct aw86927_data *haptics)
 
 static int aw86927_prepare_waveforms(struct aw86927_data *haptics);
 
+static void aw86927_rtp_wake(struct aw86927_data *haptics)
+{
+	WRITE_ONCE(haptics->rtp_space, kfifo_avail(&haptics->rtp_queue));
+	wake_up_interruptible(&haptics->rtp_wait);
+}
+
+static int aw86927_rtp_clear(struct aw86927_data *haptics)
+{
+	bool active = haptics->rtp_active;
+	int ret, stop_ret;
+
+	if (!haptics->rtp_armed)
+		return 0;
+	haptics->rtp_armed = false;
+	haptics->rtp_requested = false;
+	haptics->rtp_active = false;
+	WRITE_ONCE(haptics->rtp_eof, false);
+	WRITE_ONCE(haptics->rtp_epoch, haptics->rtp_epoch + 1);
+	kfifo_reset(&haptics->rtp_queue);
+	aw86927_rtp_wake(haptics);
+	if (!active)
+		return 0;
+	ret = regmap_set_bits(haptics->regmap, AW86927_SYSINTM_REG,
+			      AW86927_SYSINTM_FF_AEM | AW86927_SYSINTM_DONEM);
+	stop_ret = aw86927_stop(haptics);
+	return ret ?: stop_ret;
+}
+
+static int aw86927_rtp_feed(struct aw86927_data *haptics)
+{
+	u8 samples[AW86927_RTP_CHUNK_SIZE];
+	unsigned int status, count, budget;
+	int ret;
+
+	budget = kfifo_len(&haptics->rtp_queue);
+	while (budget) {
+		ret = regmap_read(haptics->regmap, AW86927_SYSST_REG, &status);
+		if (ret)
+			return ret;
+		if (status & AW86927_SYSST_FF_AFS)
+			break;
+		count = min3(budget, haptics->rtp_period, (u32)sizeof(samples));
+		count = kfifo_out(&haptics->rtp_queue, samples, count);
+		ret = regmap_noinc_write(haptics->regmap, AW86927_RTPDATA_REG,
+					 samples, count);
+		if (ret)
+			return ret;
+		budget -= count;
+	}
+	aw86927_rtp_wake(haptics);
+	if (haptics->rtp_eof && kfifo_is_empty(&haptics->rtp_queue))
+		return regmap_set_bits(haptics->regmap, AW86927_SYSINTM_REG,
+				       AW86927_SYSINTM_FF_AEM);
+	return 0;
+}
+
+static int aw86927_rtp_kick(struct aw86927_data *haptics)
+{
+	struct regmap *map = haptics->regmap;
+	unsigned int status;
+	int ret;
+
+	if (!haptics->rtp_requested)
+		return 0;
+	if (haptics->rtp_active)
+		return aw86927_rtp_feed(haptics);
+	if (kfifo_is_empty(&haptics->rtp_queue) ||
+	    (!haptics->rtp_eof && kfifo_len(&haptics->rtp_queue) < 4 * haptics->rtp_period))
+		return 0;
+
+	ret = aw86927_stop(haptics);
+	if (ret)
+		return ret;
+	ret = regmap_read(map, AW86927_SYSINT_REG, &status);
+	if (!ret)
+		ret = regmap_set_bits(map, AW86927_PLAYCFG1_REG,
+				       AW86927_PLAYCFG1_BST_MODE_BOOST);
+	if (!ret)
+		ret = regmap_update_bits(map, AW86927_PLAYCFG3_REG,
+					 AW86927_PLAYCFG3_PLAY_MODE_MASK,
+					 AW86927_PLAYCFG3_PLAY_MODE_RTP);
+	if (!ret)
+		ret = regmap_write(map, AW86927_PLAYCFG2_REG, haptics->rtp_gain);
+	if (ret)
+		return ret;
+	haptics->rtp_active = true;
+	ret = regmap_write(map, AW86927_PLAYCFG4_REG, AW86927_PLAYCFG4_GO);
+	if (!ret)
+		ret = regmap_read_poll_timeout(map, AW86927_GLBRD5_REG, status,
+					      (status & AW86927_GLBRD5_STATE_MASK) ==
+					      AW86927_GLBRD5_STATE_RTP_GO, 200, 10000);
+	if (!ret)
+		ret = regmap_clear_bits(map, AW86927_SYSINTM_REG,
+					 AW86927_SYSINTM_FF_AEM | AW86927_SYSINTM_DONEM);
+	if (!ret)
+		ret = aw86927_rtp_feed(haptics);
+	return ret;
+}
+
 static int aw86927_init_f0(struct aw86927_data *haptics)
 {
 	struct regmap *regmap = haptics->regmap;
@@ -405,8 +526,66 @@ static ssize_t f0_value_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(f0_value);
 
+static ssize_t custom_wave_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct aw86927_data *haptics = dev_get_drvdata(dev);
+	ssize_t ret;
+
+	mutex_lock(&haptics->io_lock);
+	ret = aw86927_prepare_waveforms(haptics);
+	if (!ret)
+		ret = sysfs_emit(buf, "period_size=%u;\nmax_size=%u;free_size=%u;\ncustom_wave_id=%u;\n",
+				 haptics->rtp_period, AW86927_RTP_QUEUE_SIZE,
+				 kfifo_avail(&haptics->rtp_queue), haptics->custom_wave_id);
+	mutex_unlock(&haptics->io_lock);
+	return ret;
+}
+
+static ssize_t custom_wave_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct aw86927_data *haptics = dev_get_drvdata(dev);
+	ssize_t ret;
+	u32 epoch;
+
+	if (!count)
+		return 0;
+	if (count > AW86927_RTP_QUEUE_SIZE)
+		return -EMSGSIZE;
+	mutex_lock(&haptics->io_lock);
+	epoch = haptics->rtp_epoch;
+	while (haptics->rtp_armed && haptics->rtp_epoch == epoch &&
+	       !haptics->rtp_eof && kfifo_avail(&haptics->rtp_queue) < count) {
+		mutex_unlock(&haptics->io_lock);
+		ret = wait_event_interruptible_timeout(haptics->rtp_wait,
+			READ_ONCE(haptics->rtp_epoch) != epoch || READ_ONCE(haptics->rtp_eof) ||
+			READ_ONCE(haptics->rtp_space) >= count, msecs_to_jiffies(1000));
+		if (ret <= 0)
+			return ret ?: -ETIMEDOUT;
+		mutex_lock(&haptics->io_lock);
+	}
+	if (!haptics->rtp_armed || haptics->rtp_epoch != epoch || haptics->rtp_eof) {
+		ret = -EPIPE;
+		goto unlock;
+	}
+	kfifo_in(&haptics->rtp_queue, buf, count);
+	WRITE_ONCE(haptics->rtp_eof, count < haptics->rtp_period || count % haptics->rtp_period);
+	aw86927_rtp_wake(haptics);
+	ret = aw86927_rtp_kick(haptics);
+	if (ret)
+		aw86927_rtp_clear(haptics);
+	else
+		ret = count;
+unlock:
+	mutex_unlock(&haptics->io_lock);
+	return ret;
+}
+static DEVICE_ATTR_RW(custom_wave);
+
 static struct attribute *aw86927_attrs[] = {
 	&dev_attr_f0_value.attr,
+	&dev_attr_custom_wave.attr,
 	NULL,
 };
 static const struct attribute_group aw86927_group = {

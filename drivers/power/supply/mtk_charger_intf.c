@@ -147,6 +147,20 @@ int get_battery_temperature(struct mtk_charger *info)
 	return ret;
 }
 
+static bool mtk_bms_current_is_inverted(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		struct device_node *bms_node;
+
+		bms_node = of_find_compatible_node(NULL, NULL, "bq28z610");
+		cached = of_device_is_available(bms_node) ? 1 : 0;
+		of_node_put(bms_node);
+	}
+	return cached > 0;
+}
+
 int get_battery_current(struct mtk_charger *info)
 {
 	union power_supply_propval prop;
@@ -168,7 +182,11 @@ int get_battery_current(struct mtk_charger *info)
 	} else {
 		tmp_ret = power_supply_get_property(bat_psy,
 			POWER_SUPPLY_PROP_CURRENT_NOW, &prop);
-		ret = prop.intval / 1000;
+		if (!tmp_ret) {
+			ret = prop.intval / 1000;
+			if (mtk_bms_current_is_inverted())
+				ret = -ret;
+		}
 	}
 
 	chr_debug("%s:%d\n", __func__,

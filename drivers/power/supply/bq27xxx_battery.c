@@ -1897,7 +1897,7 @@ static int bq27xxx_battery_current_and_status(
 	}
 
 	if (val_curr)
-		val_curr->intval = curr;
+		val_curr->intval = di->invert_current ? -curr : curr;
 
 	if (val_status) {
 		if (bq27xxx_battery_is_full(di, flags))
@@ -2148,11 +2148,14 @@ static int bq27xxx_battery_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		if (di->chip == BQ28Z610) {
+			int curr;
+
 			/* The BQ28Z610 Current() command is separate from AverageCurrent(). */
 			ret = di->bus.read(di, BQ28Z610_REG_CURRENT, false);
 			if (ret < 0)
 				return ret;
-			val->intval = (s16)ret * 1000;
+			curr = (int)((s16)ret) * 1000;
+			val->intval = di->invert_current ? -curr : curr;
 			return 0;
 		}
 		fallthrough;
@@ -2269,6 +2272,8 @@ int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
 		psy_desc->type = POWER_SUPPLY_TYPE_UNKNOWN;
 		psy_cfg.supplied_to = bms_supplied_to;
 		psy_cfg.num_supplicants = ARRAY_SIZE(bms_supplied_to);
+		/* Stock Xiaomi HyperOS expects negative current when charging. */
+		di->invert_current = true;
 	}
 	psy_desc->properties = bq27xxx_chip_data[di->chip].props;
 	psy_desc->num_properties = bq27xxx_chip_data[di->chip].props_size;

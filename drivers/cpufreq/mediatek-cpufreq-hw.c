@@ -9,6 +9,7 @@
 #include <linux/init.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -16,6 +17,7 @@
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 
 #define LUT_MAX_ENTRIES			32U
 #define LUT_FREQ			GENMASK(11, 0)
@@ -30,6 +32,12 @@
 #define MT6989_CPUFREQ_FW_STATE	0x9c
 #define MT6989_CPUFREQ_SCALING	0x4cc
 #define MT6989_FDVFS_MAGIC	0xabcd0001
+#define MT6989_MAX_DOMAINS	8U
+#define MT6989_CCI_MIN_KHZ		300000U
+#define MT6989_CCI_MAX_KHZ		1950000U
+#define MT6989_CCI_SINGLE_RATIO_PCT	50U
+#define MT6989_CCI_MULTI_RATIO_PCT	57U
+#define MT6989_CCI_MULTI_THRESH_KHZ	1600000U
 
 enum {
 	REG_FREQ_LUT_TABLE,
@@ -46,6 +54,10 @@ struct mtk_cpufreq_priv {
 	struct device *dev;
 	const struct mtk_cpufreq_variant *variant;
 	void __iomem *fdvfs;
+	void __iomem *fdvfs_cci;
+	raw_spinlock_t fdvfs_cci_lock;
+	unsigned int domain_freq[MT6989_MAX_DOMAINS];
+	u32 last_cci_code;
 	bool perf_state_in_khz;
 };
 
@@ -56,6 +68,7 @@ struct mtk_cpufreq_domain {
 	struct resource *res;
 	void __iomem *base;
 	int nr_opp;
+	unsigned int domain_idx;
 };
 
 struct mtk_cpufreq_variant {
@@ -157,8 +170,18 @@ static int mtk_cpufreq_hw_mt6989_init(struct mtk_cpufreq_priv *priv)
 
 	magic = readl_relaxed(base);
 	iounmap(base);
-	if (magic == MT6989_FDVFS_MAGIC)
+	if (magic == MT6989_FDVFS_MAGIC) {
 		priv->fdvfs = devm_of_iomap(priv->dev, fdvfs, 0, NULL);
+		if (!IS_ERR(priv->fdvfs)) {
+			priv->fdvfs_cci = devm_of_iomap(priv->dev, fdvfs, 1, NULL);
+			if (IS_ERR(priv->fdvfs_cci)) {
+				dev_warn(priv->dev,
+					 "Failed to map MT6989 FDVFS CCI register: %ld\n",
+					 PTR_ERR(priv->fdvfs_cci));
+				priv->fdvfs_cci = NULL;
+			}
+		}
+	}
 	of_node_put(fdvfs);
 	if (IS_ERR(priv->fdvfs))
 		return dev_err_probe(priv->dev, PTR_ERR(priv->fdvfs),
@@ -210,6 +233,43 @@ mtk_cpufreq_get_cpu_power(struct device *cpu_dev, unsigned long *uW,
 	return 0;
 }
 
+static void mtk_cpufreq_hw_mt6989_update_cci(struct mtk_cpufreq_priv *priv,
+					     unsigned int domain_idx,
+					     unsigned int target_freq)
+{
+	unsigned long flags;
+	unsigned int i, max_freq = 0, active_high = 0, ratio_pct, cci_freq;
+	u32 cci_code;
+
+	if (!priv->fdvfs_cci || domain_idx >= ARRAY_SIZE(priv->domain_freq))
+		return;
+
+	raw_spin_lock_irqsave(&priv->fdvfs_cci_lock, flags);
+	priv->domain_freq[domain_idx] = target_freq;
+	for (i = 0; i < ARRAY_SIZE(priv->domain_freq); i++) {
+		if (priv->domain_freq[i] > max_freq)
+			max_freq = priv->domain_freq[i];
+		if (priv->domain_freq[i] >= MT6989_CCI_MULTI_THRESH_KHZ)
+			active_high++;
+	}
+	/*
+	 * Single-cluster bursts (e.g. solo P7 @ 3400 MHz) rarely saturate L3/DSU,
+	 * so 50% (1700 MHz) avoids pinning the shared vbuck9 rail to CCI's
+	 * 1950 MHz ceiling. When 2+ clusters run >= 1.6 GHz concurrently (real
+	 * multi-core / gaming loads), step up to 57% (up to full 1950 MHz).
+	 */
+	ratio_pct = active_high >= 2 ? MT6989_CCI_MULTI_RATIO_PCT
+				     : MT6989_CCI_SINGLE_RATIO_PCT;
+	cci_freq = clamp((unsigned int)div_u64((u64)max_freq * ratio_pct, 100),
+			 MT6989_CCI_MIN_KHZ, MT6989_CCI_MAX_KHZ);
+	cci_code = DIV_ROUND_UP(cci_freq, FDVFS_FDIV_HZ);
+	if (cci_code != priv->last_cci_code) {
+		priv->last_cci_code = cci_code;
+		writel(cci_code, priv->fdvfs_cci);
+	}
+	raw_spin_unlock_irqrestore(&priv->fdvfs_cci_lock, flags);
+}
+
 static void mtk_cpufreq_hw_fdvfs_switch(unsigned int target_freq,
 					struct cpufreq_policy *policy)
 {
@@ -217,6 +277,7 @@ static void mtk_cpufreq_hw_fdvfs_switch(unsigned int target_freq,
 	struct mtk_cpufreq_priv *priv = data->parent;
 	unsigned int cpu;
 
+	mtk_cpufreq_hw_mt6989_update_cci(priv, data->domain_idx, target_freq);
 	target_freq = DIV_ROUND_UP(target_freq, FDVFS_FDIV_HZ);
 	for_each_cpu(cpu, policy->real_cpus) {
 		writel_relaxed(target_freq, priv->fdvfs + cpu * 4);
@@ -352,6 +413,8 @@ static int mtk_cpu_resources_init(struct platform_device *pdev,
 	index = args.args[0];
 	of_node_put(args.np);
 
+	data->domain_idx = index;
+
 	/*
 	 * In a cpufreq with hybrid DVFS, such as the MT8196, the first declared
 	 * register range is for FDVFS, followed by the frequency domain MMIOs.
@@ -438,6 +501,15 @@ static int mtk_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 		pr_info("SVS of CPU%d is not enabled\n", policy->cpu);
 	}
 
+	if (data->parent->fdvfs_cci) {
+		unsigned int cur_freq = mtk_cpufreq_hw_get(policy->cpu);
+
+		if (!cur_freq && data->nr_opp > 0)
+			cur_freq = data->table[data->nr_opp - 1].frequency;
+		mtk_cpufreq_hw_mt6989_update_cci(data->parent, data->domain_idx,
+						 cur_freq);
+	}
+
 	return 0;
 }
 
@@ -446,6 +518,8 @@ static void mtk_cpufreq_hw_cpu_exit(struct cpufreq_policy *policy)
 	struct mtk_cpufreq_domain *data = policy->driver_data;
 	struct resource *res = data->res;
 	void __iomem *base = data->base;
+
+	mtk_cpufreq_hw_mt6989_update_cci(data->parent, data->domain_idx, 0);
 
 	/* HW should be in paused state now */
 	writel_relaxed(0x0, data->reg_bases[REG_FREQ_ENABLE]);
@@ -514,6 +588,7 @@ static int mtk_cpufreq_hw_driver_probe(struct platform_device *pdev)
 
 	priv->variant = data;
 	priv->dev = &pdev->dev;
+	raw_spin_lock_init(&priv->fdvfs_cci_lock);
 
 	if (priv->variant->init) {
 		ret = priv->variant->init(priv);

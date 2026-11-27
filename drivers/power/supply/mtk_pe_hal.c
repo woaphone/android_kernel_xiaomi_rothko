@@ -116,6 +116,20 @@ int pe_hal_get_vbus(struct chg_alg_device *alg)
 	return ret < 0 ? ret : vchr;
 }
 
+static bool mtk_bms_current_is_inverted(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		struct device_node *bms_node;
+
+		bms_node = of_find_compatible_node(NULL, NULL, "bq28z610");
+		cached = of_device_is_available(bms_node) ? 1 : 0;
+		of_node_put(bms_node);
+	}
+	return cached > 0;
+}
+
 int pe_hal_get_ibat(struct chg_alg_device *alg)
 {
 	union power_supply_propval prop;
@@ -142,7 +156,7 @@ int pe_hal_get_ibat(struct chg_alg_device *alg)
 		ret = power_supply_get_property(bat_psy,
 			POWER_SUPPLY_PROP_CURRENT_NOW, &prop);
 		if (!ret)
-			ret = prop.intval;
+			ret = mtk_bms_current_is_inverted() ? -prop.intval : prop.intval;
 	}
 
 	pr_debug("%s:%d\n", __func__,
